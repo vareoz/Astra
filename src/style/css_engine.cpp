@@ -144,6 +144,53 @@ EdgeSizes parse_edges(std::string_view val) {
     return e;
 }
 
+std::vector<GridTrack> parse_grid_tracks(std::string_view val) {
+    std::vector<GridTrack> tracks;
+    std::string s = to_lower(trim(val));
+    size_t pos = 0;
+    while (pos < s.size()) {
+        while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
+        if (pos >= s.size()) break;
+        if (s.compare(pos, 7, "repeat(") == 0) {
+            size_t rp = s.find(')', pos + 7);
+            if (rp == std::string::npos) break;
+            std::string inner = s.substr(pos + 7, rp - (pos + 7));
+            size_t comma = inner.find(',');
+            if (comma != std::string::npos) {
+                int count = std::clamp(std::atoi(inner.substr(0, comma).c_str()), 1, 16);
+                std::string unit = trim(inner.substr(comma + 1));
+                GridTrack tr;
+                if (unit.find("fr") != std::string::npos) {
+                    tr.is_fr = true;
+                    tr.value = std::max(0.1f, std::strtof(unit.c_str(), nullptr));
+                } else {
+                    tr.is_fr = false;
+                    tr.value = std::max(24.0f, StyleEngine::parse_px(unit, 120.0f));
+                }
+                for (int i = 0; i < count; ++i) tracks.push_back(tr);
+            }
+            pos = rp + 1;
+        } else {
+            size_t st = pos;
+            while (pos < s.size() && !std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
+            std::string tok = s.substr(st, pos - st);
+            GridTrack tr;
+            if (tok.find("fr") != std::string::npos) {
+                tr.is_fr = true;
+                tr.value = std::max(0.1f, std::strtof(tok.c_str(), nullptr));
+            } else if (tok == "auto") {
+                tr.is_fr = true;
+                tr.value = 1.0f;
+            } else {
+                tr.is_fr = false;
+                tr.value = std::max(24.0f, StyleEngine::parse_px(tok, 120.0f));
+            }
+            tracks.push_back(tr);
+        }
+    }
+    return tracks;
+}
+
 void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
     const std::string& p = d.property;
     const std::string& v = d.value;
@@ -152,11 +199,14 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
     if (p == "display") {
         if (vl == "none") st.display = DisplayType::None;
         else if (vl == "flex") st.display = DisplayType::Flex;
+        else if (vl == "grid") st.display = DisplayType::Grid;
         else if (vl == "inline" || vl == "inline-block") st.display = DisplayType::Inline;
         else st.display = DisplayType::Block;
     } else if (p == "flex-direction") {
         st.flex_direction = (vl == "column") ? FlexDirection::Column : FlexDirection::Row;
-    } else if (p == "gap") {
+    } else if (p == "grid-template-columns") {
+        st.grid_columns = parse_grid_tracks(v);
+    } else if (p == "gap" || p == "grid-gap") {
         st.gap = StyleEngine::parse_px(v, 0.0f);
     } else if (p == "width") {
         if (vl != "auto" && vl.find('%') == std::string::npos) st.width = StyleEngine::parse_px(v, -1.0f);
@@ -206,6 +256,9 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
         st.font_size = std::clamp(StyleEngine::parse_px(v, st.font_size), 8.0f, 64.0f);
     } else if (p == "font-weight") {
         st.bold = (vl == "bold" || vl == "600" || vl == "700" || vl == "800" || vl == "900");
+    } else if (p == "font-family") {
+        st.monospace = (vl.find("mono") != std::string::npos || vl.find("code") != std::string::npos ||
+                        vl.find("consolas") != std::string::npos || vl.find("courier") != std::string::npos);
     }
 }
 
@@ -222,6 +275,7 @@ void apply_ua_defaults(const DomNode* node, ComputedStyle& st) {
             st.background = Color{28, 34, 46, 255};
             st.color = Color{135, 232, 182, 255};
             st.padding = {2, 5, 2, 5};
+            st.monospace = true;
         }
     } else if (t == "body") {
         st.background = Color{13, 17, 24, 255};
@@ -252,6 +306,16 @@ void apply_ua_defaults(const DomNode* node, ComputedStyle& st) {
         st.border_width = 1.0f;
         st.border_color = Color{45, 56, 76, 255};
         st.margin = {6, 0, 12, 0};
+        st.monospace = true;
+    } else if (t == "input" || t == "textarea") {
+        st.background = Color{15, 23, 42, 255};
+        st.color = Color{241, 245, 249, 255};
+        st.border_width = 1.0f;
+        st.border_color = Color{51, 65, 85, 255};
+        st.border_radius = 6.0f;
+        st.padding = {8, 12, 8, 12};
+        st.font_size = 14.0f;
+        st.height = (t == "textarea") ? 88.0f : 38.0f;
     } else if (t == "ul" || t == "ol") {
         st.padding = {0, 0, 0, 20};
         st.margin = {4, 0, 10, 0};
@@ -419,6 +483,7 @@ ComputedStyle StyleEngine::compute_style(const DomNode* node,
         st.color = parent_style->color;
         st.font_size = parent_style->font_size;
         st.bold = parent_style->bold;
+        st.monospace = parent_style->monospace;
         st.line_height = parent_style->line_height;
     }
 

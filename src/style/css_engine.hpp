@@ -36,12 +36,18 @@ enum class DisplayType : uint8_t {
     Block,
     Inline,
     Flex,
+    Grid,
     None
 };
 
 enum class FlexDirection : uint8_t {
     Row,
     Column
+};
+
+struct GridTrack {
+    float value = 1.0f;
+    bool is_fr = true;
 };
 
 struct EdgeSizes {
@@ -54,6 +60,7 @@ struct EdgeSizes {
 struct ComputedStyle {
     DisplayType display = DisplayType::Block;
     FlexDirection flex_direction = FlexDirection::Row;
+    std::vector<GridTrack> grid_columns;
     float gap = 0.0f;
     float width = -1.0f;   // < 0 means auto
     float height = -1.0f;  // < 0 means auto
@@ -66,7 +73,8 @@ struct ComputedStyle {
     Color color{230, 234, 240, 255};
     float font_size = 14.0f;
     bool bold = false;
-    float line_height = 1.45f;
+    bool monospace = false;
+    float line_height = 1.48f;
 };
 
 struct CssDeclaration {

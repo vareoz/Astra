@@ -36,12 +36,15 @@ class Framebuffer;
 struct InteractiveCallbacks {
     std::function<void(int x, int y)> on_click;
     std::function<void(int delta_y)> on_scroll;
+    std::function<void(const std::string& text)> on_text;
+    std::function<void()> on_backspace;
+    std::function<void()> on_enter;
     std::function<void(Framebuffer& fb)> on_repaint;
 };
 
-// Astra Compositor v2: ARGB32 software compositor with APZ-style scroll_y,
-// native <img> blitting, smooth Astra3D integration, zero-dep PNG encoder,
-// and interactive Linux X11 desktop event loop (dlopen libX11.so.6).
+// Astra Compositor v3: ARGB32 software compositor with Anti-Aliased TrueType (AstraFont),
+// APZ-style scroll_y, native PNG/JPEG/BMP/PPM <img> blitting, interactive <input>,
+// smooth Astra3D integration, zero-dep PNG encoder, and interactive Linux X11 desktop window.
 class Framebuffer {
 public:
     static constexpr int kChromeHeight = 84;
@@ -58,7 +61,8 @@ public:
     void fill_rect(int x, int y, int w, int h, uint32_t argb);
     void fill_rounded_rect(int x, int y, int w, int h, int radius, uint32_t argb);
     void stroke_rounded_rect(int x, int y, int w, int h, int radius, int thickness, uint32_t argb);
-    void draw_text(int x, int y, std::string_view text, uint32_t argb, float font_size, bool bold = false);
+    void draw_text(int x, int y, std::string_view text, uint32_t argb, float font_size,
+                   bool bold = false, bool monospace = false);
     void blit_scaled(int dst_x, int dst_y, int dst_w, int dst_h,
                      const uint32_t* src, int src_w, int src_h);
 

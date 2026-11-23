@@ -1,9 +1,11 @@
 #include "js/astra_js.hpp"
+#include "core/json.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <sstream>
 
 namespace astra {
@@ -639,6 +641,10 @@ void AstraJsEngine::bind_storage(StorageGetFn getter, StorageSetFn setter) {
     storage_set_ = std::move(setter);
 }
 
+void AstraJsEngine::bind_fetch(FetchFn fetcher) {
+    fetch_fn_ = std::move(fetcher);
+}
+
 GcObject* AstraJsEngine::alloc_object(GcObject::Type type) {
     GcObject* o = new GcObject();
     o->type = type;
@@ -711,6 +717,24 @@ JsValue AstraJsEngine::invoke_callable(const JsValue& fn,
         if (fn.sval == "__gc__") {
             return JsValue::make_number(static_cast<double>(gc_collect()));
         }
+        if (fn.sval == "__fetch__" && !args.empty()) {
+            std::string url = args[0].to_string();
+            JsFetchResult fr;
+            if (fetch_fn_) {
+                fr = fetch_fn_(url);
+            } else {
+                fr.error = "No network transport bound";
+            }
+            GcObject* resp = alloc_object(GcObject::Type::Map);
+            resp->props["ok"] = JsValue::make_bool(fr.ok);
+            resp->props["status"] = JsValue::make_number(static_cast<double>(fr.status));
+            resp->props["body"] = JsValue::make_string(fr.body);
+            resp->props["error"] = JsValue::make_string(fr.error);
+            resp->props["fromCache"] = JsValue::make_bool(fr.from_cache);
+            resp->props["blockedByShield"] = JsValue::make_bool(fr.blocked_by_shield);
+            resp->props["__is_fetch_resp__"] = JsValue::make_bool(true);
+            return JsValue::make_obj(resp);
+        }
         return JsValue::make_undefined();
     }
 
@@ -760,7 +784,8 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
             }
             case OpCode::LoadGlobal: {
                 const std::string& name = chunk.names[static_cast<size_t>(ins.operand)];
-                if (name == "document" || name == "console" || name == "astra" || name == "Math") {
+                if (name == "document" || name == "console" || name == "astra" ||
+                    name == "Math" || name == "JSON" || name == "localStorage") {
                     stack_.push_back(JsValue::make_string("__builtin_" + name + "__"));
                 } else if (name == "queueMicrotask") {
                     stack_.push_back(JsValue::make_string("__queueMicrotask__"));
@@ -768,6 +793,8 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                     stack_.push_back(JsValue::make_string("__setTimeout__"));
                 } else if (name == "gc") {
                     stack_.push_back(JsValue::make_string("__gc__"));
+                } else if (name == "fetch") {
+                    stack_.push_back(JsValue::make_string("__fetch__"));
                 } else {
                     auto it = globals_.find(name);
                     stack_.push_back(it != globals_.end() ? it->second : JsValue::make_undefined());
@@ -937,7 +964,120 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                     }
                 } else if (recv.kind == JsValue::Kind::String && recv.sval == "__builtin_Math__") {
                     if (method == "floor" && !args.empty()) ret = JsValue::make_number(std::floor(args[0].to_number()));
+                    else if (method == "ceil" && !args.empty()) ret = JsValue::make_number(std::ceil(args[0].to_number()));
+                    else if (method == "round" && !args.empty()) ret = JsValue::make_number(std::round(args[0].to_number()));
                     else if (method == "sqrt" && !args.empty()) ret = JsValue::make_number(std::sqrt(args[0].to_number()));
+                } else if (recv.kind == JsValue::Kind::String && recv.sval == "__builtin_localStorage__") {
+                    if (method == "setItem" && args.size() >= 2) {
+                        std::string k = args[0].to_string();
+                        std::string v = args[1].to_string();
+                        local_storage_[k] = v;
+                        if (storage_set_) storage_set_("ls:" + k, v);
+                    } else if (method == "getItem" && !args.empty()) {
+                        std::string k = args[0].to_string();
+                        auto it = local_storage_.find(k);
+                        if (it != local_storage_.end()) ret = JsValue::make_string(it->second);
+                        else if (storage_get_) {
+                            std::string v = storage_get_("ls:" + k);
+                            ret = v.empty() ? JsValue::make_null() : JsValue::make_string(v);
+                        } else {
+                            ret = JsValue::make_null();
+                        }
+                    } else if (method == "removeItem" && !args.empty()) {
+                        local_storage_.erase(args[0].to_string());
+                    }
+                } else if (recv.kind == JsValue::Kind::String && recv.sval == "__builtin_JSON__") {
+                    std::function<JsValue(const JsonValue&)> json_to_js = [&](const JsonValue& jv) -> JsValue {
+                        switch (jv.type()) {
+                            case JsonValue::Type::Null: return JsValue::make_null();
+                            case JsonValue::Type::Bool: return JsValue::make_bool(jv.as_bool());
+                            case JsonValue::Type::Number: return JsValue::make_number(jv.as_number());
+                            case JsonValue::Type::String: return JsValue::make_string(jv.as_string());
+                            case JsonValue::Type::Array: {
+                                GcObject* arr = alloc_object(GcObject::Type::Array);
+                                for (const auto& el : jv.as_array()) arr->elements.push_back(json_to_js(el));
+                                return JsValue::make_obj(arr);
+                            }
+                            case JsonValue::Type::Object: {
+                                GcObject* o = alloc_object(GcObject::Type::Map);
+                                for (const auto& [k, v] : jv.as_object()) o->props[k] = json_to_js(v);
+                                return JsValue::make_obj(o);
+                            }
+                        }
+                        return JsValue::make_null();
+                    };
+                    std::function<std::string(const JsValue&)> js_to_json = [&](const JsValue& v) -> std::string {
+                        switch (v.kind) {
+                            case JsValue::Kind::Undefined:
+                            case JsValue::Kind::Null: return "null";
+                            case JsValue::Kind::Bool: return v.bval ? "true" : "false";
+                            case JsValue::Kind::Number: return v.to_string();
+                            case JsValue::Kind::String: {
+                                std::string out = "\"";
+                                for (char c : v.sval) {
+                                    if (c == '"' || c == '\\') { out.push_back('\\'); out.push_back(c); }
+                                    else if (c == '\n') out += "\\n";
+                                    else out.push_back(c);
+                                }
+                                out.push_back('"');
+                                return out;
+                            }
+                            case JsValue::Kind::DomRef: return "\"<dom>\"";
+                            case JsValue::Kind::Object:
+                                if (!v.obj) return "null";
+                                if (v.obj->type == GcObject::Type::Array) {
+                                    std::string out = "[";
+                                    for (size_t i = 0; i < v.obj->elements.size(); ++i) {
+                                        if (i) out.push_back(',');
+                                        out += js_to_json(v.obj->elements[i]);
+                                    }
+                                    out.push_back(']');
+                                    return out;
+                                } else {
+                                    std::string out = "{";
+                                    bool first = true;
+                                    for (const auto& [k, val] : v.obj->props) {
+                                        if (k.rfind("__", 0) == 0) continue;
+                                        if (!first) out.push_back(',');
+                                        first = false;
+                                        out += "\"" + k + "\":" + js_to_json(val);
+                                    }
+                                    out.push_back('}');
+                                    return out;
+                                }
+                        }
+                        return "null";
+                    };
+                    if (method == "parse" && !args.empty()) {
+                        JsonValue parsed;
+                        if (JsonValue::parse(args[0].to_string(), parsed)) {
+                            ret = json_to_js(parsed);
+                        } else {
+                            ret = JsValue::make_null();
+                        }
+                    } else if (method == "stringify" && !args.empty()) {
+                        ret = JsValue::make_string(js_to_json(args[0]));
+                    }
+                } else if (recv.kind == JsValue::Kind::String) {
+                    const std::string& s = recv.sval;
+                    if (method == "trim") {
+                        size_t a = 0, b = s.size();
+                        while (a < b && std::isspace(static_cast<unsigned char>(s[a]))) ++a;
+                        while (b > a && std::isspace(static_cast<unsigned char>(s[b - 1]))) --b;
+                        ret = JsValue::make_string(s.substr(a, b - a));
+                    } else if (method == "toUpperCase") {
+                        std::string u = s;
+                        std::transform(u.begin(), u.end(), u.begin(),
+                                       [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+                        ret = JsValue::make_string(std::move(u));
+                    } else if (method == "toLowerCase") {
+                        std::string u = s;
+                        std::transform(u.begin(), u.end(), u.begin(),
+                                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                        ret = JsValue::make_string(std::move(u));
+                    } else if (method == "includes" && !args.empty()) {
+                        ret = JsValue::make_bool(s.find(args[0].to_string()) != std::string::npos);
+                    }
                 } else if (recv.kind == JsValue::Kind::DomRef && recv.node) {
                     if (method == "setAttribute" && args.size() >= 2) {
                         recv.node->set_attr(args[0].to_string(), args[1].to_string());
@@ -954,6 +1094,37 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                     if (recv.obj->type == GcObject::Type::Array && method == "push" && !args.empty()) {
                         recv.obj->elements.push_back(args[0]);
                         ret = JsValue::make_number(static_cast<double>(recv.obj->elements.size()));
+                    } else if (recv.obj->props.count("__is_fetch_resp__") && method == "text") {
+                        ret = recv.obj->props["body"];
+                    } else if (recv.obj->props.count("__is_fetch_resp__") && method == "json") {
+                        JsonValue parsed;
+                        if (JsonValue::parse(recv.obj->props["body"].to_string(), parsed)) {
+                            std::function<JsValue(const JsonValue&)> conv = [&](const JsonValue& jv) -> JsValue {
+                                switch (jv.type()) {
+                                    case JsonValue::Type::Null: return JsValue::make_null();
+                                    case JsonValue::Type::Bool: return JsValue::make_bool(jv.as_bool());
+                                    case JsonValue::Type::Number: return JsValue::make_number(jv.as_number());
+                                    case JsonValue::Type::String: return JsValue::make_string(jv.as_string());
+                                    case JsonValue::Type::Array: {
+                                        GcObject* a = alloc_object(GcObject::Type::Array);
+                                        for (const auto& el : jv.as_array()) a->elements.push_back(conv(el));
+                                        return JsValue::make_obj(a);
+                                    }
+                                    case JsonValue::Type::Object: {
+                                        GcObject* o = alloc_object(GcObject::Type::Map);
+                                        for (const auto& [k, v] : jv.as_object()) o->props[k] = conv(v);
+                                        return JsValue::make_obj(o);
+                                    }
+                                }
+                                return JsValue::make_null();
+                            };
+                            ret = conv(parsed);
+                        } else {
+                            ret = JsValue::make_null();
+                        }
+                    } else if (recv.obj->props.count("__is_fetch_resp__") && method == "then" && !args.empty()) {
+                        invoke_callable(args[0], {recv}, doc, rep);
+                        ret = recv;
                     } else if (recv.obj->props.count(method) > 0) {
                         ret = invoke_callable(recv.obj->props[method], args, doc, rep);
                     }

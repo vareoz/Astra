@@ -1,4 +1,5 @@
 #include "gfx/rasterizer.hpp"
+#include "gfx/font_engine.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -202,7 +203,40 @@ void Framebuffer::stroke_rounded_rect(int x, int y, int w, int h, int radius, in
     }
 }
 
-void Framebuffer::draw_text(int x, int y, std::string_view raw_text, uint32_t argb, float font_size, bool bold) {
+void Framebuffer::draw_text(int x, int y, std::string_view raw_text, uint32_t argb,
+                            float font_size, bool bold, bool monospace) {
+    auto& fe = FontEngine::instance();
+    if (fe.freetype_active()) {
+        int px = static_cast<int>(std::round(std::clamp(font_size, 8.0f, 72.0f)));
+        int baseline_y = y + static_cast<int>(std::round(px * 0.88f));
+        uint32_t base_a = (argb >> 24) & 0xFFu;
+        uint32_t rgb = argb & 0x00FFFFFFu;
+        int cx = x;
+        size_t idx = 0;
+        while (idx < raw_text.size()) {
+            uint32_t cp = FontEngine::next_utf8_codepoint(raw_text, idx);
+            const CachedGlyph* g = fe.get_glyph(cp, px, bold, monospace);
+            if (!g) { cx += px / 2; continue; }
+            int gx0 = cx + g->bearing_x;
+            int gy0 = baseline_y - g->bearing_y;
+            for (int row = 0; row < g->height; ++row) {
+                int py = gy0 + row;
+                if (py < 0 || py >= height_) continue;
+                for (int col = 0; col < g->width; ++col) {
+                    uint8_t cov = g->alpha[static_cast<size_t>(row * g->width + col)];
+                    if (cov == 0) continue;
+                    int pxx = gx0 + col;
+                    if (pxx < 0 || pxx >= width_) continue;
+                    uint32_t eff_a = (base_a * cov) / 255u;
+                    if (eff_a > 0) blend_pixel(pxx, py, (eff_a << 24) | rgb);
+                }
+            }
+            cx += g->advance_x;
+            if (cx > width_) break;
+        }
+        return;
+    }
+
     std::string text = utf8_to_printable(raw_text);
     int scale = (font_size >= 26.0f) ? 3 : ((font_size >= 18.0f) ? 2 : 1);
     int adv = scale * 8 + (bold ? 1 : 0);
@@ -249,47 +283,47 @@ int Framebuffer::draw_browser_chrome(const ChromeStatus& st) {
     fill_rect(0, tab_bar_h, width_, nav_bar_h, 0xFF111827u);
     fill_rect(0, total_h - 1, width_, 1, 0xFF1F2937u);
 
-    fill_rounded_rect(10, 7, 68, 24, 6, 0xFF0284C7u);
-    draw_text(21, 15, "ASTRA", 0xFFFFFFFFu, 12.0f, true);
+    fill_rounded_rect(10, 7, 72, 24, 6, 0xFF0284C7u);
+    draw_text(20, 12, "ASTRA", 0xFFFFFFFFu, 13.0f, true, false);
 
-    int tx = 88;
+    int tx = 92;
     size_t max_tabs = std::min<size_t>(st.tab_titles.size(), 5);
     for (size_t i = 0; i < max_tabs; ++i) {
         bool active = (i == st.active_tab_index);
-        int tw = 195;
+        int tw = 205;
         fill_rounded_rect(tx, 6, tw, 28, 8, active ? 0xFF1E293Bu : 0xFF111827u);
         if (active) fill_rect(tx + 12, 6, tw - 24, 2, 0xFF38BDF8u);
         std::string lbl = st.tab_titles[i];
-        if (lbl.size() > 21) lbl = lbl.substr(0, 19) + "..";
-        draw_text(tx + 10, 16, lbl, active ? 0xFFF8FAFCu : 0xFF94A3B8u, 12.0f, active);
+        if (lbl.size() > 24) lbl = lbl.substr(0, 22) + "..";
+        draw_text(tx + 12, 13, lbl, active ? 0xFFF8FAFCu : 0xFF94A3B8u, 12.0f, active, false);
         tx += tw + 8;
-        if (tx + 195 > width_) break;
+        if (tx + 205 > width_) break;
     }
 
     int bar_x = 16;
-    int bar_w = std::max(240, width_ - 404);
+    int bar_w = std::max(240, width_ - 416);
     fill_rounded_rect(bar_x, tab_bar_h + 8, bar_w, 30, 8, 0xFF0B1120u);
     stroke_rounded_rect(bar_x, tab_bar_h + 8, bar_w, 30, 8, 1,
                         st.tls_verified ? 0xFF10B981u : 0xFF334155u);
     std::string url_disp = (st.tls_verified ? "[TLS] " : "") + st.active_url;
-    draw_text(bar_x + 12, tab_bar_h + 19, url_disp, 0xFFE2E8F0u, 13.0f, false);
+    draw_text(bar_x + 12, tab_bar_h + 15, url_disp, 0xFFE2E8F0u, 13.0f, false, true);
 
     int rx = bar_x + bar_w + 12;
     std::string shield_txt = "SHIELD:" + std::to_string(st.trackers_blocked);
-    fill_rounded_rect(rx, tab_bar_h + 8, 106, 30, 8, 0xFF064E3Bu);
-    draw_text(rx + 12, tab_bar_h + 19, shield_txt, 0xFF6EE7B7u, 12.0f, true);
+    fill_rounded_rect(rx, tab_bar_h + 8, 108, 30, 8, 0xFF064E3Bu);
+    draw_text(rx + 12, tab_bar_h + 15, shield_txt, 0xFF6EE7B7u, 12.0f, true, true);
 
-    rx += 114;
+    rx += 116;
     std::string ram_txt = "RAM:" + std::to_string(st.rss_mb) + "/" + std::to_string(st.ceiling_mb) + "MB";
     uint32_t ram_bg = (st.rss_mb * 100 / std::max<uint64_t>(1, st.ceiling_mb) > 80) ? 0xFF7F1D1Du : 0xFF1E293Bu;
-    fill_rounded_rect(rx, tab_bar_h + 8, 174, 30, 8, ram_bg);
-    draw_text(rx + 12, tab_bar_h + 19, ram_txt, 0xFF38BDF8u, 12.0f, true);
+    fill_rounded_rect(rx, tab_bar_h + 8, 180, 30, 8, ram_bg);
+    draw_text(rx + 12, tab_bar_h + 15, ram_txt, 0xFF38BDF8u, 12.0f, true, true);
 
-    rx += 182;
-    if (rx + 74 <= width_) {
+    rx += 188;
+    if (rx + 76 <= width_) {
         std::string ext_txt = "EXT:" + std::to_string(st.extensions_loaded);
-        fill_rounded_rect(rx, tab_bar_h + 8, 72, 30, 8, 0xFF312E81u);
-        draw_text(rx + 12, tab_bar_h + 19, ext_txt, 0xFFC7D2FEu, 12.0f, true);
+        fill_rounded_rect(rx, tab_bar_h + 8, 76, 30, 8, 0xFF312E81u);
+        draw_text(rx + 12, tab_bar_h + 15, ext_txt, 0xFFC7D2FEu, 12.0f, true, true);
     }
 
     return total_h;
@@ -328,9 +362,33 @@ void Framebuffer::composite_display_list(const DisplayList& dl,
             }
             case DisplayItemType::DrawText:
                 if (iy >= y_offset) {
-                    draw_text(ix, iy, item.text, item.color_argb, item.font_size, item.bold);
+                    draw_text(ix, iy, item.text, item.color_argb, item.font_size, item.bold, item.monospace);
                 }
                 break;
+            case DisplayItemType::DrawInput: {
+                int cy = std::max(y_offset, iy);
+                int ch = std::min(height_, iy + ih) - cy;
+                if (ch > 0) {
+                    int rad = static_cast<int>(item.radius);
+                    fill_rounded_rect(ix, cy, iw, ch, rad, item.focused ? 0xFF0F1B2Eu : 0xFF0B1120u);
+                    stroke_rounded_rect(ix, cy, iw, ch, rad, item.focused ? 2 : 1,
+                                        item.focused ? 0xFF38BDF8u : 0xFF334155u);
+                    int ty = iy + std::max(4, (ih - static_cast<int>(item.font_size)) / 2 - 1);
+                    if (ty >= y_offset && ty < height_ - 4) {
+                        draw_text(ix + 12, ty, item.text, item.color_argb, item.font_size, false, false);
+                        if (item.focused) {
+                            float tw = (item.color_argb == 0xFF64748Bu)
+                                           ? 0.0f
+                                           : FontEngine::instance().measure_text(item.text, item.font_size, false, false);
+                            int caret_x = ix + 13 + static_cast<int>(std::round(tw));
+                            if (caret_x < ix + iw - 6) {
+                                fill_rect(caret_x, ty, 2, static_cast<int>(item.font_size) + 2, 0xFF38BDF8u);
+                            }
+                        }
+                    }
+                }
+                break;
+            }
             case DisplayItemType::DrawImage: {
                 int cx = std::max(0, ix);
                 int cy = std::max(y_offset, iy);
@@ -342,7 +400,7 @@ void Framebuffer::composite_display_list(const DisplayList& dl,
                     stroke_rounded_rect(cx, cy, cw, ch, 6, 1, 0xFF334155u);
                 } else {
                     fill_rounded_rect(cx, cy, cw, ch, 6, 0xFF1E293Bu);
-                    draw_text(cx + 8, cy + ch / 2 - 4, "[IMG] " + item.text, 0xFF94A3B8u, 11.0f, false);
+                    draw_text(cx + 8, cy + ch / 2 - 6, "[IMG] " + item.text, 0xFF94A3B8u, 11.0f, false, true);
                 }
                 break;
             }
@@ -356,8 +414,9 @@ void Framebuffer::composite_display_list(const DisplayList& dl,
                                                            item.text, time3d_sec, cam3d);
                     stroke_rounded_rect(cx, cy, cw, ch, 6, 1, 0xFF38BDF8u);
                     std::string hud = "Astra3D Smooth | " + std::to_string(st3d.triangles_rasterized) + " tris";
-                    fill_rounded_rect(cx + 10, cy + ch - 28, std::min(cw - 20, 320), 20, 4, 0xCC0A0F1Au);
-                    draw_text(cx + 18, cy + ch - 22, hud, 0xFF7DD3FCu, 11.0f, true);
+                    int hud_w = std::min(cw - 20, static_cast<int>(FontEngine::instance().measure_text(hud, 11.0f, true, true)) + 20);
+                    fill_rounded_rect(cx + 10, cy + ch - 28, hud_w, 22, 4, 0xCC0A0F1Au);
+                    draw_text(cx + 18, cy + ch - 23, hud, 0xFF7DD3FCu, 11.0f, true, true);
                 }
                 break;
             }
@@ -371,13 +430,13 @@ void Framebuffer::composite_display_list(const DisplayList& dl,
                     frame.width > 0 && frame.height > 0 && !frame.argb.empty()) {
                     blit_scaled(cx, cy, cw, ch, frame.argb.data(), frame.width, frame.height);
                     stroke_rounded_rect(cx, cy, cw, ch, 6, 1, 0xFF34D399u);
-                    int pill_w = std::min(cw - 20, static_cast<int>(frame.label.size()) * 9 + 20);
-                    fill_rounded_rect(cx + 10, cy + ch - 28, pill_w, 20, 4, 0xCC06141Eu);
-                    draw_text(cx + 18, cy + ch - 22, frame.label, 0xFF6EE7B7u, 11.0f, true);
+                    int pill_w = std::min(cw - 20, static_cast<int>(FontEngine::instance().measure_text(frame.label, 11.0f, true, true)) + 20);
+                    fill_rounded_rect(cx + 10, cy + ch - 28, pill_w, 22, 4, 0xCC06141Eu);
+                    draw_text(cx + 18, cy + ch - 23, frame.label, 0xFF6EE7B7u, 11.0f, true, true);
                 } else {
                     fill_rounded_rect(cx, cy, cw, ch, 8, 0xFF0F172Au);
                     stroke_rounded_rect(cx, cy, cw, ch, 8, 1, 0xFF475569u);
-                    draw_text(cx + 16, cy + ch / 2 - 6, "AstraMedia Video: " + item.text, 0xFF94A3B8u, 13.0f, true);
+                    draw_text(cx + 16, cy + ch / 2 - 6, "AstraMedia Video: " + item.text, 0xFF94A3B8u, 13.0f, true, false);
                 }
                 break;
             }
@@ -535,8 +594,10 @@ bool Framebuffer::present_x11_interactive(const std::string& window_title,
             }
             if (callbacks.on_repaint) callbacks.on_repaint(*this);
             blit_now();
-        } else if (ev.type == 2) { // KeyPress (Escape=9, q=24, Down=116, Up=111)
-            if (ev.xkey.keycode == 9 || ev.xkey.keycode == 24) {
+        } else if (ev.type == 2) { // KeyPress (Escape=9, Backspace=22, Enter=36, Down=116, Up=111)
+            using XLookupString_fn = int (*)(void*, char*, int, unsigned long*, void*);
+            static auto XLookupString = reinterpret_cast<XLookupString_fn>(dlsym(x11, "XLookupString"));
+            if (ev.xkey.keycode == 9) {
                 running = false;
             } else if (ev.xkey.keycode == 116 && callbacks.on_scroll) {
                 callbacks.on_scroll(80);
@@ -546,6 +607,23 @@ bool Framebuffer::present_x11_interactive(const std::string& window_title,
                 callbacks.on_scroll(-80);
                 if (callbacks.on_repaint) callbacks.on_repaint(*this);
                 blit_now();
+            } else if (ev.xkey.keycode == 22 && callbacks.on_backspace) {
+                callbacks.on_backspace();
+                if (callbacks.on_repaint) callbacks.on_repaint(*this);
+                blit_now();
+            } else if (ev.xkey.keycode == 36 && callbacks.on_enter) {
+                callbacks.on_enter();
+                if (callbacks.on_repaint) callbacks.on_repaint(*this);
+                blit_now();
+            } else if (XLookupString && callbacks.on_text) {
+                char buf[16] = {};
+                unsigned long ks = 0;
+                int n = XLookupString(&ev.xkey, buf, sizeof(buf) - 1, &ks, nullptr);
+                if (n > 0 && buf[0] >= 32 && buf[0] < 127) {
+                    callbacks.on_text(std::string(buf, static_cast<size_t>(n)));
+                    if (callbacks.on_repaint) callbacks.on_repaint(*this);
+                    blit_now();
+                }
             }
         }
     }

@@ -5,6 +5,7 @@
 #include "docs/doc_viewer.hpp"
 #include "ext/extension_runtime.hpp"
 #include "gfx/astra3d.hpp"
+#include "gfx/font_engine.hpp"
 #include "gfx/image_decoder.hpp"
 #include "gfx/rasterizer.hpp"
 #include "ipc/ipc_channel.hpp"
@@ -42,7 +43,7 @@ void expect(bool cond, const std::string& label) {
 }
 
 int run_full_test_suite() {
-    std::cout << "=== Astra Browser Core v2 — Full Subsystem Verification Suite ===\n\n";
+    std::cout << "=== Astra Browser Core v3 — Full Subsystem Verification Suite ===\n\n";
 
     // 1. SlabArena + OS Reclamation
     {
@@ -233,6 +234,113 @@ int run_full_test_suite() {
         expect(mem.total_rss_bytes > 0 && mem.total_rss_bytes < 256ULL * 1024 * 1024 && mem.processes.size() >= 3,
                "MemoryGovernor tracks real Linux /proc RSS across Main + Content + RDD workers");
 
+        // 12. AstraFont Native TrueType Vector Typography + UTF-8 + Bounded LRU Cache
+        {
+            auto& fe = FontEngine::instance();
+            float w_en = fe.measure_text("Astra Browser", 18.0f, true, false);
+            float w_es = fe.measure_text("Navegación rápida — España", 16.0f, false, false);
+            float w_mono = fe.measure_text("0xFF38BDF8", 13.0f, false, true);
+            expect(fe.freetype_active() && w_en > 80.0f && w_es > 120.0f && w_mono > 50.0f &&
+                   fe.cached_glyph_count() >= 15 && fe.cache_bytes() <= FontEngine::kMaxCacheBytes,
+                   "AstraFont loads libfreetype.so.6 via dlopen, renders UTF-8 TrueType glyphs within 4 MiB LRU cap");
+        }
+
+        // 13. AstraImage v2 Native Pure-C++20 Baseline DCT JPEG Decoder
+        {
+            std::string jpg = "astra/examples/astra_nebula.jpg";
+            if (!std::ifstream(jpg)) jpg = "examples/astra_nebula.jpg";
+            DecodedImage jimg = ImageDecoder::decode_file(jpg);
+            bool non_uniform = false;
+            if (jimg.valid && jimg.argb.size() > 100) {
+                uint32_t first = jimg.argb[0];
+                for (size_t i = 1; i < jimg.argb.size(); i += 97) {
+                    if (jimg.argb[i] != first) { non_uniform = true; break; }
+                }
+            }
+            expect(jimg.valid && jimg.format == "JPEG" && jimg.width >= 300 && jimg.height >= 180 && non_uniform,
+                   "AstraImage v2 pure-C++20 Baseline DCT JPEG decoder decodes real YCbCr JPEG images natively");
+        }
+
+        // 14. CSS Grid Multi-Column + Multi-Row Layout Engine
+        {
+            SlabArena ga;
+            HtmlDocument gdoc = HtmlDocument::parse(
+                ga,
+                "<html><head><style>"
+                ".g { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }"
+                ".c { height: 60px; background: #1e293b; }"
+                "</style></head><body><div class=\"g\">"
+                "<div class=\"c\">1</div><div class=\"c\">2</div><div class=\"c\">3</div>"
+                "<div class=\"c\">4</div><div class=\"c\">5</div><div class=\"c\">6</div>"
+                "</div></body></html>");
+            CssStylesheet gsheet;
+            gsheet.parse(gdoc.collect_stylesheets());
+            LayoutFrame* groot = LayoutEngine::build_layout(ga, gdoc, gsheet, 960.0f, 600.0f);
+            LayoutFrame* grid = (groot && !groot->children.empty()) ? groot->children[0] : nullptr;
+            bool ok_grid = grid && grid->children.size() == 6 &&
+                           grid->children[0]->border_box.x < grid->children[1]->border_box.x &&
+                           grid->children[1]->border_box.x < grid->children[2]->border_box.x &&
+                           std::abs(grid->children[0]->border_box.y - grid->children[2]->border_box.y) < 1.0f &&
+                           grid->children[3]->border_box.y > grid->children[0]->border_box.y + 60.0f;
+            expect(ok_grid,
+                   "CSS Grid (display: grid + repeat(3, 1fr) + gap) computes multi-column/multi-row geometry accurately");
+        }
+
+        // 15. Interactive <input> Focus, Keyboard Typing & AstraJS v3 input/submit Events
+        {
+            const std::string fpath = "/tmp/astra_input_test.html";
+            {
+                std::ofstream f(fpath);
+                f << "<!doctype html><html><body>"
+                  << "<input id=\"q\" placeholder=\"Search...\">"
+                  << "<p id=\"out\">idle</p>"
+                  << "<script>"
+                  << "let inp = document.querySelector(\"#q\");"
+                  << "inp.addEventListener(\"input\", function() { document.querySelector(\"#out\").textContent = \"typing:\" + inp.value; });"
+                  << "inp.addEventListener(\"submit\", function() { document.querySelector(\"#out\").textContent = \"submitted:\" + inp.value.toUpperCase(); });"
+                  << "</script></body></html>";
+            }
+            app.new_tab("file://" + fpath);
+            const Tab* tptr = app.active_tab();
+            int hit_x = 80, hit_y = Framebuffer::kChromeHeight + 40;
+            if (tptr) {
+                for (const auto& hr : tptr->cached_display_list.hit_regions) {
+                    if (hr.kind == HitRegionKind::Input) {
+                        hit_x = static_cast<int>(hr.rect.x + 20);
+                        hit_y = Framebuffer::kChromeHeight + static_cast<int>(hr.rect.y + 16);
+                    }
+                }
+            }
+            auto cr = app.click_at(hit_x, hit_y);
+            bool typed = app.type_text("astra v3");
+            std::string mid_txt = app.active_tab()->live_doc->query_selector("#out")->text_content();
+            bool submitted = app.press_enter();
+            std::string end_txt = app.active_tab()->live_doc->query_selector("#out")->text_content();
+            expect(cr.handled && cr.action == "focus_input" && typed && submitted &&
+                   mid_txt == "typing:astra v3" && end_txt == "submitted:ASTRA V3",
+                   "Interactive <input> focus, keyboard typing, and Enter dispatch real input/submit events in AstraJS v3");
+        }
+
+        // 16. AstraJS v3 Web APIs: fetch() via AstraShield + HttpCache, JSON.parse/stringify, localStorage
+        {
+            const std::string apath = "/tmp/astra_webapi_test.html";
+            {
+                std::ofstream f(apath);
+                f << "<!doctype html><html><body><p id=\"res\">init</p><script>"
+                  << "localStorage.setItem(\"engine\", \"AstraV3\");"
+                  << "let obj = JSON.parse(\"{\\\"ver\\\":3,\\\"tags\\\":[\\\"cpp\\\",\\\"fast\\\"]}\");"
+                  << "let ser = JSON.stringify({ ok: true, v: obj.ver });"
+                  << "let blocked = fetch(\"https://doubleclick.net/pixel.js\");"
+                  << "let live = fetch(\"https://example.com\");"
+                  << "document.querySelector(\"#res\").textContent = localStorage.getItem(\"engine\") + \"|\" + obj.tags[1] + \"|\" + blocked.blockedByShield + \"|\" + live.status + \"|\" + ser;"
+                  << "</script></body></html>";
+            }
+            app.new_tab("file://" + apath);
+            std::string res_txt = app.active_tab()->live_doc->query_selector("#res")->text_content();
+            expect(res_txt.find("AstraV3|fast|true|200|") == 0 && res_txt.find("\"v\":3") != std::string::npos,
+                   "AstraJS v3 executes fetch() (with AstraShield blocking + live HTTPS), JSON.parse/stringify, and localStorage");
+        }
+
         app.stop_workers();
     }
 
@@ -241,7 +349,7 @@ int run_full_test_suite() {
 }
 
 int run_stress_test(int tab_count, uint64_t ceiling_mb) {
-    std::cout << "=== Astra v2 Multi-Tab Stress Test (" << tab_count << " tabs, ceiling " << ceiling_mb << " MB) ===\n";
+    std::cout << "=== Astra v3 Multi-Tab Stress Test (" << tab_count << " tabs, ceiling " << ceiling_mb << " MB) ===\n";
     BrowserApp app(ceiling_mb * 1024ULL * 1024ULL);
     app.start_workers();
 
@@ -300,12 +408,13 @@ int run_stress_test(int tab_count, uint64_t ceiling_mb) {
 
 void print_help() {
     std::cout
-        << "Astra Browser Core v2 (Native C++20 Multi-Process Engine)\n"
+        << "Astra Browser Core v3 (Native C++20 Multi-Process Engine)\n"
         << "Usage:\n"
-        << "  astra --test                                Run full Session 2 subsystem suite\n"
+        << "  astra --test                                Run full Session 3 subsystem suite\n"
         << "  astra --url <URL> [--out <file.png>]        Load URL & render PNG\n"
         << "        [--ext <extension_dir>]               Load Manifest V3 WebExtension\n"
         << "        [--scroll <px>] [--click <x,y>]       Simulate APZ scroll or mouse click before render\n"
+        << "        [--type <text>] [--enter]             Type into focused <input> and press Enter\n"
         << "        [--video-frame <N>] [--wireframe]     Select video frame or 3D wireframe mode\n"
         << "        [--gui]                               Open interactive Linux X11 desktop window\n"
         << "  astra --stress-tabs <N> [--cap <MB>]        Stress-test N tabs with real /proc RSS check\n"
@@ -320,7 +429,8 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    std::string mode_url, out_png, ext_dir, click_spec;
+    std::string mode_url, out_png, ext_dir;
+    std::vector<std::pair<std::string, std::string>> cli_actions;
     bool run_tests = false, open_gui = false, run_repl = false, wireframe = false;
     int stress_tabs = 0;
     float scroll_px = 0.0f;
@@ -336,7 +446,9 @@ int main(int argc, char** argv) {
         else if (arg == "--url" && i + 1 < argc) mode_url = argv[++i];
         else if (arg == "--out" && i + 1 < argc) out_png = argv[++i];
         else if (arg == "--ext" && i + 1 < argc) ext_dir = argv[++i];
-        else if (arg == "--click" && i + 1 < argc) click_spec = argv[++i];
+        else if (arg == "--click" && i + 1 < argc) cli_actions.emplace_back("click", argv[++i]);
+        else if (arg == "--type" && i + 1 < argc) cli_actions.emplace_back("type", argv[++i]);
+        else if (arg == "--enter") cli_actions.emplace_back("enter", "");
         else if (arg == "--scroll" && i + 1 < argc) scroll_px = std::strtof(argv[++i], nullptr);
         else if (arg == "--video-frame" && i + 1 < argc) video_frame = static_cast<uint32_t>(std::atoi(argv[++i]));
         else if (arg == "--stress-tabs" && i + 1 < argc) stress_tabs = std::atoi(argv[++i]);
@@ -378,14 +490,22 @@ int main(int argc, char** argv) {
         if (scroll_px != 0.0f) {
             app.scroll_active_tab(scroll_px);
         }
-        if (!click_spec.empty()) {
-            size_t comma = click_spec.find(',');
-            if (comma != std::string::npos) {
-                int cx = std::atoi(click_spec.substr(0, comma).c_str());
-                int cy = std::atoi(click_spec.substr(comma + 1).c_str());
-                auto cr = app.click_at(cx, cy);
-                std::cout << "[Astra] Click(" << cx << "," << cy << "): "
-                          << (cr.handled ? (cr.action + " -> " + cr.detail) : "no hit") << "\n";
+        for (const auto& [act, val] : cli_actions) {
+            if (act == "click") {
+                size_t comma = val.find(',');
+                if (comma != std::string::npos) {
+                    int cx = std::atoi(val.substr(0, comma).c_str());
+                    int cy = std::atoi(val.substr(comma + 1).c_str());
+                    auto cr = app.click_at(cx, cy);
+                    std::cout << "[Astra] Click(" << cx << "," << cy << "): "
+                              << (cr.handled ? (cr.action + " -> " + cr.detail) : "no hit") << "\n";
+                }
+            } else if (act == "type") {
+                bool ok = app.type_text(val);
+                std::cout << "[Astra] Type(\"" << val << "\"): " << (ok ? "OK" : "no focused input") << "\n";
+            } else if (act == "enter") {
+                bool ok = app.press_enter();
+                std::cout << "[Astra] Enter: " << (ok ? "submitted" : "no focused input") << "\n";
             }
         }
 
@@ -415,7 +535,7 @@ int main(int argc, char** argv) {
     }
 
     if (run_repl) {
-        std::cout << "Astra v2 Interactive Shell (open <url>, tabs, switch <id>, scroll <px>, click <x> <y>, mem, shield, cache, render <file.png>, quit)\n";
+        std::cout << "Astra v3 Interactive Shell (open <url>, tabs, switch <id>, scroll <px>, click <x> <y>, type <text>, enter, mem, shield, cache, render <file.png>, quit)\n";
         app.new_tab("astra://home");
         std::string line;
         while (std::cout << "astra> " && std::getline(std::cin, line)) {
@@ -444,6 +564,12 @@ int main(int argc, char** argv) {
                 int x = 0, y = 0; iss >> x >> y;
                 auto cr = app.click_at(x, y);
                 std::cout << (cr.handled ? (cr.action + ": " + cr.detail + "\n") : "No interactive hit.\n");
+            } else if (cmd == "type") {
+                std::string txt;
+                std::getline(iss >> std::ws, txt);
+                std::cout << (app.type_text(txt) ? "Typed.\n" : "No focused input.\n");
+            } else if (cmd == "enter") {
+                std::cout << (app.press_enter() ? "Submitted.\n" : "No focused input.\n");
             } else if (cmd == "mem") {
                 auto m = app.memory_snapshot();
                 std::cout << "Total RSS: " << (m.total_rss_bytes / (1024.0 * 1024.0)) << " MB / "

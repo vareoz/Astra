@@ -115,12 +115,23 @@ struct JsExecutionReport {
     GcStats gc;
 };
 
-// AstraJS v2: Lexer -> Recursive-Descent Compiler -> Stack Bytecode VM
-// + Mark-and-Sweep Garbage Collector + Microtask/Timer Event Loop + DOM Events.
+struct JsFetchResult {
+    bool ok = false;
+    int status = 0;
+    std::string body;
+    std::string error;
+    bool from_cache = false;
+    bool blocked_by_shield = false;
+};
+
+// AstraJS v3: Lexer -> Recursive-Descent Compiler -> Stack Bytecode VM
+// + Mark-and-Sweep GC + Microtask/Timer Event Loop + DOM Events
+// + Web APIs: fetch() (via AstraShield/HttpCache), JSON.parse/stringify, localStorage.
 class AstraJsEngine {
 public:
     using StorageGetFn = std::function<std::string(const std::string&)>;
     using StorageSetFn = std::function<void(const std::string&, const std::string&)>;
+    using FetchFn = std::function<JsFetchResult(const std::string& url)>;
 
     AstraJsEngine() = default;
     ~AstraJsEngine();
@@ -129,9 +140,10 @@ public:
     AstraJsEngine& operator=(const AstraJsEngine&) = delete;
 
     void bind_storage(StorageGetFn getter, StorageSetFn setter);
+    void bind_fetch(FetchFn fetcher);
     JsExecutionReport execute(std::string_view code, HtmlDocument& doc);
 
-    // Dispatch a real DOM event (e.g. "click") to registered JS bytecode handlers
+    // Dispatch a real DOM event (e.g. "click", "input", "submit") to registered JS bytecode handlers
     JsExecutionReport dispatch_event(DomNode* target, const std::string& event_name, HtmlDocument& doc);
 
     // Trigger explicit Mark-and-Sweep Garbage Collection cycle
@@ -171,9 +183,11 @@ private:
     std::vector<TimerEntry> timers_;
     // DOM event listeners: (node_ptr, event_name) -> callbacks
     std::map<std::pair<DomNode*, std::string>, std::vector<JsValue>> listeners_;
+    std::unordered_map<std::string, std::string> local_storage_;
 
     StorageGetFn storage_get_;
     StorageSetFn storage_set_;
+    FetchFn fetch_fn_;
 };
 
 } // namespace astra

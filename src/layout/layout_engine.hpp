@@ -32,7 +32,8 @@ enum class DisplayItemType : uint32_t {
     DrawText = 3,
     Embed3D = 4,
     EmbedVideo = 5,
-    DrawImage = 6
+    DrawImage = 6,
+    DrawInput = 7
 };
 
 struct DisplayItem {
@@ -43,6 +44,8 @@ struct DisplayItem {
     float thickness = 1.0f;
     float font_size = 14.0f;
     bool bold = false;
+    bool monospace = false;
+    bool focused = false;
     std::string text;
 };
 
@@ -50,13 +53,14 @@ enum class HitRegionKind : uint32_t {
     Link = 1,
     Button = 2,
     Scene3D = 3,
-    Video = 4
+    Video = 4,
+    Input = 5
 };
 
 struct HitRegion {
     HitRegionKind kind = HitRegionKind::Link;
     Rect rect;
-    std::string target; // href for Link, id/selector for Button, src for Video/3D
+    std::string target; // href for Link, id/selector for Button/Input, src for Video/3D
 };
 
 struct DisplayList {

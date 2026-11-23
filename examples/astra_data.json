@@ -1,0 +1,6 @@
+{
+  "engine": "Astra Browser Core v3",
+  "renderer": "AstraFont TrueType + Baseline JPEG/PNG + CSS Grid",
+  "ramCeilingMB": 2048,
+  "features": ["TrueType", "JPEG-DCT", "CSS-Grid", "Forms", "fetch-API"]
+}

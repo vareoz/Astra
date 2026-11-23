@@ -15,6 +15,7 @@ SRCS := \
 	src/layout/layout_engine.cpp \
 	src/js/astra_js.cpp \
 	src/ext/extension_runtime.cpp \
+	src/gfx/font_engine.cpp \
 	src/gfx/image_decoder.cpp \
 	src/gfx/rasterizer.cpp \
 	src/gfx/astra3d.cpp \

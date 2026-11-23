@@ -46,6 +46,7 @@ struct Tab {
     std::unique_ptr<HtmlDocument> live_doc;
     std::unique_ptr<AstraJsEngine> js_vm;
     DisplayList cached_display_list;
+    std::string focused_input_selector;
     std::vector<std::string> console_logs;
 };
 
@@ -94,9 +95,12 @@ public:
     bool dehydrate_lru_background_tab();
     size_t enforce_memory_budget();
 
-    // Interactive APZ scroll + hit-testing click dispatch
+    // Interactive APZ scroll + hit-testing click + form keyboard input
     void scroll_active_tab(float delta_y);
     ClickResult click_at(int x, int y);
+    bool type_text(const std::string& text);
+    bool backspace();
+    bool press_enter();
     void set_3d_camera(const Camera3D& cam) { cam3d_ = cam; }
     void set_video_frame(uint32_t idx) { video_frame_idx_ = idx; }
 
@@ -132,6 +136,7 @@ private:
     std::string fetch_external_stylesheets(const HtmlDocument& doc,
                                            const std::string& base_url,
                                            size_t& loaded_count);
+    JsFetchResult perform_js_fetch(const std::string& base_url, const std::string& url);
     bool render_html_via_content_ipc(const std::string& html,
                                      const std::string& extra_css,
                                      uint32_t vw, uint32_t vh,

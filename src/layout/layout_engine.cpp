@@ -1,4 +1,5 @@
 #include "layout/layout_engine.hpp"
+#include "gfx/font_engine.hpp"
 #include "ipc/ipc_channel.hpp"
 
 #include <algorithm>
@@ -10,26 +11,14 @@ namespace astra {
 
 namespace {
 
-int glyph_scale_for_size(float font_size) {
-    if (font_size >= 26.0f) return 3;
-    if (font_size >= 18.0f) return 2;
-    return 1;
-}
-
-float char_advance(float font_size, bool bold) {
-    int scale = glyph_scale_for_size(font_size);
-    return static_cast<float>(scale * 8 + (bold ? 1 : 0));
-}
-
 float line_height_for_size(float font_size) {
-    int scale = glyph_scale_for_size(font_size);
-    return static_cast<float>(scale * 8) * 1.65f;
+    return FontEngine::instance().line_height(font_size);
 }
 
-std::vector<std::string> wrap_text(const std::string& raw, float max_width, float font_size, bool bold) {
+std::vector<std::string> wrap_text(const std::string& raw, float max_width, float font_size, bool bold, bool mono) {
     std::vector<std::string> lines;
-    float adv = char_advance(font_size, bold);
-    size_t max_chars = std::max<size_t>(8, static_cast<size_t>(max_width / adv));
+    auto& fe = FontEngine::instance();
+    float usable_w = std::max(40.0f, max_width);
 
     std::string cur;
     size_t i = 0;
@@ -47,12 +36,14 @@ std::vector<std::string> wrap_text(const std::string& raw, float max_width, floa
         std::string word = raw.substr(wstart, i - wstart);
         if (cur.empty()) {
             cur = std::move(word);
-        } else if (cur.size() + 1 + word.size() <= max_chars) {
-            cur.push_back(' ');
-            cur += word;
         } else {
-            lines.push_back(std::move(cur));
-            cur = std::move(word);
+            std::string cand = cur + " " + word;
+            if (fe.measure_text(cand, font_size, bold, mono) <= usable_w) {
+                cur = std::move(cand);
+            } else {
+                lines.push_back(std::move(cur));
+                cur = std::move(word);
+            }
         }
     }
     if (!cur.empty()) lines.push_back(std::move(cur));
@@ -143,11 +134,17 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w) {
             frame->border_box.h = h + pad_y + st.padding.bottom + st.border_width;
             return;
         }
+        if (tag == "input" || tag == "textarea") {
+            float h = (st.height > 0.0f) ? st.height : (tag == "textarea" ? 88.0f : 38.0f);
+            frame->border_box.h = h;
+            frame->content_box.h = std::max(16.0f, h - pad_y - st.padding.bottom - st.border_width);
+            return;
+        }
     }
 
     // Text frame
     if (frame->node && frame->node->type == NodeType::Text) {
-        frame->wrapped_lines = wrap_text(frame->node->text, inner_w, st.font_size, st.bold);
+        frame->wrapped_lines = wrap_text(frame->node->text, inner_w, st.font_size, st.bold, st.monospace);
         float lh = line_height_for_size(st.font_size);
         frame->content_box.h = static_cast<float>(frame->wrapped_lines.size()) * lh;
         frame->border_box.h = frame->content_box.h;
@@ -156,7 +153,41 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w) {
 
     float cur_y = frame->content_box.y;
 
-    if (st.display == DisplayType::Flex && st.flex_direction == FlexDirection::Row && !frame->children.empty()) {
+    if (st.display == DisplayType::Grid && !frame->children.empty()) {
+        std::vector<GridTrack> cols = st.grid_columns;
+        if (cols.empty()) cols = {GridTrack{1.0f, true}, GridTrack{1.0f, true}};
+        size_t ncols = cols.size();
+        float total_gap = st.gap * static_cast<float>(ncols > 1 ? ncols - 1 : 0);
+        float fixed_px = 0.0f;
+        float total_fr = 0.0f;
+        for (const auto& t : cols) {
+            if (t.is_fr) total_fr += t.value;
+            else fixed_px += t.value;
+        }
+        float rem_w = std::max(0.0f, inner_w - total_gap - fixed_px);
+        std::vector<float> col_w(ncols, 60.0f);
+        std::vector<float> col_x(ncols, frame->content_box.x);
+        float cx = frame->content_box.x;
+        for (size_t c = 0; c < ncols; ++c) {
+            col_w[c] = cols[c].is_fr
+                           ? std::max(40.0f, (total_fr > 0.0f ? rem_w * (cols[c].value / total_fr) : 60.0f))
+                           : cols[c].value;
+            col_x[c] = cx;
+            cx += col_w[c] + st.gap;
+        }
+        size_t idx = 0;
+        while (idx < frame->children.size()) {
+            float row_h = 0.0f;
+            for (size_t c = 0; c < ncols && idx < frame->children.size(); ++c, ++idx) {
+                LayoutFrame* ch = frame->children[idx];
+                layout_node(ch, col_x[c], cur_y, col_w[c]);
+                float ch_h = ch->border_box.h + ch->style.margin.top + ch->style.margin.bottom;
+                row_h = std::max(row_h, ch_h);
+            }
+            cur_y += row_h;
+            if (idx < frame->children.size()) cur_y += st.gap;
+        }
+    } else if (st.display == DisplayType::Flex && st.flex_direction == FlexDirection::Row && !frame->children.empty()) {
         size_t count = frame->children.size();
         float total_gap = st.gap * static_cast<float>(count > 0 ? count - 1 : 0);
         float item_w = std::max(40.0f, (inner_w - total_gap) / static_cast<float>(count));
@@ -243,6 +274,30 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl) {
             item.text = f->node->get_attr("src");
             dl.items.push_back(std::move(item));
             return;
+        } else if (tag == "input" || tag == "textarea") {
+            std::string id = f->node->id();
+            std::string sel = id.empty() ? tag : ("#" + id);
+            dl.hit_regions.push_back(HitRegion{HitRegionKind::Input, f->border_box, sel});
+
+            DisplayItem item;
+            item.type = DisplayItemType::DrawInput;
+            item.rect = f->border_box;
+            item.radius = st.border_radius;
+            item.font_size = st.font_size;
+            item.focused = (f->node->get_attr("data-astra-focused") == "1");
+            std::string val = f->node->get_attr("value");
+            std::string ph = f->node->get_attr("placeholder");
+            std::string input_type = f->node->get_attr("type");
+            if (!val.empty()) {
+                if (input_type == "password") item.text.assign(val.size(), '*');
+                else item.text = val;
+                item.color_argb = st.color.to_argb();
+            } else {
+                item.text = ph;
+                item.color_argb = 0xFF64748Bu; // muted placeholder
+            }
+            dl.items.push_back(std::move(item));
+            return;
         }
     }
 
@@ -256,6 +311,7 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl) {
             item.color_argb = st.color.to_argb();
             item.font_size = st.font_size;
             item.bold = st.bold;
+            item.monospace = st.monospace;
             item.text = line;
             dl.items.push_back(std::move(item));
             ty += lh;
@@ -299,7 +355,8 @@ std::vector<uint8_t> DisplayList::serialize() const {
         write_f32(buf, it.radius);
         write_f32(buf, it.thickness);
         write_f32(buf, it.font_size);
-        write_u32(buf, it.bold ? 1u : 0u);
+        uint32_t flags = (it.bold ? 1u : 0u) | (it.monospace ? 2u : 0u) | (it.focused ? 4u : 0u);
+        write_u32(buf, flags);
         write_str(buf, it.text);
     }
     write_u32(buf, static_cast<uint32_t>(hit_regions.size()));
@@ -328,7 +385,7 @@ bool DisplayList::deserialize(const std::vector<uint8_t>& blob, DisplayList& out
     out.items.reserve(count);
     for (uint32_t i = 0; i < count; ++i) {
         DisplayItem it;
-        uint32_t t = 0, bold_flag = 0;
+        uint32_t t = 0, flags = 0;
         if (!read_u32(blob, off, t)) return false;
         it.type = static_cast<DisplayItemType>(t);
         if (!read_f32(blob, off, it.rect.x)) return false;
@@ -339,8 +396,10 @@ bool DisplayList::deserialize(const std::vector<uint8_t>& blob, DisplayList& out
         if (!read_f32(blob, off, it.radius)) return false;
         if (!read_f32(blob, off, it.thickness)) return false;
         if (!read_f32(blob, off, it.font_size)) return false;
-        if (!read_u32(blob, off, bold_flag)) return false;
-        it.bold = (bold_flag != 0);
+        if (!read_u32(blob, off, flags)) return false;
+        it.bold = (flags & 1u) != 0;
+        it.monospace = (flags & 2u) != 0;
+        it.focused = (flags & 4u) != 0;
         if (!read_str(blob, off, it.text)) return false;
         out.items.push_back(std::move(it));
     }

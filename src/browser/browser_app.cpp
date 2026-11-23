@@ -29,23 +29,23 @@ bool read_local_file(const std::string& path, std::string& out) {
 std::string build_home_html(const AstraShield& shield, size_t ext_count,
                             const MemorySnapshot& mem, const CacheStats& cstats) {
     std::ostringstream html;
-    html << "<!doctype html><html><head><title>Astra Browser v2 — Native Core</title>"
+    html << "<!doctype html><html><head><title>Astra Browser v3 — Native Core</title>"
          << "<style>"
          << "body { background: #0b0f19; color: #e2e8f0; padding: 20px 26px; }"
          << ".hero { background: #111827; border: 1px solid #1e293b; border-radius: 12px; padding: 18px 22px; margin-bottom: 16px; }"
-         << ".kicker { color: #38bdf8; font-size: 12px; font-weight: bold; margin-bottom: 6px; }"
-         << ".grid { display: flex; flex-direction: row; gap: 14px; margin-bottom: 16px; }"
+         << ".kicker { color: #38bdf8; font-size: 12px; font-weight: bold; font-family: monospace; margin-bottom: 6px; }"
+         << ".grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 16px; }"
          << ".card { background: #131c2e; border: 1px solid #24324a; border-radius: 10px; padding: 14px; }"
-         << ".card-title { color: #7dd3fc; font-size: 13px; font-weight: bold; margin-bottom: 6px; }"
+         << ".card-title { color: #7dd3fc; font-size: 12px; font-weight: bold; font-family: monospace; margin-bottom: 6px; }"
          << ".metric { color: #f8fafc; font-size: 20px; font-weight: bold; margin-bottom: 4px; }"
          << ".muted { color: #94a3b8; font-size: 12px; }"
-         << ".media-row { display: flex; flex-direction: row; gap: 16px; }"
+         << ".media-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }"
          << ".panel { background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 12px; }"
          << "</style></head><body>"
          << "<div class=\"hero\">"
-         << "<div class=\"kicker\">ASTRA v2 NATIVE C++20 | BYTECODE JS VM + GC | STRICT TLS | SMOOTH 3D</div>"
-         << "<h1 id=\"headline\">Astra Desktop Browser — Session 2</h1>"
-         << "<p>Multi-process e10s architecture (Main + Content + RDD Media) with AstraJS v2 bytecode VM & Mark-and-Sweep GC, bounded 32 MB HTTP disk cache, native PNG/BMP/PPM image decoder, APZ scroll & click hit-testing, smooth Blinn-Phong Astra3D, and bounded-RAM video playback.</p>"
+         << "<div class=\"kicker\">ASTRA v3 NATIVE C++20 | TRUETYPE VECTOR FONTS | JPEG+PNG | CSS GRID | FETCH()</div>"
+         << "<h1 id=\"headline\">Astra Desktop Browser — Session 3</h1>"
+         << "<p>Multi-process e10s architecture (Main + Content + RDD Media) with anti-aliased TrueType vector typography, pure C++20 Baseline JPEG & PNG decoders, CSS Grid + interactive forms, AstraJS v3 bytecode VM (GC + fetch + JSON + localStorage), strict TLS, and smooth Blinn-Phong Astra3D.</p>"
          << "</div>"
          << "<div class=\"grid\">"
          << "<div class=\"card\"><div class=\"card-title\">MEMORY GOVERNOR</div>"
@@ -56,7 +56,7 @@ std::string build_home_html(const AstraShield& shield, size_t ext_count,
          << "<div class=\"muted\">Total Cookie Partitioning + Strict TLS + GPC</div></div>"
          << "<div class=\"card\"><div class=\"card-title\">WEBEXTENSIONS MV3</div>"
          << "<div class=\"metric\">" << ext_count << " Active</div>"
-         << "<div class=\"muted\">DeclarativeNetRequest + AstraJS v2 Bytecode VM</div></div>"
+         << "<div class=\"muted\">DeclarativeNetRequest + AstraJS v3 Bytecode VM</div></div>"
          << "</div>"
          << "<div class=\"media-row\">"
          << "<div class=\"panel\"><div class=\"card-title\">ASTRA3D v2 SMOOTH SHADER ENGINE</div>"
@@ -429,12 +429,17 @@ NavigationResult BrowserApp::navigate(uint32_t tab_id, const std::string& url) {
 
     tab->live_doc = std::make_unique<HtmlDocument>(HtmlDocument::parse(*tab->live_arena, html));
     tab->js_vm = std::make_unique<AstraJsEngine>();
+    tab->focused_input_selector.clear();
+    std::string fetch_base = final_url;
+    tab->js_vm->bind_fetch([this, fetch_base](const std::string& req_url) {
+        return perform_js_fetch(fetch_base, req_url);
+    });
 
     // Load external <link rel="stylesheet"> subresources through AstraShield + HttpCache
     size_t ext_css_count = 0;
     std::string subresource_css = fetch_external_stylesheets(*tab->live_doc, final_url, ext_css_count);
 
-    // Execute page <script> blocks via AstraJS v2 Bytecode VM
+    // Execute page <script> blocks via AstraJS v3 Bytecode VM
     tab->console_logs.clear();
     auto scripts = tab->live_doc->collect_scripts();
     for (const auto& sc : scripts) {
@@ -602,6 +607,22 @@ ClickResult BrowserApp::click_at(int x, int y) {
         out.handled = true;
         out.action = "navigate";
         out.detail = next_url;
+    } else if (hit->kind == HitRegionKind::Input && active->live_doc) {
+        for (DomNode* inp : active->live_doc->query_selector_all("input")) {
+            inp->set_attr("data-astra-focused", "0");
+        }
+        for (DomNode* ta : active->live_doc->query_selector_all("textarea")) {
+            ta->set_attr("data-astra-focused", "0");
+        }
+        DomNode* el = active->live_doc->query_selector(hit->target);
+        if (el) {
+            el->set_attr("data-astra-focused", "1");
+            active->focused_input_selector = hit->target;
+            relayout_live_tab(*active);
+            out.handled = true;
+            out.action = "focus_input";
+            out.detail = hit->target;
+        }
     } else if (hit->kind == HitRegionKind::Button && active->live_doc && active->js_vm) {
         DomNode* btn = active->live_doc->query_selector(hit->target);
         if (btn) {
@@ -625,6 +646,79 @@ ClickResult BrowserApp::click_at(int x, int y) {
         out.detail = "frame=" + std::to_string(video_frame_idx_);
     }
     return out;
+}
+
+JsFetchResult BrowserApp::perform_js_fetch(const std::string& base_url, const std::string& url) {
+    JsFetchResult out;
+    std::string resolved = HttpClient::resolve_relative_url(base_url, url);
+    if (resolved.rfind("file://", 0) == 0) {
+        std::string path = resolved.substr(7);
+        std::string body;
+        if (read_local_file(path, body)) {
+            out.ok = true;
+            out.status = 200;
+            out.body = std::move(body);
+        } else {
+            out.status = 404;
+            out.error = "File not found: " + path;
+        }
+        return out;
+    }
+    ParsedUrl base_p = parse_url(base_url);
+    std::string top_site = base_p.valid ? base_p.registrable_domain() : "";
+    HttpResponse resp = http_.get(resolved, top_site, false);
+    out.status = resp.status_code;
+    out.body = std::move(resp.body);
+    out.error = resp.error;
+    out.from_cache = resp.from_cache;
+    out.blocked_by_shield = resp.blocked_by_privacy || resp.blocked_by_extension;
+    out.ok = (!out.blocked_by_shield && resp.status_code >= 200 && resp.status_code < 400);
+    return out;
+}
+
+bool BrowserApp::type_text(const std::string& text) {
+    Tab* active = find_tab(active_tab_id_);
+    if (!active || !active->live_doc || active->focused_input_selector.empty()) return false;
+    DomNode* el = active->live_doc->query_selector(active->focused_input_selector);
+    if (!el) return false;
+    std::string cur = el->get_attr("value");
+    cur += text;
+    el->set_attr("value", cur);
+    if (active->js_vm) {
+        auto rep = active->js_vm->dispatch_event(el, "input", *active->live_doc);
+        for (const auto& l : rep.logs) active->console_logs.push_back(l);
+    }
+    relayout_live_tab(*active);
+    return true;
+}
+
+bool BrowserApp::backspace() {
+    Tab* active = find_tab(active_tab_id_);
+    if (!active || !active->live_doc || active->focused_input_selector.empty()) return false;
+    DomNode* el = active->live_doc->query_selector(active->focused_input_selector);
+    if (!el) return false;
+    std::string cur = el->get_attr("value");
+    if (!cur.empty()) cur.pop_back();
+    el->set_attr("value", cur);
+    if (active->js_vm) {
+        auto rep = active->js_vm->dispatch_event(el, "input", *active->live_doc);
+        for (const auto& l : rep.logs) active->console_logs.push_back(l);
+    }
+    relayout_live_tab(*active);
+    return true;
+}
+
+bool BrowserApp::press_enter() {
+    Tab* active = find_tab(active_tab_id_);
+    if (!active || !active->live_doc || active->focused_input_selector.empty()) return false;
+    DomNode* el = active->live_doc->query_selector(active->focused_input_selector);
+    if (!el) return false;
+    if (active->js_vm) {
+        auto rep = active->js_vm->dispatch_event(el, "submit", *active->live_doc);
+        for (const auto& l : rep.logs) active->console_logs.push_back(l);
+    }
+    relayout_live_tab(*active);
+    return true;
 }
 
 bool BrowserApp::decode_video_via_rdd(const std::string& path, uint32_t frame_idx, DecodedVideoFrame& out) {
@@ -716,6 +810,9 @@ bool BrowserApp::render_active_tab(const std::string& out_png_path,
         InteractiveCallbacks cbs;
         cbs.on_click = [this](int x, int y) { click_at(x, y); };
         cbs.on_scroll = [this](int dy) { scroll_active_tab(static_cast<float>(dy)); };
+        cbs.on_text = [this](const std::string& t) { type_text(t); };
+        cbs.on_backspace = [this]() { backspace(); };
+        cbs.on_enter = [this]() { press_enter(); };
         cbs.on_repaint = [this](Framebuffer& f) { paint_active_tab(f); };
         fb.present_x11_interactive("Astra Browser — " + (active ? active->title : "Desktop"), cbs);
     }
