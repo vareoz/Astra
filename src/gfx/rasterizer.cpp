@@ -1,0 +1,556 @@
+#include "gfx/rasterizer.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <dlfcn.h>
+#include <fstream>
+#include <unistd.h>
+
+namespace astra {
+
+namespace {
+
+const uint8_t* glyph_bitmap(unsigned char ch) {
+    static const uint8_t kFont[95][8] = {
+        {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, {0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00},
+        {0x36,0x36,0x24,0x00,0x00,0x00,0x00,0x00}, {0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00},
+        {0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0x00}, {0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0x00},
+        {0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00}, {0x06,0x06,0x03,0x00,0x00,0x00,0x00,0x00},
+        {0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0x00}, {0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0x00},
+        {0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00}, {0x00,0x0C,0x0C,0x3F,0x0C,0x0C,0x00,0x00},
+        {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x06}, {0x00,0x00,0x00,0x3F,0x00,0x00,0x00,0x00},
+        {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x00}, {0x60,0x30,0x18,0x0C,0x06,0x03,0x01,0x00},
+        {0x3E,0x63,0x73,0x7B,0x6F,0x67,0x3E,0x00}, {0x0C,0x0E,0x0C,0x0C,0x0C,0x0C,0x3F,0x00},
+        {0x1E,0x33,0x30,0x1C,0x06,0x33,0x3F,0x00}, {0x1E,0x33,0x30,0x1C,0x30,0x33,0x1E,0x00},
+        {0x38,0x3C,0x36,0x33,0x7F,0x30,0x78,0x00}, {0x3F,0x03,0x1F,0x30,0x30,0x33,0x1E,0x00},
+        {0x1C,0x06,0x03,0x1F,0x33,0x33,0x1E,0x00}, {0x3F,0x33,0x30,0x18,0x0C,0x0C,0x0C,0x00},
+        {0x1E,0x33,0x33,0x1E,0x33,0x33,0x1E,0x00}, {0x1E,0x33,0x33,0x3E,0x30,0x18,0x0E,0x00},
+        {0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x00}, {0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x06},
+        {0x18,0x0C,0x06,0x03,0x06,0x0C,0x18,0x00}, {0x00,0x00,0x3F,0x00,0x00,0x3F,0x00,0x00},
+        {0x06,0x0C,0x18,0x30,0x18,0x0C,0x06,0x00}, {0x1E,0x33,0x30,0x18,0x0C,0x00,0x0C,0x00},
+        {0x3E,0x63,0x7B,0x7B,0x7B,0x03,0x1E,0x00}, {0x0C,0x1E,0x33,0x33,0x3F,0x33,0x33,0x00},
+        {0x3F,0x66,0x66,0x3E,0x66,0x66,0x3F,0x00}, {0x3C,0x66,0x03,0x03,0x03,0x66,0x3C,0x00},
+        {0x1F,0x36,0x66,0x66,0x66,0x36,0x1F,0x00}, {0x7F,0x46,0x16,0x1E,0x16,0x46,0x7F,0x00},
+        {0x7F,0x46,0x16,0x1E,0x16,0x06,0x0F,0x00}, {0x3C,0x66,0x03,0x03,0x73,0x66,0x7C,0x00},
+        {0x33,0x33,0x33,0x3F,0x33,0x33,0x33,0x00}, {0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00},
+        {0x78,0x30,0x30,0x30,0x33,0x33,0x1E,0x00}, {0x67,0x66,0x36,0x1E,0x36,0x66,0x67,0x00},
+        {0x0F,0x06,0x06,0x06,0x46,0x66,0x7F,0x00}, {0x63,0x77,0x7F,0x7F,0x6B,0x63,0x63,0x00},
+        {0x63,0x67,0x6F,0x7B,0x73,0x63,0x63,0x00}, {0x1C,0x36,0x63,0x63,0x63,0x36,0x1C,0x00},
+        {0x3F,0x66,0x66,0x3E,0x06,0x06,0x0F,0x00}, {0x1E,0x33,0x33,0x33,0x3B,0x1E,0x38,0x00},
+        {0x3F,0x66,0x66,0x3E,0x36,0x66,0x67,0x00}, {0x1E,0x33,0x07,0x0E,0x38,0x33,0x1E,0x00},
+        {0x3F,0x2D,0x0C,0x0C,0x0C,0x0C,0x1E,0x00}, {0x33,0x33,0x33,0x33,0x33,0x33,0x3F,0x00},
+        {0x33,0x33,0x33,0x33,0x33,0x1E,0x0C,0x00}, {0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0x00},
+        {0x63,0x63,0x36,0x1C,0x1C,0x36,0x63,0x00}, {0x33,0x33,0x33,0x1E,0x0C,0x0C,0x1E,0x00},
+        {0x7F,0x63,0x31,0x18,0x4C,0x66,0x7F,0x00}, {0x1E,0x06,0x06,0x06,0x06,0x06,0x1E,0x00},
+        {0x03,0x06,0x0C,0x18,0x30,0x60,0x40,0x00}, {0x1E,0x18,0x18,0x18,0x18,0x18,0x1E,0x00},
+        {0x08,0x1C,0x36,0x63,0x00,0x00,0x00,0x00}, {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF},
+        {0x0C,0x0C,0x18,0x00,0x00,0x00,0x00,0x00}, {0x00,0x00,0x1E,0x30,0x3E,0x33,0x6E,0x00},
+        {0x07,0x06,0x06,0x3E,0x66,0x66,0x3B,0x00}, {0x00,0x00,0x1E,0x33,0x03,0x33,0x1E,0x00},
+        {0x38,0x30,0x30,0x3E,0x33,0x33,0x6E,0x00}, {0x00,0x00,0x1E,0x33,0x3F,0x03,0x1E,0x00},
+        {0x1C,0x36,0x06,0x0F,0x06,0x06,0x0F,0x00}, {0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x1F},
+        {0x07,0x06,0x36,0x6E,0x66,0x66,0x67,0x00}, {0x0C,0x00,0x0E,0x0C,0x0C,0x0C,0x1E,0x00},
+        {0x30,0x00,0x30,0x30,0x30,0x33,0x33,0x1E}, {0x07,0x06,0x66,0x36,0x1E,0x36,0x67,0x00},
+        {0x0E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00}, {0x00,0x00,0x33,0x7F,0x7F,0x6B,0x63,0x00},
+        {0x00,0x00,0x1F,0x33,0x33,0x33,0x33,0x00}, {0x00,0x00,0x1E,0x33,0x33,0x33,0x1E,0x00},
+        {0x00,0x00,0x3B,0x66,0x66,0x3E,0x06,0x0F}, {0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x78},
+        {0x00,0x00,0x3B,0x6E,0x66,0x06,0x0F,0x00}, {0x00,0x00,0x3E,0x03,0x1E,0x30,0x1F,0x00},
+        {0x08,0x0C,0x3E,0x0C,0x0C,0x2C,0x18,0x00}, {0x00,0x00,0x33,0x33,0x33,0x33,0x6E,0x00},
+        {0x00,0x00,0x33,0x33,0x33,0x1E,0x0C,0x00}, {0x00,0x00,0x63,0x6B,0x7F,0x7F,0x36,0x00},
+        {0x00,0x00,0x63,0x36,0x1C,0x36,0x63,0x00}, {0x00,0x00,0x33,0x33,0x33,0x3E,0x30,0x1F},
+        {0x00,0x00,0x3F,0x19,0x0C,0x26,0x3F,0x00}, {0x38,0x0C,0x0C,0x07,0x0C,0x0C,0x38,0x00},
+        {0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00}, {0x07,0x0C,0x0C,0x38,0x0C,0x0C,0x07,0x00},
+        {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00}
+    };
+    if (ch >= 32 && ch <= 126) return kFont[ch - 32];
+    return kFont['?' - 32];
+}
+
+std::string utf8_to_printable(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 128) {
+            out.push_back(static_cast<char>(c));
+        } else if (c == 0xC3 && i + 1 < s.size()) {
+            unsigned char n = static_cast<unsigned char>(s[++i]);
+            switch (n) {
+                case 0xA1: out.push_back('a'); break; case 0xA9: out.push_back('e'); break;
+                case 0xAD: out.push_back('i'); break; case 0xB3: out.push_back('o'); break;
+                case 0xBA: out.push_back('u'); break; case 0xB1: out.push_back('n'); break;
+                case 0x81: out.push_back('A'); break; case 0x89: out.push_back('E'); break;
+                case 0x8D: out.push_back('I'); break; case 0x93: out.push_back('O'); break;
+                case 0x9A: out.push_back('U'); break; case 0x91: out.push_back('N'); break;
+                default: out.push_back('?'); break;
+            }
+        } else if (c == 0xC2 && i + 1 < s.size()) { ++i; out.push_back(' '); }
+        else if (c == 0xE2 && i + 2 < s.size()) { i += 2; out.push_back('-'); }
+    }
+    return out;
+}
+
+uint32_t crc32_compute(const uint8_t* data, size_t len) {
+    static uint32_t table[256];
+    static bool init = false;
+    if (!init) {
+        for (uint32_t n = 0; n < 256; ++n) {
+            uint32_t c = n;
+            for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            table[n] = c;
+        }
+        init = true;
+    }
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) c = table[(c ^ data[i]) & 0xFFu] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+uint32_t adler32_compute(const uint8_t* data, size_t len) {
+    uint32_t a = 1, b = 0;
+    for (size_t i = 0; i < len; ++i) {
+        a = (a + data[i]) % 65521u;
+        b = (b + a) % 65521u;
+    }
+    return (b << 16) | a;
+}
+
+void write_be32(std::vector<uint8_t>& buf, uint32_t v) {
+    buf.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+    buf.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+    buf.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+    buf.push_back(static_cast<uint8_t>(v & 0xFF));
+}
+
+void write_png_chunk(std::vector<uint8_t>& out, const char type[4], const std::vector<uint8_t>& data) {
+    write_be32(out, static_cast<uint32_t>(data.size()));
+    size_t crc_start = out.size();
+    out.insert(out.end(), type, type + 4);
+    out.insert(out.end(), data.begin(), data.end());
+    uint32_t crc = crc32_compute(out.data() + crc_start, 4 + data.size());
+    write_be32(out, crc);
+}
+
+bool inside_rounded(int x, int y, int w, int h, int r) {
+    if (r <= 0) return true;
+    r = std::min({r, w / 2, h / 2});
+    int dx = 0, dy = 0;
+    if (x < r && y < r) { dx = r - x; dy = r - y; }
+    else if (x >= w - r && y < r) { dx = x - (w - r - 1); dy = r - y; }
+    else if (x < r && y >= h - r) { dx = r - x; dy = y - (h - r - 1); }
+    else if (x >= w - r && y >= h - r) { dx = x - (w - r - 1); dy = y - (h - r - 1); }
+    else return true;
+    return (dx * dx + dy * dy) <= r * r;
+}
+
+} // namespace
+
+Framebuffer::Framebuffer(int width, int height)
+    : width_(width), height_(height), pixels_(static_cast<size_t>(width * height), 0xFF0D1118u) {}
+
+void Framebuffer::clear(uint32_t argb) {
+    std::fill(pixels_.begin(), pixels_.end(), argb);
+}
+
+void Framebuffer::blend_pixel(int x, int y, uint32_t argb) {
+    if (x < 0 || y < 0 || x >= width_ || y >= height_) return;
+    uint32_t a = (argb >> 24) & 0xFFu;
+    if (a == 0) return;
+    uint32_t& dst = pixels_[static_cast<size_t>(y * width_ + x)];
+    if (a == 255) { dst = argb; return; }
+    uint32_t inv = 255 - a;
+    uint32_t sr = (argb >> 16) & 0xFFu, sg = (argb >> 8) & 0xFFu, sb = argb & 0xFFu;
+    uint32_t dr = (dst >> 16) & 0xFFu, dg = (dst >> 8) & 0xFFu, db = dst & 0xFFu;
+    dst = 0xFF000000u | (((sr * a + dr * inv) / 255) << 16) |
+          (((sg * a + dg * inv) / 255) << 8) | ((sb * a + db * inv) / 255);
+}
+
+void Framebuffer::fill_rect(int x, int y, int w, int h, uint32_t argb) {
+    int x0 = std::max(0, x), y0 = std::max(0, y);
+    int x1 = std::min(width_, x + w), y1 = std::min(height_, y + h);
+    for (int py = y0; py < y1; ++py) {
+        for (int px = x0; px < x1; ++px) blend_pixel(px, py, argb);
+    }
+}
+
+void Framebuffer::fill_rounded_rect(int x, int y, int w, int h, int radius, uint32_t argb) {
+    if (radius <= 0) { fill_rect(x, y, w, h, argb); return; }
+    int x0 = std::max(0, x), y0 = std::max(0, y);
+    int x1 = std::min(width_, x + w), y1 = std::min(height_, y + h);
+    for (int py = y0; py < y1; ++py) {
+        for (int px = x0; px < x1; ++px) {
+            if (inside_rounded(px - x, py - y, w, h, radius)) blend_pixel(px, py, argb);
+        }
+    }
+}
+
+void Framebuffer::stroke_rounded_rect(int x, int y, int w, int h, int radius, int thickness, uint32_t argb) {
+    thickness = std::max(1, thickness);
+    int x0 = std::max(0, x), y0 = std::max(0, y);
+    int x1 = std::min(width_, x + w), y1 = std::min(height_, y + h);
+    for (int py = y0; py < y1; ++py) {
+        for (int px = x0; px < x1; ++px) {
+            int lx = px - x, ly = py - y;
+            if (!inside_rounded(lx, ly, w, h, radius)) continue;
+            bool inside_inner = (lx >= thickness && lx < w - thickness &&
+                                 ly >= thickness && ly < h - thickness &&
+                                 inside_rounded(lx - thickness, ly - thickness,
+                                                w - 2 * thickness, h - 2 * thickness,
+                                                std::max(0, radius - thickness)));
+            if (!inside_inner) blend_pixel(px, py, argb);
+        }
+    }
+}
+
+void Framebuffer::draw_text(int x, int y, std::string_view raw_text, uint32_t argb, float font_size, bool bold) {
+    std::string text = utf8_to_printable(raw_text);
+    int scale = (font_size >= 26.0f) ? 3 : ((font_size >= 18.0f) ? 2 : 1);
+    int adv = scale * 8 + (bold ? 1 : 0);
+    int cx = x;
+
+    for (char ch : text) {
+        const uint8_t* bm = glyph_bitmap(static_cast<unsigned char>(ch));
+        for (int row = 0; row < 8; ++row) {
+            uint8_t bits = bm[row];
+            for (int col = 0; col < 8; ++col) {
+                if (bits & (1u << col)) {
+                    fill_rect(cx + col * scale, y + row * scale,
+                              scale + (bold ? 1 : 0), scale, argb);
+                }
+            }
+        }
+        cx += adv;
+        if (cx > width_) break;
+    }
+}
+
+void Framebuffer::blit_scaled(int dst_x, int dst_y, int dst_w, int dst_h,
+                              const uint32_t* src, int src_w, int src_h) {
+    if (!src || src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0) return;
+    for (int y = 0; y < dst_h; ++y) {
+        int ty = dst_y + y;
+        if (ty < 0 || ty >= height_) continue;
+        int sy = (y * src_h) / dst_h;
+        for (int x = 0; x < dst_w; ++x) {
+            int tx = dst_x + x;
+            if (tx < 0 || tx >= width_) continue;
+            int sx = (x * src_w) / dst_w;
+            blend_pixel(tx, ty, src[sy * src_w + sx]);
+        }
+    }
+}
+
+int Framebuffer::draw_browser_chrome(const ChromeStatus& st) {
+    const int tab_bar_h = 38;
+    const int nav_bar_h = 46;
+    const int total_h = tab_bar_h + nav_bar_h;
+
+    fill_rect(0, 0, width_, tab_bar_h, 0xFF0A0E16u);
+    fill_rect(0, tab_bar_h, width_, nav_bar_h, 0xFF111827u);
+    fill_rect(0, total_h - 1, width_, 1, 0xFF1F2937u);
+
+    fill_rounded_rect(10, 7, 68, 24, 6, 0xFF0284C7u);
+    draw_text(21, 15, "ASTRA", 0xFFFFFFFFu, 12.0f, true);
+
+    int tx = 88;
+    size_t max_tabs = std::min<size_t>(st.tab_titles.size(), 5);
+    for (size_t i = 0; i < max_tabs; ++i) {
+        bool active = (i == st.active_tab_index);
+        int tw = 195;
+        fill_rounded_rect(tx, 6, tw, 28, 8, active ? 0xFF1E293Bu : 0xFF111827u);
+        if (active) fill_rect(tx + 12, 6, tw - 24, 2, 0xFF38BDF8u);
+        std::string lbl = st.tab_titles[i];
+        if (lbl.size() > 21) lbl = lbl.substr(0, 19) + "..";
+        draw_text(tx + 10, 16, lbl, active ? 0xFFF8FAFCu : 0xFF94A3B8u, 12.0f, active);
+        tx += tw + 8;
+        if (tx + 195 > width_) break;
+    }
+
+    int bar_x = 16;
+    int bar_w = std::max(240, width_ - 404);
+    fill_rounded_rect(bar_x, tab_bar_h + 8, bar_w, 30, 8, 0xFF0B1120u);
+    stroke_rounded_rect(bar_x, tab_bar_h + 8, bar_w, 30, 8, 1,
+                        st.tls_verified ? 0xFF10B981u : 0xFF334155u);
+    std::string url_disp = (st.tls_verified ? "[TLS] " : "") + st.active_url;
+    draw_text(bar_x + 12, tab_bar_h + 19, url_disp, 0xFFE2E8F0u, 13.0f, false);
+
+    int rx = bar_x + bar_w + 12;
+    std::string shield_txt = "SHIELD:" + std::to_string(st.trackers_blocked);
+    fill_rounded_rect(rx, tab_bar_h + 8, 106, 30, 8, 0xFF064E3Bu);
+    draw_text(rx + 12, tab_bar_h + 19, shield_txt, 0xFF6EE7B7u, 12.0f, true);
+
+    rx += 114;
+    std::string ram_txt = "RAM:" + std::to_string(st.rss_mb) + "/" + std::to_string(st.ceiling_mb) + "MB";
+    uint32_t ram_bg = (st.rss_mb * 100 / std::max<uint64_t>(1, st.ceiling_mb) > 80) ? 0xFF7F1D1Du : 0xFF1E293Bu;
+    fill_rounded_rect(rx, tab_bar_h + 8, 174, 30, 8, ram_bg);
+    draw_text(rx + 12, tab_bar_h + 19, ram_txt, 0xFF38BDF8u, 12.0f, true);
+
+    rx += 182;
+    if (rx + 74 <= width_) {
+        std::string ext_txt = "EXT:" + std::to_string(st.extensions_loaded);
+        fill_rounded_rect(rx, tab_bar_h + 8, 72, 30, 8, 0xFF312E81u);
+        draw_text(rx + 12, tab_bar_h + 19, ext_txt, 0xFFC7D2FEu, 12.0f, true);
+    }
+
+    return total_h;
+}
+
+void Framebuffer::composite_display_list(const DisplayList& dl,
+                                         int y_offset,
+                                         float scroll_y,
+                                         const VideoProvider& video_provider,
+                                         const ImageProvider& image_provider,
+                                         const Camera3D& cam3d,
+                                         float time3d_sec) {
+    fill_rect(0, y_offset, width_, height_ - y_offset, dl.clear_color_argb);
+
+    for (const auto& item : dl.items) {
+        int ix = static_cast<int>(std::round(item.rect.x));
+        int iy = static_cast<int>(std::round(item.rect.y - scroll_y)) + y_offset;
+        int iw = static_cast<int>(std::round(item.rect.w));
+        int ih = static_cast<int>(std::round(item.rect.h));
+
+        if (iy >= height_ || iy + ih <= y_offset) continue;
+
+        switch (item.type) {
+            case DisplayItemType::FillRect: {
+                int cy = std::max(y_offset, iy);
+                int ch = std::min(height_, iy + ih) - cy;
+                if (ch > 0) fill_rounded_rect(ix, cy, iw, ch, static_cast<int>(item.radius), item.color_argb);
+                break;
+            }
+            case DisplayItemType::StrokeRect: {
+                int cy = std::max(y_offset, iy);
+                int ch = std::min(height_, iy + ih) - cy;
+                if (ch > 0) stroke_rounded_rect(ix, cy, iw, ch, static_cast<int>(item.radius),
+                                                static_cast<int>(item.thickness), item.color_argb);
+                break;
+            }
+            case DisplayItemType::DrawText:
+                if (iy >= y_offset) {
+                    draw_text(ix, iy, item.text, item.color_argb, item.font_size, item.bold);
+                }
+                break;
+            case DisplayItemType::DrawImage: {
+                int cx = std::max(0, ix);
+                int cy = std::max(y_offset, iy);
+                int cw = std::min(width_ - cx, iw);
+                int ch = std::min(height_ - cy, ih);
+                DecodedImage img;
+                if (image_provider && image_provider(item.text, img) && img.valid) {
+                    blit_scaled(cx, cy, cw, ch, img.argb.data(), img.width, img.height);
+                    stroke_rounded_rect(cx, cy, cw, ch, 6, 1, 0xFF334155u);
+                } else {
+                    fill_rounded_rect(cx, cy, cw, ch, 6, 0xFF1E293Bu);
+                    draw_text(cx + 8, cy + ch / 2 - 4, "[IMG] " + item.text, 0xFF94A3B8u, 11.0f, false);
+                }
+                break;
+            }
+            case DisplayItemType::Embed3D: {
+                int cx = std::max(0, ix);
+                int cy = std::max(y_offset, iy);
+                int cw = std::min(width_ - cx, iw);
+                int ch = std::min(height_ - cy, ih);
+                if (cw > 16 && ch > 16) {
+                    auto st3d = Astra3D::render_scene_into(pixels_.data(), width_, cx, cy, cw, ch,
+                                                           item.text, time3d_sec, cam3d);
+                    stroke_rounded_rect(cx, cy, cw, ch, 6, 1, 0xFF38BDF8u);
+                    std::string hud = "Astra3D Smooth | " + std::to_string(st3d.triangles_rasterized) + " tris";
+                    fill_rounded_rect(cx + 10, cy + ch - 28, std::min(cw - 20, 320), 20, 4, 0xCC0A0F1Au);
+                    draw_text(cx + 18, cy + ch - 22, hud, 0xFF7DD3FCu, 11.0f, true);
+                }
+                break;
+            }
+            case DisplayItemType::EmbedVideo: {
+                int cx = std::max(0, ix);
+                int cy = std::max(y_offset, iy);
+                int cw = std::min(width_ - cx, iw);
+                int ch = std::min(height_ - cy, ih);
+                VideoBlitFrame frame;
+                if (video_provider && video_provider(item.text, frame) &&
+                    frame.width > 0 && frame.height > 0 && !frame.argb.empty()) {
+                    blit_scaled(cx, cy, cw, ch, frame.argb.data(), frame.width, frame.height);
+                    stroke_rounded_rect(cx, cy, cw, ch, 6, 1, 0xFF34D399u);
+                    fill_rounded_rect(cx + 10, cy + ch - 28, std::min(cw - 20, 470), 20, 4, 0xCC06141Eu);
+                    draw_text(cx + 18, cy + ch - 22, frame.label, 0xFF6EE7B7u, 11.0f, true);
+                } else {
+                    fill_rounded_rect(cx, cy, cw, ch, 8, 0xFF0F172Au);
+                    stroke_rounded_rect(cx, cy, cw, ch, 8, 1, 0xFF475569u);
+                    draw_text(cx + 16, cy + ch / 2 - 6, "AstraMedia Video: " + item.text, 0xFF94A3B8u, 13.0f, true);
+                }
+                break;
+            }
+        }
+    }
+
+    // Draw APZ-style scrollbar thumb if content overflows viewport
+    float view_h = static_cast<float>(height_ - y_offset);
+    if (dl.content_height > view_h + 4.0f) {
+        int track_h = height_ - y_offset - 8;
+        int thumb_h = std::max(28, static_cast<int>(track_h * (view_h / dl.content_height)));
+        float max_scroll = std::max(1.0f, dl.content_height - view_h);
+        float frac = std::clamp(scroll_y / max_scroll, 0.0f, 1.0f);
+        int thumb_y = y_offset + 4 + static_cast<int>((track_h - thumb_h) * frac);
+        fill_rounded_rect(width_ - 10, y_offset + 4, 6, track_h, 3, 0xFF1E293Bu);
+        fill_rounded_rect(width_ - 10, thumb_y, 6, thumb_h, 3, 0xFF38BDF8u);
+    }
+}
+
+bool Framebuffer::save_png(const std::string& path) const {
+    const size_t row_bytes = static_cast<size_t>(width_) * 4 + 1;
+    std::vector<uint8_t> raw;
+    raw.reserve(row_bytes * static_cast<size_t>(height_));
+    for (int y = 0; y < height_; ++y) {
+        raw.push_back(0);
+        for (int x = 0; x < width_; ++x) {
+            uint32_t p = pixels_[static_cast<size_t>(y * width_ + x)];
+            raw.push_back(static_cast<uint8_t>((p >> 16) & 0xFF));
+            raw.push_back(static_cast<uint8_t>((p >> 8) & 0xFF));
+            raw.push_back(static_cast<uint8_t>(p & 0xFF));
+            raw.push_back(static_cast<uint8_t>((p >> 24) & 0xFF));
+        }
+    }
+
+    std::vector<uint8_t> zstream;
+    zstream.reserve(raw.size() + (raw.size() / 65535 + 2) * 5 + 6);
+    zstream.push_back(0x78);
+    zstream.push_back(0x01);
+
+    size_t offset = 0;
+    while (offset < raw.size()) {
+        size_t chunk = std::min<size_t>(65535, raw.size() - offset);
+        bool final_block = (offset + chunk >= raw.size());
+        zstream.push_back(final_block ? 0x01 : 0x00);
+        uint16_t len = static_cast<uint16_t>(chunk);
+        uint16_t nlen = static_cast<uint16_t>(~len);
+        zstream.push_back(static_cast<uint8_t>(len & 0xFF));
+        zstream.push_back(static_cast<uint8_t>((len >> 8) & 0xFF));
+        zstream.push_back(static_cast<uint8_t>(nlen & 0xFF));
+        zstream.push_back(static_cast<uint8_t>((nlen >> 8) & 0xFF));
+        zstream.insert(zstream.end(), raw.begin() + static_cast<ptrdiff_t>(offset),
+                       raw.begin() + static_cast<ptrdiff_t>(offset + chunk));
+        offset += chunk;
+    }
+    write_be32(zstream, adler32_compute(raw.data(), raw.size()));
+
+    std::vector<uint8_t> png = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    std::vector<uint8_t> ihdr;
+    write_be32(ihdr, static_cast<uint32_t>(width_));
+    write_be32(ihdr, static_cast<uint32_t>(height_));
+    ihdr.push_back(8); ihdr.push_back(6); ihdr.push_back(0); ihdr.push_back(0); ihdr.push_back(0);
+    write_png_chunk(png, "IHDR", ihdr);
+    write_png_chunk(png, "IDAT", zstream);
+    write_png_chunk(png, "IEND", {});
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+    f.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+    return f.good();
+}
+
+bool Framebuffer::present_x11_interactive(const std::string& window_title,
+                                          const InteractiveCallbacks& callbacks) {
+    if (!std::getenv("DISPLAY")) return false;
+    void* x11 = dlopen("libX11.so.6", RTLD_LAZY);
+    if (!x11) return false;
+
+    struct XButtonEv {
+        int type; unsigned long serial; int send_event; void* display;
+        unsigned long window, root, subwindow, time;
+        int x, y, x_root, y_root;
+        unsigned int state, button;
+    };
+    struct XKeyEv {
+        int type; unsigned long serial; int send_event; void* display;
+        unsigned long window, root, subwindow, time;
+        int x, y, x_root, y_root;
+        unsigned int state, keycode;
+    };
+    union XEv {
+        int type;
+        XButtonEv xbutton;
+        XKeyEv xkey;
+        long pad[24];
+    };
+
+    auto XOpenDisplay = reinterpret_cast<void* (*)(const char*)>(dlsym(x11, "XOpenDisplay"));
+    auto XDefaultScreen = reinterpret_cast<int (*)(void*)>(dlsym(x11, "XDefaultScreen"));
+    auto XRootWindow = reinterpret_cast<unsigned long (*)(void*, int)>(dlsym(x11, "XRootWindow"));
+    auto XDefaultVisual = reinterpret_cast<void* (*)(void*, int)>(dlsym(x11, "XDefaultVisual"));
+    auto XDefaultDepth = reinterpret_cast<int (*)(void*, int)>(dlsym(x11, "XDefaultDepth"));
+    auto XCreateSimpleWindow = reinterpret_cast<unsigned long (*)(void*, unsigned long, int, int, unsigned, unsigned, unsigned, unsigned long, unsigned long)>(dlsym(x11, "XCreateSimpleWindow"));
+    auto XStoreName = reinterpret_cast<int (*)(void*, unsigned long, const char*)>(dlsym(x11, "XStoreName"));
+    auto XSelectInput = reinterpret_cast<int (*)(void*, unsigned long, long)>(dlsym(x11, "XSelectInput"));
+    auto XMapWindow = reinterpret_cast<int (*)(void*, unsigned long)>(dlsym(x11, "XMapWindow"));
+    auto XCreateGC = reinterpret_cast<void* (*)(void*, unsigned long, unsigned long, void*)>(dlsym(x11, "XCreateGC"));
+    auto XCreateImage = reinterpret_cast<void* (*)(void*, void*, unsigned, int, int, char*, unsigned, unsigned, int, int)>(dlsym(x11, "XCreateImage"));
+    auto XPutImage = reinterpret_cast<int (*)(void*, unsigned long, void*, void*, int, int, int, int, unsigned, unsigned)>(dlsym(x11, "XPutImage"));
+    auto XNextEvent = reinterpret_cast<int (*)(void*, XEv*)>(dlsym(x11, "XNextEvent"));
+    auto XFlush = reinterpret_cast<int (*)(void*)>(dlsym(x11, "XFlush"));
+    auto XCloseDisplay = reinterpret_cast<int (*)(void*)>(dlsym(x11, "XCloseDisplay"));
+
+    if (!XOpenDisplay || !XCreateSimpleWindow || !XCreateImage || !XPutImage || !XNextEvent) return false;
+    void* dpy = XOpenDisplay(nullptr);
+    if (!dpy) return false;
+
+    int scr = XDefaultScreen(dpy);
+    unsigned long root = XRootWindow(dpy, scr);
+    unsigned long win = XCreateSimpleWindow(dpy, root, 40, 40,
+                                            static_cast<unsigned>(width_), static_cast<unsigned>(height_),
+                                            0, 0, 0x0D1118);
+    if (XStoreName) XStoreName(dpy, win, window_title.c_str());
+    // ExposureMask (1<<15) | KeyPressMask (1<<0) | ButtonPressMask (1<<2)
+    if (XSelectInput) XSelectInput(dpy, win, (1L << 15) | (1L << 0) | (1L << 2));
+    XMapWindow(dpy, win);
+    void* gc = XCreateGC(dpy, win, 0, nullptr);
+
+    auto blit_now = [&]() {
+        std::vector<uint32_t> copy = pixels_;
+        void* img = XCreateImage(dpy, XDefaultVisual(dpy, scr),
+                                 static_cast<unsigned>(XDefaultDepth(dpy, scr)),
+                                 2, 0, reinterpret_cast<char*>(copy.data()),
+                                 static_cast<unsigned>(width_), static_cast<unsigned>(height_), 32, 0);
+        if (img) {
+            XPutImage(dpy, win, gc, img, 0, 0, 0, 0,
+                      static_cast<unsigned>(width_), static_cast<unsigned>(height_));
+            XFlush(dpy);
+        }
+    };
+
+    blit_now();
+    bool running = true;
+    while (running) {
+        XEv ev{};
+        XNextEvent(dpy, &ev);
+        if (ev.type == 12) { // Expose
+            blit_now();
+        } else if (ev.type == 4) { // ButtonPress
+            if (ev.xbutton.button == 4 && callbacks.on_scroll) {
+                callbacks.on_scroll(-60);
+            } else if (ev.xbutton.button == 5 && callbacks.on_scroll) {
+                callbacks.on_scroll(60);
+            } else if (ev.xbutton.button == 1 && callbacks.on_click) {
+                callbacks.on_click(ev.xbutton.x, ev.xbutton.y);
+            }
+            if (callbacks.on_repaint) callbacks.on_repaint(*this);
+            blit_now();
+        } else if (ev.type == 2) { // KeyPress (Escape=9, q=24, Down=116, Up=111)
+            if (ev.xkey.keycode == 9 || ev.xkey.keycode == 24) {
+                running = false;
+            } else if (ev.xkey.keycode == 116 && callbacks.on_scroll) {
+                callbacks.on_scroll(80);
+                if (callbacks.on_repaint) callbacks.on_repaint(*this);
+                blit_now();
+            } else if (ev.xkey.keycode == 111 && callbacks.on_scroll) {
+                callbacks.on_scroll(-80);
+                if (callbacks.on_repaint) callbacks.on_repaint(*this);
+                blit_now();
+            }
+        }
+    }
+
+    XCloseDisplay(dpy);
+    return true;
+}
+
+} // namespace astra

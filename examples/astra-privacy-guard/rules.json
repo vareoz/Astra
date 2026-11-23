@@ -1,0 +1,19 @@
+[
+  {
+    "id": 101,
+    "priority": 10,
+    "action": { "type": "block" },
+    "condition": { "urlFilter": "tracker.evil-ads.test" }
+  },
+  {
+    "id": 102,
+    "priority": 5,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        { "header": "X-Astra-Extension", "value": "PrivacyGuard/1.0" }
+      ]
+    },
+    "condition": { "urlFilter": "https://" }
+  }
+]

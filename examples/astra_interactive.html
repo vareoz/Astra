@@ -1,0 +1,53 @@
+<!doctype html>
+<html>
+<head>
+  <title>Astra v2 Interactive Showcase</title>
+  <link rel="stylesheet" href="astra_theme.css">
+</head>
+<body>
+  <div class="topbar">
+    <div class="accent">SESSION 2 LIVE VERIFICATION: EXTERNAL CSS + NATIVE PNG &lt;img&gt; + ASTRAJS v2 BYTECODE EVENTS</div>
+    <h1 id="status-title">Interactive State: Ready (0 clicks)</h1>
+    <p id="vm-report">Booting AstraJS v2 bytecode VM...</p>
+    <button id="action-btn">Click Me (Dispatch AstraJS v2 Event)</button>
+  </div>
+
+  <div class="row">
+    <div class="box">
+      <div class="accent">NATIVE PNG IMAGE DECODER (&lt;img&gt;)</div>
+      <img src="astra_badge.png" width="380" height="220">
+    </div>
+    <div class="box">
+      <div class="accent">ASTRA3D v2 SMOOTH SHADER SCENE</div>
+      <astra-3d scene="torus" style="height: 220px;"></astra-3d>
+    </div>
+  </div>
+
+  <div class="box">
+    <div class="accent">NAVIGATION LINK HIT-TEST REGION</div>
+    <a href="astra://home">Return to Astra Home</a>
+  </div>
+
+  <script>
+    function computeScore(n) {
+      let total = 0;
+      for (let i = 1; i <= n; i = i + 1) {
+        total = total + i * i;
+      }
+      return total;
+    }
+
+    let clicks = 0;
+    let score = computeScore(10);
+    let badge = document.querySelector("#vm-report");
+    badge.textContent = "AstraJS v2 Bytecode VM Ready | sum(1..10^2)=" + score;
+
+    let btn = document.querySelector("#action-btn");
+    btn.addEventListener("click", function() {
+      clicks = clicks + 1;
+      document.querySelector("#status-title").textContent = "Interactive State: CLICKED (" + clicks + "x) via Bytecode VM!";
+      document.querySelector("#vm-report").textContent = "Event listener fired & relaid out DOM cleanly | score=" + (score + clicks * 100);
+    });
+  </script>
+</body>
+</html>

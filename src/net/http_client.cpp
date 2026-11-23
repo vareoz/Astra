@@ -1,0 +1,552 @@
+#include "net/http_client.hpp"
+
+#include <algorithm>
+#include <arpa/inet.h>
+#include <cctype>
+#include <cstring>
+#include <dlfcn.h>
+#include <netdb.h>
+#include <sstream>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+namespace astra {
+
+namespace {
+
+// Dynamic OpenSSL 3.x ABI loader with strict certificate & hostname verification
+struct OpenSslApi {
+    void* ssl_lib = nullptr;
+    void* crypto_lib = nullptr;
+    bool loaded = false;
+
+    using TLS_client_method_fn = const void* (*)();
+    using SSL_CTX_new_fn = void* (*)(const void*);
+    using SSL_CTX_free_fn = void (*)(void*);
+    using SSL_CTX_set_default_verify_paths_fn = int (*)(void*);
+    using SSL_CTX_set_verify_fn = void (*)(void*, int, void*);
+    using SSL_new_fn = void* (*)(void*);
+    using SSL_free_fn = void (*)(void*);
+    using SSL_set_fd_fn = int (*)(void*, int);
+    using SSL_ctrl_fn = long (*)(void*, int, long, void*);
+    using SSL_set1_host_fn = int (*)(void*, const char*);
+    using SSL_get_verify_result_fn = long (*)(const void*);
+    using SSL_connect_fn = int (*)(void*);
+    using SSL_write_fn = int (*)(void*, const void*, int);
+    using SSL_read_fn = int (*)(void*, void*, int);
+    using SSL_shutdown_fn = int (*)(void*);
+
+    TLS_client_method_fn TLS_client_method = nullptr;
+    SSL_CTX_new_fn SSL_CTX_new = nullptr;
+    SSL_CTX_free_fn SSL_CTX_free = nullptr;
+    SSL_CTX_set_default_verify_paths_fn SSL_CTX_set_default_verify_paths = nullptr;
+    SSL_CTX_set_verify_fn SSL_CTX_set_verify = nullptr;
+    SSL_new_fn SSL_new = nullptr;
+    SSL_free_fn SSL_free = nullptr;
+    SSL_set_fd_fn SSL_set_fd = nullptr;
+    SSL_ctrl_fn SSL_ctrl = nullptr;
+    SSL_set1_host_fn SSL_set1_host = nullptr;
+    SSL_get_verify_result_fn SSL_get_verify_result = nullptr;
+    SSL_connect_fn SSL_connect = nullptr;
+    SSL_write_fn SSL_write = nullptr;
+    SSL_read_fn SSL_read = nullptr;
+    SSL_shutdown_fn SSL_shutdown = nullptr;
+
+    static constexpr int kSslCtrlSetTlsextHostname = 55;
+    static constexpr long kTlsextNametypeHostName = 0;
+    static constexpr int kSslVerifyPeer = 0x01;
+
+    OpenSslApi() {
+        crypto_lib = dlopen("libcrypto.so.3", RTLD_LAZY | RTLD_GLOBAL);
+        if (!crypto_lib) crypto_lib = dlopen("libcrypto.so.1.1", RTLD_LAZY | RTLD_GLOBAL);
+        ssl_lib = dlopen("libssl.so.3", RTLD_LAZY);
+        if (!ssl_lib) ssl_lib = dlopen("libssl.so.1.1", RTLD_LAZY);
+        if (!ssl_lib) return;
+
+        TLS_client_method = reinterpret_cast<TLS_client_method_fn>(dlsym(ssl_lib, "TLS_client_method"));
+        SSL_CTX_new = reinterpret_cast<SSL_CTX_new_fn>(dlsym(ssl_lib, "SSL_CTX_new"));
+        SSL_CTX_free = reinterpret_cast<SSL_CTX_free_fn>(dlsym(ssl_lib, "SSL_CTX_free"));
+        SSL_CTX_set_default_verify_paths = reinterpret_cast<SSL_CTX_set_default_verify_paths_fn>(
+            dlsym(ssl_lib, "SSL_CTX_set_default_verify_paths"));
+        SSL_CTX_set_verify = reinterpret_cast<SSL_CTX_set_verify_fn>(dlsym(ssl_lib, "SSL_CTX_set_verify"));
+        SSL_new = reinterpret_cast<SSL_new_fn>(dlsym(ssl_lib, "SSL_new"));
+        SSL_free = reinterpret_cast<SSL_free_fn>(dlsym(ssl_lib, "SSL_free"));
+        SSL_set_fd = reinterpret_cast<SSL_set_fd_fn>(dlsym(ssl_lib, "SSL_set_fd"));
+        SSL_ctrl = reinterpret_cast<SSL_ctrl_fn>(dlsym(ssl_lib, "SSL_ctrl"));
+        SSL_set1_host = reinterpret_cast<SSL_set1_host_fn>(dlsym(ssl_lib, "SSL_set1_host"));
+        SSL_get_verify_result = reinterpret_cast<SSL_get_verify_result_fn>(dlsym(ssl_lib, "SSL_get_verify_result"));
+        SSL_connect = reinterpret_cast<SSL_connect_fn>(dlsym(ssl_lib, "SSL_connect"));
+        SSL_write = reinterpret_cast<SSL_write_fn>(dlsym(ssl_lib, "SSL_write"));
+        SSL_read = reinterpret_cast<SSL_read_fn>(dlsym(ssl_lib, "SSL_read"));
+        SSL_shutdown = reinterpret_cast<SSL_shutdown_fn>(dlsym(ssl_lib, "SSL_shutdown"));
+
+        loaded = TLS_client_method && SSL_CTX_new && SSL_CTX_free && SSL_new &&
+                 SSL_free && SSL_set_fd && SSL_ctrl && SSL_connect &&
+                 SSL_write && SSL_read && SSL_shutdown;
+    }
+};
+
+OpenSslApi& openssl() {
+    static OpenSslApi api;
+    return api;
+}
+
+struct ZlibStream {
+    const uint8_t* next_in;
+    unsigned int avail_in;
+    unsigned long total_in;
+    uint8_t* next_out;
+    unsigned int avail_out;
+    unsigned long total_out;
+    const char* msg;
+    void* state;
+    void* zalloc;
+    void* zfree;
+    void* opaque;
+    int data_type;
+    unsigned long adler;
+    unsigned long reserved;
+};
+
+struct ZlibApi {
+    void* lib = nullptr;
+    bool loaded = false;
+
+    using inflateInit2_fn = int (*)(ZlibStream*, int, const char*, int);
+    using inflate_fn = int (*)(ZlibStream*, int);
+    using inflateEnd_fn = int (*)(ZlibStream*);
+    using zlibVersion_fn = const char* (*)();
+
+    inflateInit2_fn inflateInit2_ = nullptr;
+    inflate_fn inflate = nullptr;
+    inflateEnd_fn inflateEnd = nullptr;
+    zlibVersion_fn zlibVersion = nullptr;
+
+    ZlibApi() {
+        lib = dlopen("libz.so.1", RTLD_LAZY);
+        if (!lib) lib = dlopen("libz.so", RTLD_LAZY);
+        if (!lib) return;
+        inflateInit2_ = reinterpret_cast<inflateInit2_fn>(dlsym(lib, "inflateInit2_"));
+        inflate = reinterpret_cast<inflate_fn>(dlsym(lib, "inflate"));
+        inflateEnd = reinterpret_cast<inflateEnd_fn>(dlsym(lib, "inflateEnd"));
+        zlibVersion = reinterpret_cast<zlibVersion_fn>(dlsym(lib, "zlibVersion"));
+        loaded = inflateInit2_ && inflate && inflateEnd && zlibVersion;
+    }
+};
+
+ZlibApi& zlib_api() {
+    static ZlibApi api;
+    return api;
+}
+
+std::string to_lower(std::string_view s) {
+    std::string out(s);
+    std::transform(out.begin(), out.end(), out.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return out;
+}
+
+std::string trim(std::string_view s) {
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.remove_prefix(1);
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.remove_suffix(1);
+    return std::string(s);
+}
+
+std::string decode_chunked(const std::string& raw) {
+    std::string out;
+    size_t pos = 0;
+    while (pos < raw.size()) {
+        size_t line_end = raw.find("\r\n", pos);
+        if (line_end == std::string::npos) break;
+        std::string hex_str = raw.substr(pos, line_end - pos);
+        size_t semi = hex_str.find(';');
+        if (semi != std::string::npos) hex_str.resize(semi);
+        size_t chunk_size = std::strtoul(hex_str.c_str(), nullptr, 16);
+        pos = line_end + 2;
+        if (chunk_size == 0) break;
+        if (pos + chunk_size > raw.size()) {
+            out.append(raw.data() + pos, raw.size() - pos);
+            break;
+        }
+        out.append(raw.data() + pos, chunk_size);
+        pos += chunk_size + 2;
+    }
+    return out;
+}
+
+int connect_tcp(const std::string& host, uint16_t port) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    addrinfo* res = nullptr;
+    std::string port_str = std::to_string(port);
+    if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0 || !res) {
+        return -1;
+    }
+
+    int fd = -1;
+    for (addrinfo* p = res; p != nullptr; p = p->ai_next) {
+        fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (fd < 0) continue;
+
+        timeval tv{};
+        tv.tv_sec = 8;
+        tv.tv_usec = 0;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        if (::connect(fd, p->ai_addr, p->ai_addrlen) == 0) {
+            break;
+        }
+        ::close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    return fd;
+}
+
+} // namespace
+
+bool HttpClient::tls_available() {
+    return openssl().loaded;
+}
+
+std::string HttpClient::resolve_relative_url(const std::string& base_url, const std::string& rel) {
+    if (rel.empty()) return base_url;
+    if (rel.rfind("http://", 0) == 0 || rel.rfind("https://", 0) == 0 ||
+        rel.rfind("file://", 0) == 0 || rel.rfind("astra://", 0) == 0) {
+        return rel;
+    }
+    ParsedUrl base = parse_url(base_url);
+    if (!base.valid) return rel;
+    if (rel.rfind("//", 0) == 0) {
+        return base.scheme + ":" + rel;
+    }
+    if (base.scheme == "file") {
+        if (rel[0] == '/') return "file://" + rel;
+        size_t slash = base.path.rfind('/');
+        std::string dir = (slash == std::string::npos) ? "" : base.path.substr(0, slash + 1);
+        return "file://" + dir + rel;
+    }
+    if (rel[0] == '/') {
+        return base.origin() + rel;
+    }
+    size_t slash = base.path.rfind('/');
+    std::string dir = (slash == std::string::npos) ? "/" : base.path.substr(0, slash + 1);
+    return base.origin() + dir + rel;
+}
+
+bool HttpClient::decompress_gzip_or_zlib(const uint8_t* data, size_t len, std::string& out) {
+    auto& z = zlib_api();
+    if (!z.loaded || !data || len == 0) return false;
+
+    ZlibStream strm{};
+    strm.next_in = data;
+    strm.avail_in = static_cast<unsigned int>(len);
+
+    int rc = z.inflateInit2_(&strm, 47, z.zlibVersion(), static_cast<int>(sizeof(ZlibStream)));
+    if (rc != 0) {
+        strm = ZlibStream{};
+        strm.next_in = data;
+        strm.avail_in = static_cast<unsigned int>(len);
+        rc = z.inflateInit2_(&strm, -15, z.zlibVersion(), static_cast<int>(sizeof(ZlibStream)));
+        if (rc != 0) return false;
+    }
+
+    out.clear();
+    uint8_t chunk[16384];
+    int status = 0;
+    do {
+        strm.next_out = chunk;
+        strm.avail_out = sizeof(chunk);
+        status = z.inflate(&strm, 0);
+        if (status != 0 && status != 1) {
+            z.inflateEnd(&strm);
+            return false;
+        }
+        size_t have = sizeof(chunk) - strm.avail_out;
+        out.append(reinterpret_cast<const char*>(chunk), have);
+        if (out.size() > 32 * 1024 * 1024) break;
+    } while (status != 1 && strm.avail_out == 0);
+
+    z.inflateEnd(&strm);
+    return status == 1 || !out.empty();
+}
+
+HttpClient::HttpClient(AstraShield& shield, HttpCache* cache)
+    : shield_(shield), cache_(cache) {}
+
+HttpResponse HttpClient::get(const std::string& url,
+                             const std::string& top_level_site,
+                             bool is_top_level_navigation,
+                             int max_redirects) {
+    std::string current_url = url;
+    std::string top_site = top_level_site;
+
+    for (int hop = 0; hop <= max_redirects; ++hop) {
+        ParsedUrl prelim = parse_url(current_url);
+        if (top_site.empty() && prelim.valid) {
+            top_site = prelim.registrable_domain();
+        }
+
+        // Step 1: AstraShield inspection
+        PrivacyDecision pdec = shield_.inspect_request(current_url, top_site, is_top_level_navigation);
+        if (pdec.blocked) {
+            HttpResponse resp;
+            resp.final_url = pdec.sanitized_url;
+            resp.blocked_by_privacy = true;
+            resp.privacy_decision = pdec;
+            resp.error = pdec.reason;
+            return resp;
+        }
+        current_url = pdec.sanitized_url;
+
+        // Step 2: Extension Declarative Net Request (DNR)
+        std::vector<std::pair<std::string, std::string>> ext_headers;
+        if (dnr_hook_) {
+            DnrHookResult dnr = dnr_hook_(current_url, top_site);
+            if (dnr.block) {
+                HttpResponse resp;
+                resp.final_url = current_url;
+                resp.blocked_by_extension = true;
+                resp.privacy_decision = pdec;
+                resp.error = "Blocked by WebExtension DNR: " + dnr.rule_source;
+                return resp;
+            }
+            if (!dnr.redirect_url.empty() && dnr.redirect_url != current_url) {
+                current_url = dnr.redirect_url;
+                continue;
+            }
+            ext_headers = std::move(dnr.add_headers);
+        }
+
+        // Step 3: Check bounded RAM/Disk HttpCache before opening any socket
+        if (cache_) {
+            CachedResource cached;
+            if (cache_->lookup(current_url, cached)) {
+                HttpResponse resp;
+                resp.status_code = 200;
+                resp.final_url = current_url;
+                resp.content_type = cached.content_type;
+                resp.body = std::move(cached.body);
+                resp.from_cache = true;
+                resp.tls_verified = (current_url.rfind("https://", 0) == 0);
+                resp.privacy_decision = pdec;
+                return resp;
+            }
+        }
+
+        ParsedUrl parsed = parse_url(current_url);
+        if (!parsed.valid) {
+            HttpResponse resp;
+            resp.error = "Invalid URL: " + current_url;
+            return resp;
+        }
+
+        HttpResponse resp = perform_single_request(parsed, top_site, ext_headers);
+        resp.privacy_decision = pdec;
+
+        if ((resp.status_code == 301 || resp.status_code == 302 ||
+             resp.status_code == 303 || resp.status_code == 307 || resp.status_code == 308) &&
+            resp.headers.count("location") > 0 && hop < max_redirects) {
+            current_url = resolve_relative_url(current_url, resp.headers["location"]);
+            continue;
+        }
+
+        // Step 4: Populate bounded HttpCache on 200 OK
+        if (cache_ && resp.status_code == 200 && !resp.body.empty()) {
+            std::string cc = resp.headers.count("cache-control") ? resp.headers["cache-control"] : "";
+            int64_t max_age = HttpCache::parse_max_age(cc);
+            if (max_age > 0) {
+                CachedResource cr;
+                cr.url = resp.final_url;
+                cr.content_type = resp.content_type;
+                cr.etag = resp.headers.count("etag") ? resp.headers["etag"] : "";
+                cr.body = resp.body;
+                cr.max_age_sec = max_age;
+                cache_->store(cr);
+            }
+        }
+
+        return resp;
+    }
+
+    HttpResponse err;
+    err.error = "Too many redirects";
+    return err;
+}
+
+HttpResponse HttpClient::perform_single_request(
+    const ParsedUrl& parsed,
+    const std::string& top_level_site,
+    const std::vector<std::pair<std::string, std::string>>& extra_headers) {
+    HttpResponse resp;
+    resp.final_url = parsed.rebuild();
+
+    bool use_tls = (parsed.scheme == "https");
+    uint16_t port = parsed.port ? parsed.port : (use_tls ? 443 : 80);
+
+    int fd = connect_tcp(parsed.host, port);
+    if (fd < 0) {
+        resp.error = "TCP connection failed to " + parsed.host + ":" + std::to_string(port);
+        return resp;
+    }
+
+    std::ostringstream req;
+    std::string target = parsed.path.empty() ? "/" : parsed.path;
+    if (!parsed.query.empty()) target += "?" + parsed.query;
+
+    req << "GET " << target << " HTTP/1.1\r\n";
+    req << "Host: " << parsed.host << "\r\n";
+    req << "Accept: text/html,text/css,image/png,image/bmp,*/*;q=0.8\r\n";
+    req << "Accept-Encoding: gzip, deflate\r\n";
+    req << "Connection: close\r\n";
+
+    for (const auto& [k, v] : shield_.hardened_headers()) {
+        req << k << ": " << v << "\r\n";
+    }
+    for (const auto& [k, v] : extra_headers) {
+        req << k << ": " << v << "\r\n";
+    }
+    std::string cookies = shield_.cookie_header_for(top_level_site, parsed.origin(), use_tls);
+    if (!cookies.empty()) {
+        req << "Cookie: " << cookies << "\r\n";
+    }
+    req << "\r\n";
+    std::string req_str = req.str();
+
+    std::string raw_response;
+
+    if (use_tls) {
+        auto& ssl_api = openssl();
+        if (!ssl_api.loaded) {
+            ::close(fd);
+            resp.error = "TLS unavailable: libssl.so.3 not found";
+            return resp;
+        }
+        void* ctx = ssl_api.SSL_CTX_new(ssl_api.TLS_client_method());
+        if (ctx && strict_tls_ && ssl_api.SSL_CTX_set_default_verify_paths && ssl_api.SSL_CTX_set_verify) {
+            ssl_api.SSL_CTX_set_default_verify_paths(ctx);
+            ssl_api.SSL_CTX_set_verify(ctx, OpenSslApi::kSslVerifyPeer, nullptr);
+        }
+
+        void* ssl = ctx ? ssl_api.SSL_new(ctx) : nullptr;
+        if (!ctx || !ssl) {
+            if (ssl) ssl_api.SSL_free(ssl);
+            if (ctx) ssl_api.SSL_CTX_free(ctx);
+            ::close(fd);
+            resp.error = "Failed to initialize OpenSSL context";
+            return resp;
+        }
+
+        ssl_api.SSL_set_fd(ssl, fd);
+        ssl_api.SSL_ctrl(ssl, OpenSslApi::kSslCtrlSetTlsextHostname,
+                         OpenSslApi::kTlsextNametypeHostName,
+                         const_cast<char*>(parsed.host.c_str()));
+        if (strict_tls_ && ssl_api.SSL_set1_host) {
+            ssl_api.SSL_set1_host(ssl, parsed.host.c_str());
+        }
+
+        if (ssl_api.SSL_connect(ssl) != 1) {
+            ssl_api.SSL_free(ssl);
+            ssl_api.SSL_CTX_free(ctx);
+            ::close(fd);
+            resp.error = "TLS handshake or certificate verification failed for " + parsed.host;
+            return resp;
+        }
+
+        if (ssl_api.SSL_get_verify_result) {
+            resp.tls_verified = (ssl_api.SSL_get_verify_result(ssl) == 0);
+        }
+
+        size_t sent = 0;
+        while (sent < req_str.size()) {
+            int n = ssl_api.SSL_write(ssl, req_str.data() + sent, static_cast<int>(req_str.size() - sent));
+            if (n <= 0) break;
+            sent += static_cast<size_t>(n);
+        }
+
+        char buf[8192];
+        for (;;) {
+            int n = ssl_api.SSL_read(ssl, buf, sizeof(buf));
+            if (n <= 0) break;
+            raw_response.append(buf, static_cast<size_t>(n));
+            if (raw_response.size() > 16 * 1024 * 1024) break;
+        }
+
+        ssl_api.SSL_shutdown(ssl);
+        ssl_api.SSL_free(ssl);
+        ssl_api.SSL_CTX_free(ctx);
+        ::close(fd);
+    } else {
+        size_t sent = 0;
+        while (sent < req_str.size()) {
+            ssize_t n = ::send(fd, req_str.data() + sent, req_str.size() - sent, MSG_NOSIGNAL);
+            if (n <= 0) break;
+            sent += static_cast<size_t>(n);
+        }
+        char buf[8192];
+        for (;;) {
+            ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            raw_response.append(buf, static_cast<size_t>(n));
+            if (raw_response.size() > 16 * 1024 * 1024) break;
+        }
+        ::close(fd);
+    }
+
+    size_t hdr_end = raw_response.find("\r\n\r\n");
+    if (hdr_end == std::string::npos) {
+        resp.error = "Malformed HTTP response from " + parsed.host;
+        return resp;
+    }
+
+    std::string hdr_block = raw_response.substr(0, hdr_end);
+    std::string body_raw = raw_response.substr(hdr_end + 4);
+
+    std::istringstream hss(hdr_block);
+    std::string status_line;
+    if (std::getline(hss, status_line)) {
+        std::istringstream sl(status_line);
+        std::string http_ver;
+        sl >> http_ver >> resp.status_code;
+    }
+
+    std::string line;
+    while (std::getline(hss, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string key = to_lower(trim(line.substr(0, colon)));
+        std::string val = trim(line.substr(colon + 1));
+        if (key == "set-cookie") {
+            shield_.store_cookie(top_level_site, parsed.origin(), val);
+        } else {
+            resp.headers[key] = val;
+        }
+    }
+
+    if (resp.headers.count("transfer-encoding") &&
+        to_lower(resp.headers["transfer-encoding"]).find("chunked") != std::string::npos) {
+        body_raw = decode_chunked(body_raw);
+    }
+
+    if (resp.headers.count("content-encoding")) {
+        std::string enc = to_lower(resp.headers["content-encoding"]);
+        if (enc.find("gzip") != std::string::npos || enc.find("deflate") != std::string::npos) {
+            std::string inflated;
+            if (decompress_gzip_or_zlib(reinterpret_cast<const uint8_t*>(body_raw.data()),
+                                        body_raw.size(), inflated)) {
+                body_raw = std::move(inflated);
+            }
+        }
+    }
+
+    resp.content_type = resp.headers.count("content-type") ? resp.headers["content-type"] : "text/html";
+    resp.body = std::move(body_raw);
+    return resp;
+}
+
+} // namespace astra

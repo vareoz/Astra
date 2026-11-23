@@ -1,0 +1,83 @@
+#pragma once
+
+#include <cstdint>
+#include <deque>
+#include <string>
+#include <vector>
+
+namespace astra {
+
+struct VideoContainerInfo {
+    std::string format;       // "MP4/ISOBMFF", "WebM/Matroska", "Y4M/YUV420"
+    std::string major_brand;  // e.g. "isom", "mp42"
+    std::string video_codec;  // e.g. "avc1", "vp09", "av01", "yuv420p"
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t timescale = 0;
+    uint64_t duration_ticks = 0;
+    double duration_sec = 0.0;
+    double fps = 30.0;
+    uint32_t sample_count = 0;
+    bool valid = false;
+    std::string error;
+};
+
+struct DecodedVideoFrame {
+    int width = 0;
+    int height = 0;
+    uint32_t frame_index = 0;
+    double pts_sec = 0.0;
+    std::vector<uint32_t> argb;
+    std::string codec_label;
+};
+
+// Bounded-RAM continuous video playback session with A/V presentation clock
+// (inspired by Firefox MediaDecoderStateMachine). Caps frame queue to 16 MiB.
+class MediaPlaybackSession {
+public:
+    static constexpr size_t kMaxBufferBytes = 16ULL * 1024 * 1024;
+
+    bool open(const std::string& path, std::string* error = nullptr);
+    bool decode_batch(uint32_t start_frame, uint32_t count, std::string* error = nullptr);
+    bool seek(double time_sec, DecodedVideoFrame& out_frame);
+    bool next_frame(DecodedVideoFrame& out_frame);
+
+    const VideoContainerInfo& info() const { return info_; }
+    size_t buffered_frames() const { return ring_.size(); }
+    size_t buffered_bytes() const { return buffered_bytes_; }
+    double current_pts_sec() const { return current_pts_sec_; }
+
+private:
+    std::string path_;
+    VideoContainerInfo info_;
+    std::deque<DecodedVideoFrame> ring_;
+    size_t buffered_bytes_ = 0;
+    size_t cursor_ = 0;
+    double current_pts_sec_ = 0.0;
+};
+
+// AstraMedia v2: Firefox RDD-inspired isolated media container parser,
+// native BT.709 YUV420p -> ARGB32 converter, and real multi-frame decoder.
+class MediaEngine {
+public:
+    static VideoContainerInfo probe_container(const std::string& path);
+
+    static void yuv420p_to_argb(const uint8_t* y_plane,
+                                const uint8_t* u_plane,
+                                const uint8_t* v_plane,
+                                int width, int height,
+                                std::vector<uint32_t>& out_argb);
+
+    static bool decode_frame(const std::string& path,
+                             uint32_t target_frame_index,
+                             DecodedVideoFrame& out_frame,
+                             std::string* error = nullptr);
+
+    static bool decode_frames(const std::string& path,
+                              uint32_t start_frame,
+                              uint32_t max_frames,
+                              std::vector<DecodedVideoFrame>& out_frames,
+                              std::string* error = nullptr);
+};
+
+} // namespace astra
