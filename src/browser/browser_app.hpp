@@ -42,6 +42,8 @@ struct Tab {
     float scroll_y = 0.0f;
     bool tls_verified = false;
     bool from_cache = false;
+    std::vector<std::string> history;
+    int history_index = -1;
     std::unique_ptr<SlabArena> live_arena;
     std::unique_ptr<HtmlDocument> live_doc;
     std::unique_ptr<AstraJsEngine> js_vm;
@@ -69,15 +71,17 @@ struct NavigationResult {
 
 struct ClickResult {
     bool handled = false;
-    std::string action; // "switch_tab", "navigate", "js_click", "orbit_3d", "step_video"
+    std::string action; // "switch_tab", "new_tab", "close_tab", "focus_omnibox", "back", "forward", "reload", "navigate", "focus_input", "js_click", "orbit_3d", "seek_video", "step_video"
     std::string detail;
 };
 
-// Astra v2 Multi-Process Desktop Browser Coordinator:
+// Astra v4 Multi-Process Desktop Browser Coordinator:
 // - Main + Content + RDD Media workers over AF_UNIX IPC
 // - Hard <= 2 GB RAM governor + LRU Tab Dehydration + 32 MiB HttpCache
-// - Strict TLS cert verification + AstraShield Privacy + MV3 Extensions
-// - AstraJS v2 Bytecode VM + GC + DOM Click Events + APZ Scroll + Native <img>/<astra-3d>/<video>
+// - Interactive Chrome v4 (Omnibox, Back/Forward/Reload, [+]/[x] tabs, History stack)
+// - Strict TLS + ALPN + parallel batch subresources + AstraShield + Multi-Extension MV3
+// - AstraJS v4 Bytecode VM (Promises, GC, fetch GET/POST, JSON, disk-persisted localStorage)
+// - CSS Grid + position:absolute/fixed + z-index + box-shadow + AstraFont + JPEG/PNG + Astra3D + AstraMedia v3
 class BrowserApp {
 public:
     explicit BrowserApp(uint64_t ram_ceiling_bytes = MemoryGovernor::kDefaultCeilingBytes);
@@ -89,20 +93,28 @@ public:
     bool load_extension(const std::string& dir_path, std::string* error = nullptr);
 
     uint32_t new_tab(const std::string& url = "astra://home");
-    NavigationResult navigate(uint32_t tab_id, const std::string& url);
+    bool close_tab(uint32_t tab_id);
+    NavigationResult navigate(uint32_t tab_id, const std::string& url, bool push_history = true);
+    bool go_back();
+    bool go_forward();
+    bool reload_active_tab();
     bool switch_tab(uint32_t tab_id);
     bool dehydrate_tab(uint32_t tab_id);
     bool dehydrate_lru_background_tab();
     size_t enforce_memory_budget();
 
-    // Interactive APZ scroll + hit-testing click + form keyboard input
+    // Interactive APZ scroll + hit-testing click + Omnibox & form keyboard input
     void scroll_active_tab(float delta_y);
     ClickResult click_at(int x, int y);
+    void focus_address_bar(bool clear_text = false);
+    bool address_bar_focused() const { return address_bar_focused_; }
+    const std::string& address_bar_text() const { return address_bar_buffer_; }
     bool type_text(const std::string& text);
     bool backspace();
     bool press_enter();
     void set_3d_camera(const Camera3D& cam) { cam3d_ = cam; }
     void set_video_frame(uint32_t idx) { video_frame_idx_ = idx; }
+    uint32_t video_frame() const { return video_frame_idx_; }
 
     bool paint_active_tab(Framebuffer& fb);
     bool render_active_tab(const std::string& out_png_path,
@@ -116,6 +128,7 @@ public:
     const AstraShield& shield() const { return shield_; }
     AstraShield& shield_mut() { return shield_; }
     const HttpCache& cache() const { return cache_; }
+    HttpClient& http_client() { return http_; }
     const ExtensionRuntime& extensions() const { return extensions_; }
     const std::vector<Tab>& tabs() const { return tabs_; }
     uint32_t active_tab_id() const { return active_tab_id_; }
@@ -136,7 +149,13 @@ private:
     std::string fetch_external_stylesheets(const HtmlDocument& doc,
                                            const std::string& base_url,
                                            size_t& loaded_count);
-    JsFetchResult perform_js_fetch(const std::string& base_url, const std::string& url);
+    void preload_remote_images_parallel(const HtmlDocument& doc, const std::string& base_url);
+    JsFetchResult perform_js_fetch(const std::string& base_url,
+                                   const std::string& url,
+                                   const std::string& method,
+                                   const std::string& body);
+    std::string origin_storage_get(const std::string& origin_key, const std::string& k);
+    void origin_storage_set(const std::string& origin_key, const std::string& k, const std::string& v);
     bool render_html_via_content_ipc(const std::string& html,
                                      const std::string& extra_css,
                                      uint32_t vw, uint32_t vh,
@@ -163,9 +182,13 @@ private:
     uint64_t tick_counter_ = 0;
     uint32_t next_req_id_ = 1;
 
+    bool address_bar_focused_ = false;
+    std::string address_bar_buffer_;
+
     Camera3D cam3d_;
     float time3d_sec_ = 0.72f;
     uint32_t video_frame_idx_ = 12;
+    uint32_t last_video_total_frames_ = 48;
 };
 
 } // namespace astra

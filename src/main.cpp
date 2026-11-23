@@ -43,7 +43,7 @@ void expect(bool cond, const std::string& label) {
 }
 
 int run_full_test_suite() {
-    std::cout << "=== Astra Browser Core v3 — Full Subsystem Verification Suite ===\n\n";
+    std::cout << "=== Astra Browser Core v4 — Full Subsystem Verification Suite ===\n\n";
 
     // 1. SlabArena + OS Reclamation
     {
@@ -341,6 +341,145 @@ int run_full_test_suite() {
                    "AstraJS v3 executes fetch() (with AstraShield blocking + live HTTPS), JSON.parse/stringify, and localStorage");
         }
 
+        // 17. Interactive Browser Chrome v4: Editable Omnibox, History Back/Forward, [+] New Tab, [x] Close Tab
+        {
+            uint32_t t_home = app.new_tab("astra://home");
+            (void)t_home;
+            size_t tabs_before = app.tabs().size();
+            auto c_omni = app.click_at(320, 60); // Click Omnibox
+            bool typed_url = app.type_text("astra://3d");
+            bool nav_enter = app.press_enter();
+            std::string after_enter = app.active_tab()->url;
+            auto c_back = app.click_at(28, 60); // Click Back [<]
+            std::string after_back = app.active_tab()->url;
+            auto c_fwd = app.click_at(62, 60); // Click Forward [>]
+            std::string after_fwd = app.active_tab()->url;
+            // Click [+] button after visible tabs
+            size_t vis = std::min<size_t>(app.tabs().size(), 5);
+            int plus_x = 92 + static_cast<int>(vis) * 213 + 12;
+            auto c_new = app.click_at(plus_x, 20);
+            size_t tabs_after_new = app.tabs().size();
+            bool closed = app.close_tab(app.active_tab_id());
+            size_t tabs_after_close = app.tabs().size();
+            expect(c_omni.action == "focus_omnibox" && typed_url && nav_enter &&
+                   after_enter == "astra://3d" && c_back.action == "back" &&
+                   after_back == "astra://home" && c_fwd.action == "forward" &&
+                   after_fwd == "astra://3d" && c_new.action == "new_tab" &&
+                   tabs_after_new == tabs_before + 1 && closed && tabs_after_close == tabs_before,
+                   "Chrome v4 interactive Omnibox, Back/Forward history stack, [+] new tab, and tab closing work end-to-end");
+        }
+
+        // 18. CSS Positioning (absolute/fixed), z-index Paint Ordering, box-shadow DropShadow, opacity & ASD3 Roundtrip
+        {
+            SlabArena pa;
+            HtmlDocument pdoc = HtmlDocument::parse(
+                pa,
+                "<html><head><style>"
+                ".back { position: relative; z-index: 1; background: #1e293b; height: 120px; box-shadow: 0 6px 14px rgba(0,0,0,0.5); }"
+                ".top { position: fixed; top: 16px; right: 20px; width: 200px; z-index: 50; background: #0284c7; opacity: 0.9; }"
+                ".abs { position: absolute; top: 10px; left: 30px; width: 140px; z-index: 20; background: #10b981; }"
+                "</style></head><body>"
+                "<div class=\"top\"><button id=\"pin\">Pinned</button></div>"
+                "<div class=\"back\"><div class=\"abs\">Overlay</div></div>"
+                "</body></html>");
+            CssStylesheet psheet;
+            psheet.parse(pdoc.collect_stylesheets());
+            LayoutFrame* proot = LayoutEngine::build_layout(pa, pdoc, psheet, 1280.0f, 636.0f);
+            DisplayList pdl = LayoutEngine::build_display_list(proot, 1280, 636);
+            auto blob = pdl.serialize();
+            DisplayList rt;
+            bool rt_ok = DisplayList::deserialize(blob, rt);
+            bool has_shadow = false, has_fixed = false, z_ordered = true;
+            for (size_t i = 0; i < rt.items.size(); ++i) {
+                if (rt.items[i].type == DisplayItemType::DropShadow) has_shadow = true;
+                if (rt.items[i].fixed_viewport && rt.items[i].z_index == 50) has_fixed = true;
+                if (i > 0 && rt.items[i].z_index < rt.items[i - 1].z_index) z_ordered = false;
+            }
+            // Fixed button at top:16, right:20 -> x in [1060, 1260], y in [16, 48] MUST still hit when scroll_y = 500!
+            const HitRegion* fixed_hit = rt.hit_test(1120.0f, 24.0f, 500.0f);
+            expect(rt_ok && has_shadow && has_fixed && z_ordered &&
+                   fixed_hit && fixed_hit->fixed_viewport && fixed_hit->target == "#pin",
+                   "CSS position:absolute/fixed, z-index layering, box-shadow DropShadow, opacity & ASD3 roundtrip work cleanly");
+        }
+
+        // 19. AstraNet v3: TLS 1.3 / ALPN Inspection + Bounded 4-Thread Parallel Subresource Fetcher
+        {
+            std::error_code ec;
+            std::filesystem::remove_all("/tmp/astra_netv3_cache", ec);
+            AstraShield sh;
+            HttpCache hc("/tmp/astra_netv3_cache", 4 * 1024 * 1024);
+            HttpClient net(sh, &hc);
+            auto single = net.get("https://example.com", "example.com", true);
+            auto batch = net.fetch_batch({
+                "https://example.com/",
+                "https://doubleclick.net/track.js",
+                "https://example.com/?b=2"
+            }, "example.com", 4);
+            expect(single.status_code == 200 && single.tls_verified &&
+                   !single.tls_version.empty() && batch.size() == 3 &&
+                   batch[0].status_code == 200 && batch[1].blocked_by_privacy && batch[2].status_code == 200,
+                   "AstraNet v3 negotiates TLS 1.3 + ALPN and executes bounded 4-thread parallel fetch_batch safely");
+        }
+
+        // 20. AstraJS v4: Real Promise Microtask Chaining (.then/.catch/.finally/Promise.all) + Disk-Persisted localStorage
+        {
+            std::error_code ec;
+            std::filesystem::remove_all("/tmp/astra_origin_storage", ec);
+            const std::string ppath = "/tmp/astra_promise_test.html";
+            {
+                std::ofstream f(ppath);
+                f << "<!doctype html><html><body><p id=\"pout\">init</p><script>"
+                  << "let prev = localStorage.getItem(\"persist_key\");"
+                  << "localStorage.setItem(\"persist_key\", prev ? (prev + \"_2\") : \"v1\");"
+                  << "let log = \"S\";"
+                  << "setTimeout(function() { log = log + \"_T\"; document.querySelector(\"#pout\").textContent = log + \"|\" + localStorage.getItem(\"persist_key\"); }, 5);"
+                  << "Promise.resolve(21).then(function(x) { return x * 2; }).then(function(y) { log = log + \"_P\" + y; });"
+                  << "Promise.reject(\"boom\").catch(function(e) { log = log + \"_C:\" + e; }).finally(function() { log = log + \"_F\"; });"
+                  << "</script></body></html>";
+            }
+            app.new_tab("file://" + ppath);
+            std::string run1 = app.active_tab()->live_doc->query_selector("#pout")->text_content();
+            app.reload_active_tab();
+            std::string run2 = app.active_tab()->live_doc->query_selector("#pout")->text_content();
+            expect(run1 == "S_C:boom_P42_F_T|v1" && run2 == "S_C:boom_P42_F_T|v1_2",
+                   "AstraJS v4 executes Promise .then/.catch/.finally microtasks before timers and persists per-origin localStorage to disk");
+        }
+
+        // 21. Multi-Extension MV3 Simultaneous Isolation (2 Extensions + Combined DNR + chrome.storage.local)
+        {
+            BrowserApp mapp(512ULL * 1024 * 1024);
+            std::string e1 = "astra/examples/astra-privacy-guard";
+            if (!std::ifstream(e1 + "/manifest.json")) e1 = "examples/astra-privacy-guard";
+            std::string e2 = "astra/examples/astra-reader-boost";
+            if (!std::ifstream(e2 + "/manifest.json")) e2 = "examples/astra-reader-boost";
+            bool ok1 = mapp.load_extension(e1);
+            bool ok2 = mapp.load_extension(e2);
+            auto dnr1 = mapp.extensions().evaluate_dnr("https://tracker.evil-ads.test/banner", "example.com");
+            auto dnr2 = mapp.extensions().evaluate_dnr("https://popup-annoyance.test/modal.js", "example.com");
+            const std::string mhtml = "/tmp/astra_multi_ext.html";
+            {
+                std::ofstream f(mhtml);
+                f << "<!doctype html><html><body><div id=\"ext-boost-slot\">none</div></body></html>";
+            }
+            mapp.new_tab("file://" + mhtml);
+            std::string slot_txt = mapp.active_tab()->live_doc->query_selector("#ext-boost-slot")->text_content();
+            expect(ok1 && ok2 && mapp.extensions().extensions().size() == 2 &&
+                   dnr1.block && dnr2.block && slot_txt == "MV3 ReaderBoost: enabled",
+                   "Multi-Extension MV3 runtime loads 2 extensions simultaneously with combined DNR + chrome.storage.local");
+        }
+
+        // 22. AstraMedia v3: Native WAV Audio Probe + Bounded PCM Decode (Non-Zero RMS) & Video Scrubber Seek
+        {
+            std::string wav = "astra/examples/astra_chime.wav";
+            if (!std::ifstream(wav)) wav = "examples/astra_chime.wav";
+            auto ainfo = MediaEngine::probe_container(wav);
+            DecodedAudioBuffer abuf;
+            bool decoded = MediaEngine::decode_audio_pcm(wav, 1.0, abuf);
+            expect(ainfo.valid && ainfo.has_audio && ainfo.audio_sample_rate == 44100 &&
+                   decoded && abuf.valid && abuf.pcm_s16.size() > 10000 && abuf.rms_level > 0.04,
+                   "AstraMedia v3 probes WAV audio container and decodes bounded PCM s16le waveform with real non-zero RMS");
+        }
+
         app.stop_workers();
     }
 
@@ -349,7 +488,7 @@ int run_full_test_suite() {
 }
 
 int run_stress_test(int tab_count, uint64_t ceiling_mb) {
-    std::cout << "=== Astra v3 Multi-Tab Stress Test (" << tab_count << " tabs, ceiling " << ceiling_mb << " MB) ===\n";
+    std::cout << "=== Astra v4 Multi-Tab Stress Test (" << tab_count << " tabs, ceiling " << ceiling_mb << " MB) ===\n";
     BrowserApp app(ceiling_mb * 1024ULL * 1024ULL);
     app.start_workers();
 
@@ -408,13 +547,13 @@ int run_stress_test(int tab_count, uint64_t ceiling_mb) {
 
 void print_help() {
     std::cout
-        << "Astra Browser Core v3 (Native C++20 Multi-Process Engine)\n"
+        << "Astra Browser Core v4 (Native C++20 Multi-Process Engine)\n"
         << "Usage:\n"
-        << "  astra --test                                Run full Session 3 subsystem suite\n"
+        << "  astra --test                                Run full Session 4 subsystem suite (27 tests)\n"
         << "  astra --url <URL> [--out <file.png>]        Load URL & render PNG\n"
-        << "        [--ext <extension_dir>]               Load Manifest V3 WebExtension\n"
+        << "        [--ext <extension_dir>]               Load Manifest V3 WebExtension (repeatable)\n"
         << "        [--scroll <px>] [--click <x,y>]       Simulate APZ scroll or mouse click before render\n"
-        << "        [--type <text>] [--enter]             Type into focused <input> and press Enter\n"
+        << "        [--type <text>] [--enter]             Type into Omnibox or focused <input> and press Enter\n"
         << "        [--video-frame <N>] [--wireframe]     Select video frame or 3D wireframe mode\n"
         << "        [--gui]                               Open interactive Linux X11 desktop window\n"
         << "  astra --stress-tabs <N> [--cap <MB>]        Stress-test N tabs with real /proc RSS check\n"
@@ -429,7 +568,8 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    std::string mode_url, out_png, ext_dir;
+    std::string mode_url, out_png;
+    std::vector<std::string> ext_dirs;
     std::vector<std::pair<std::string, std::string>> cli_actions;
     bool run_tests = false, open_gui = false, run_repl = false, wireframe = false;
     int stress_tabs = 0;
@@ -445,7 +585,7 @@ int main(int argc, char** argv) {
         else if (arg == "--wireframe") wireframe = true;
         else if (arg == "--url" && i + 1 < argc) mode_url = argv[++i];
         else if (arg == "--out" && i + 1 < argc) out_png = argv[++i];
-        else if (arg == "--ext" && i + 1 < argc) ext_dir = argv[++i];
+        else if (arg == "--ext" && i + 1 < argc) ext_dirs.emplace_back(argv[++i]);
         else if (arg == "--click" && i + 1 < argc) cli_actions.emplace_back("click", argv[++i]);
         else if (arg == "--type" && i + 1 < argc) cli_actions.emplace_back("type", argv[++i]);
         else if (arg == "--enter") cli_actions.emplace_back("enter", "");
@@ -469,7 +609,7 @@ int main(int argc, char** argv) {
     }
     app.set_video_frame(video_frame);
 
-    if (!ext_dir.empty()) {
+    for (const auto& ext_dir : ext_dirs) {
         std::string err;
         if (app.load_extension(ext_dir, &err)) {
             std::cout << "[AstraExt] Loaded extension from " << ext_dir << "\n";
@@ -535,7 +675,7 @@ int main(int argc, char** argv) {
     }
 
     if (run_repl) {
-        std::cout << "Astra v3 Interactive Shell (open <url>, tabs, switch <id>, scroll <px>, click <x> <y>, type <text>, enter, mem, shield, cache, render <file.png>, quit)\n";
+        std::cout << "Astra v4 Interactive Shell (open <url>, back, forward, reload, close <id>, tabs, switch <id>, scroll <px>, click <x> <y>, type <text>, enter, mem, shield, cache, render <file.png>, quit)\n";
         app.new_tab("astra://home");
         std::string line;
         while (std::cout << "astra> " && std::getline(std::cin, line)) {
@@ -547,6 +687,15 @@ int main(int argc, char** argv) {
                 std::string u; iss >> u;
                 uint32_t id = app.new_tab(u);
                 std::cout << "Opened tab #" << id << " -> " << u << "\n";
+            } else if (cmd == "back") {
+                std::cout << (app.go_back() ? "Back OK.\n" : "No previous page.\n");
+            } else if (cmd == "forward") {
+                std::cout << (app.go_forward() ? "Forward OK.\n" : "No forward page.\n");
+            } else if (cmd == "reload") {
+                std::cout << (app.reload_active_tab() ? "Reloaded.\n" : "Reload failed.\n");
+            } else if (cmd == "close") {
+                uint32_t id = 0; iss >> id;
+                std::cout << (app.close_tab(id ? id : app.active_tab_id()) ? "Closed.\n" : "Not found.\n");
             } else if (cmd == "tabs") {
                 for (const auto& t : app.tabs()) {
                     std::cout << "  #" << t.id << (t.id == app.active_tab_id() ? " * " : "   ")

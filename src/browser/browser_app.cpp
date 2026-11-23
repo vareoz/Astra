@@ -4,8 +4,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <unistd.h>
 
@@ -26,26 +29,64 @@ bool read_local_file(const std::string& path, std::string& out) {
     return true;
 }
 
+uint64_t fnv1a_64(std::string_view s) {
+    uint64_t h = 14695981039346656037ULL;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+std::string origin_storage_path(const std::string& origin_key) {
+    std::error_code ec;
+    std::filesystem::create_directories("/tmp/astra_origin_storage", ec);
+    std::ostringstream oss;
+    oss << "/tmp/astra_origin_storage/" << std::hex << fnv1a_64(origin_key) << ".kv";
+    return oss.str();
+}
+
+std::string format_mmss(double sec) {
+    if (sec < 0.0) sec = 0.0;
+    int mins = static_cast<int>(sec) / 60;
+    double rem = sec - mins * 60;
+    std::ostringstream oss;
+    oss << std::setw(2) << std::setfill('0') << mins << ":"
+        << std::fixed << std::setprecision(1) << std::setw(4) << std::setfill('0') << rem;
+    return oss.str();
+}
+
+std::string normalize_omnibox_url(std::string raw) {
+    while (!raw.empty() && std::isspace(static_cast<unsigned char>(raw.front()))) raw.erase(raw.begin());
+    while (!raw.empty() && std::isspace(static_cast<unsigned char>(raw.back()))) raw.pop_back();
+    if (raw.empty()) return "astra://home";
+    if (raw.rfind("http://", 0) == 0 || raw.rfind("https://", 0) == 0 ||
+        raw.rfind("file://", 0) == 0 || raw.rfind("astra://", 0) == 0) {
+        return raw;
+    }
+    return "https://" + raw;
+}
+
 std::string build_home_html(const AstraShield& shield, size_t ext_count,
                             const MemorySnapshot& mem, const CacheStats& cstats) {
     std::ostringstream html;
-    html << "<!doctype html><html><head><title>Astra Browser v3 — Native Core</title>"
+    html << "<!doctype html><html><head><title>Astra Browser v4 — Native Core</title>"
          << "<style>"
-         << "body { background: #0b0f19; color: #e2e8f0; padding: 20px 26px; }"
-         << ".hero { background: #111827; border: 1px solid #1e293b; border-radius: 12px; padding: 18px 22px; margin-bottom: 16px; }"
+         << "body { background: #0b0f19; color: #e2e8f0; padding: 18px 26px; }"
+         << ".hero { background: #111827; border: 1px solid #1e293b; border-radius: 12px; padding: 16px 22px; margin-bottom: 14px; box-shadow: 0 6px 16px rgba(0,0,0,0.45); }"
          << ".kicker { color: #38bdf8; font-size: 12px; font-weight: bold; font-family: monospace; margin-bottom: 6px; }"
-         << ".grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 16px; }"
-         << ".card { background: #131c2e; border: 1px solid #24324a; border-radius: 10px; padding: 14px; }"
+         << ".grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 14px; }"
+         << ".card { background: #131c2e; border: 1px solid #24324a; border-radius: 10px; padding: 14px; box-shadow: 0 4px 12px rgba(0,0,0,0.35); }"
          << ".card-title { color: #7dd3fc; font-size: 12px; font-weight: bold; font-family: monospace; margin-bottom: 6px; }"
          << ".metric { color: #f8fafc; font-size: 20px; font-weight: bold; margin-bottom: 4px; }"
          << ".muted { color: #94a3b8; font-size: 12px; }"
          << ".media-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }"
-         << ".panel { background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 12px; }"
+         << ".panel { background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.35); }"
          << "</style></head><body>"
          << "<div class=\"hero\">"
-         << "<div class=\"kicker\">ASTRA v3 NATIVE C++20 | TRUETYPE VECTOR FONTS | JPEG+PNG | CSS GRID | FETCH()</div>"
-         << "<h1 id=\"headline\">Astra Desktop Browser — Session 3</h1>"
-         << "<p>Multi-process e10s architecture (Main + Content + RDD Media) with anti-aliased TrueType vector typography, pure C++20 Baseline JPEG & PNG decoders, CSS Grid + interactive forms, AstraJS v3 bytecode VM (GC + fetch + JSON + localStorage), strict TLS, and smooth Blinn-Phong Astra3D.</p>"
+         << "<div class=\"kicker\">ASTRA v4 NATIVE C++20 | CHROME v4 OMNIBOX | CSS POSITION+Z-INDEX | PROMISES | PARALLEL NET | MEDIA SCRUBBER</div>"
+         << "<h1 id=\"headline\">Astra Desktop Browser — Session 4</h1>"
+         << "<p>Multi-process e10s engine (Main + Content + RDD Media) with interactive Omnibox/History/Tabs, TrueType UTF-8 fonts, JPEG+PNG decoders, CSS Grid + absolute/fixed + z-index + box-shadow, AstraJS v4 Promises & persistent localStorage, parallel TLS 1.3 subresources, and interactive Astra3D/AstraMedia v3.</p>"
          << "</div>"
          << "<div class=\"grid\">"
          << "<div class=\"card\"><div class=\"card-title\">MEMORY GOVERNOR</div>"
@@ -53,16 +94,16 @@ std::string build_home_html(const AstraShield& shield, size_t ext_count,
          << "<div class=\"muted\">Real Linux /proc RSS + Cache Hits: " << cstats.hits << "</div></div>"
          << "<div class=\"card\"><div class=\"card-title\">ASTRA SHIELD PRIVACY</div>"
          << "<div class=\"metric\">" << shield.blocklist_size() << " Rules | " << shield.stats().trackers_blocked << " Blocked</div>"
-         << "<div class=\"muted\">Total Cookie Partitioning + Strict TLS + GPC</div></div>"
+         << "<div class=\"muted\">Total Cookie Partitioning + TLS 1.3 ALPN + GPC</div></div>"
          << "<div class=\"card\"><div class=\"card-title\">WEBEXTENSIONS MV3</div>"
          << "<div class=\"metric\">" << ext_count << " Active</div>"
-         << "<div class=\"muted\">DeclarativeNetRequest + AstraJS v3 Bytecode VM</div></div>"
+         << "<div class=\"muted\">Multi-Ext DNR + chrome.storage + AstraJS v4</div></div>"
          << "</div>"
          << "<div class=\"media-row\">"
          << "<div class=\"panel\"><div class=\"card-title\">ASTRA3D v2 SMOOTH SHADER ENGINE</div>"
-         << "<astra-3d scene=\"planet\" style=\"height: 250px;\"></astra-3d></div>"
-         << "<div class=\"panel\"><div class=\"card-title\">ASTRAMEDIA RDD REAL VIDEO PIPELINE</div>"
-         << "<video src=\"examples/astra_demo.mp4\" style=\"height: 250px;\"></video></div>"
+         << "<astra-3d scene=\"planet\" style=\"height: 245px;\"></astra-3d></div>"
+         << "<div class=\"panel\"><div class=\"card-title\">ASTRAMEDIA v3 RDD INTERACTIVE PLAYER</div>"
+         << "<video src=\"examples/astra_demo.mp4\" style=\"height: 245px;\"></video></div>"
          << "</div>"
          << "</body></html>";
     return html.str();
@@ -160,6 +201,10 @@ void BrowserApp::run_media_worker_loop(IpcChannel& ch) {
             write_u32(resp.payload, static_cast<uint32_t>(frame.width));
             write_u32(resp.payload, static_cast<uint32_t>(frame.height));
             write_u32(resp.payload, frame.frame_index);
+            write_u32(resp.payload, frame.total_frames);
+            write_f32(resp.payload, static_cast<float>(frame.pts_sec));
+            write_f32(resp.payload, static_cast<float>(frame.duration_sec));
+            write_u32(resp.payload, frame.has_audio ? 1u : 0u);
             if (ok && !frame.argb.empty()) {
                 size_t byte_len = frame.argb.size() * sizeof(uint32_t);
                 write_u32(resp.payload, static_cast<uint32_t>(byte_len));
@@ -221,10 +266,116 @@ uint32_t BrowserApp::new_tab(const std::string& url) {
 
     tabs_.push_back(std::move(t));
     active_tab_id_ = tabs_.back().id;
+    address_bar_focused_ = false;
     if (!url.empty()) {
-        navigate(active_tab_id_, url);
+        navigate(active_tab_id_, url, true);
     }
     return active_tab_id_;
+}
+
+bool BrowserApp::close_tab(uint32_t tab_id) {
+    auto it = std::find_if(tabs_.begin(), tabs_.end(), [tab_id](const Tab& t) { return t.id == tab_id; });
+    if (it == tabs_.end()) return false;
+    size_t idx = static_cast<size_t>(std::distance(tabs_.begin(), it));
+    bool was_active = (tab_id == active_tab_id_);
+    tabs_.erase(it);
+    address_bar_focused_ = false;
+
+    if (tabs_.empty()) {
+        new_tab("astra://home");
+        return true;
+    }
+    if (was_active) {
+        size_t next_idx = std::min(idx, tabs_.size() - 1);
+        switch_tab(tabs_[next_idx].id);
+    }
+    return true;
+}
+
+bool BrowserApp::go_back() {
+    Tab* active = find_tab(active_tab_id_);
+    if (!active || active->history_index <= 0) return false;
+    --active->history_index;
+    std::string target = active->history[static_cast<size_t>(active->history_index)];
+    address_bar_focused_ = false;
+    return navigate(active->id, target, false).ok;
+}
+
+bool BrowserApp::go_forward() {
+    Tab* active = find_tab(active_tab_id_);
+    if (!active || active->history_index < 0 ||
+        static_cast<size_t>(active->history_index + 1) >= active->history.size()) {
+        return false;
+    }
+    ++active->history_index;
+    std::string target = active->history[static_cast<size_t>(active->history_index)];
+    address_bar_focused_ = false;
+    return navigate(active->id, target, false).ok;
+}
+
+bool BrowserApp::reload_active_tab() {
+    Tab* active = find_tab(active_tab_id_);
+    if (!active || active->url.empty()) return false;
+    address_bar_focused_ = false;
+    return navigate(active->id, active->url, false).ok;
+}
+
+void BrowserApp::focus_address_bar(bool clear_text) {
+    Tab* active = find_tab(active_tab_id_);
+    address_bar_focused_ = true;
+    if (clear_text) {
+        address_bar_buffer_.clear();
+    } else if (active) {
+        address_bar_buffer_ = active->url;
+    }
+    if (active && active->live_doc && !active->focused_input_selector.empty()) {
+        for (DomNode* inp : active->live_doc->query_selector_all("input")) inp->set_attr("data-astra-focused", "0");
+        for (DomNode* ta : active->live_doc->query_selector_all("textarea")) ta->set_attr("data-astra-focused", "0");
+        active->focused_input_selector.clear();
+        relayout_live_tab(*active);
+    }
+}
+
+std::string BrowserApp::origin_storage_get(const std::string& origin_key, const std::string& k) {
+    std::ifstream f(origin_storage_path(origin_key));
+    if (!f) return "";
+    std::string line;
+    std::string found;
+    while (std::getline(f, line)) {
+        size_t tab = line.find('\t');
+        if (tab != std::string::npos && line.substr(0, tab) == k) {
+            found = line.substr(tab + 1);
+        }
+    }
+    return found;
+}
+
+void BrowserApp::origin_storage_set(const std::string& origin_key, const std::string& k, const std::string& v) {
+    std::string path = origin_storage_path(origin_key);
+    std::unordered_map<std::string, std::string> kv;
+    {
+        std::ifstream f(path);
+        std::string line;
+        while (std::getline(f, line)) {
+            size_t tab = line.find('\t');
+            if (tab != std::string::npos) kv[line.substr(0, tab)] = line.substr(tab + 1);
+        }
+    }
+    std::string clean_v = v;
+    std::replace(clean_v.begin(), clean_v.end(), '\n', ' ');
+    std::replace(clean_v.begin(), clean_v.end(), '\r', ' ');
+    kv[k] = clean_v;
+
+    // Enforce bounded storage (max 1 MiB per origin)
+    std::ostringstream oss;
+    size_t total = 0;
+    for (const auto& [ek, ev] : kv) {
+        if (total + ek.size() + ev.size() + 2 > 1024 * 1024) break;
+        oss << ek << '\t' << ev << '\n';
+        total += ek.size() + ev.size() + 2;
+    }
+    std::ofstream out(path, std::ios::trunc);
+    out << oss.str();
 }
 
 std::string BrowserApp::resolve_source_html(const std::string& url,
@@ -302,6 +453,7 @@ std::string BrowserApp::fetch_external_stylesheets(const HtmlDocument& doc,
     ParsedUrl base = parse_url(base_url);
     std::string top_site = base.valid ? base.registrable_domain() : "";
 
+    std::vector<std::string> remote_urls;
     for (DomNode* link : doc.query_selector_all("link")) {
         if (link->get_attr("rel") != "stylesheet") continue;
         std::string href = link->get_attr("href");
@@ -315,7 +467,13 @@ std::string BrowserApp::fetch_external_stylesheets(const HtmlDocument& doc,
                 ++loaded_count;
             }
         } else if (resolved.rfind("http://", 0) == 0 || resolved.rfind("https://", 0) == 0) {
-            HttpResponse r = http_.get(resolved, top_site, false);
+            remote_urls.push_back(resolved);
+        }
+    }
+
+    if (!remote_urls.empty()) {
+        auto responses = http_.fetch_batch(remote_urls, top_site, 4);
+        for (const auto& r : responses) {
             if (!r.blocked_by_privacy && !r.blocked_by_extension && r.status_code == 200) {
                 combined += "\n" + r.body;
                 ++loaded_count;
@@ -323,6 +481,34 @@ std::string BrowserApp::fetch_external_stylesheets(const HtmlDocument& doc,
         }
     }
     return combined;
+}
+
+void BrowserApp::preload_remote_images_parallel(const HtmlDocument& doc, const std::string& base_url) {
+    std::vector<std::string> remote_imgs;
+    for (DomNode* img : doc.query_selector_all("img")) {
+        std::string src = img->get_attr("src");
+        if (src.empty()) continue;
+        std::string resolved = HttpClient::resolve_relative_url(base_url, src);
+        if ((resolved.rfind("http://", 0) == 0 || resolved.rfind("https://", 0) == 0) &&
+            image_cache_.find(resolved) == image_cache_.end()) {
+            remote_imgs.push_back(resolved);
+            if (remote_imgs.size() >= 8) break; // Bound concurrent preload per page
+        }
+    }
+    if (remote_imgs.size() <= 1) return;
+    ParsedUrl base = parse_url(base_url);
+    auto responses = http_.fetch_batch(remote_imgs, base.valid ? base.registrable_domain() : "", 4);
+    for (size_t i = 0; i < responses.size(); ++i) {
+        const auto& r = responses[i];
+        if (!r.blocked_by_privacy && !r.blocked_by_extension && r.status_code == 200 && !r.body.empty()) {
+            DecodedImage dec = ImageDecoder::decode_bytes(
+                reinterpret_cast<const uint8_t*>(r.body.data()), r.body.size());
+            if (dec.valid) {
+                if (image_cache_.size() > 32) image_cache_.clear();
+                image_cache_[remote_imgs[i]] = std::move(dec);
+            }
+        }
+    }
 }
 
 bool BrowserApp::load_image_subresource(const std::string& base_url, const std::string& src, DecodedImage& out) {
@@ -402,7 +588,7 @@ void BrowserApp::relayout_live_tab(Tab& tab) {
     tab.arena_bytes = tab.live_arena->bytes_used();
 }
 
-NavigationResult BrowserApp::navigate(uint32_t tab_id, const std::string& url) {
+NavigationResult BrowserApp::navigate(uint32_t tab_id, const std::string& url, bool push_history) {
     auto t0 = std::chrono::steady_clock::now();
     NavigationResult res;
     res.tab_id = tab_id;
@@ -430,16 +616,26 @@ NavigationResult BrowserApp::navigate(uint32_t tab_id, const std::string& url) {
     tab->live_doc = std::make_unique<HtmlDocument>(HtmlDocument::parse(*tab->live_arena, html));
     tab->js_vm = std::make_unique<AstraJsEngine>();
     tab->focused_input_selector.clear();
+
+    // Bind disk-persisted per-origin storage & network fetch (GET/POST)
+    ParsedUrl pu = parse_url(final_url);
+    std::string origin_key = pu.valid ? pu.origin() : final_url;
+    tab->js_vm->bind_storage(
+        [this, origin_key](const std::string& k) { return origin_storage_get(origin_key, k); },
+        [this, origin_key](const std::string& k, const std::string& v) { origin_storage_set(origin_key, k, v); });
     std::string fetch_base = final_url;
-    tab->js_vm->bind_fetch([this, fetch_base](const std::string& req_url) {
-        return perform_js_fetch(fetch_base, req_url);
+    tab->js_vm->bind_fetch([this, fetch_base](const std::string& req_url,
+                                              const std::string& method,
+                                              const std::string& body) {
+        return perform_js_fetch(fetch_base, req_url, method, body);
     });
 
-    // Load external <link rel="stylesheet"> subresources through AstraShield + HttpCache
+    // Load external <link rel="stylesheet"> subresources through AstraShield + HttpCache (parallel batch)
     size_t ext_css_count = 0;
     std::string subresource_css = fetch_external_stylesheets(*tab->live_doc, final_url, ext_css_count);
+    preload_remote_images_parallel(*tab->live_doc, final_url);
 
-    // Execute page <script> blocks via AstraJS v3 Bytecode VM
+    // Execute page <script> blocks via AstraJS v4 Bytecode VM (Promises + Event Loop)
     tab->console_logs.clear();
     auto scripts = tab->live_doc->collect_scripts();
     for (const auto& sc : scripts) {
@@ -453,6 +649,17 @@ NavigationResult BrowserApp::navigate(uint32_t tab_id, const std::string& url) {
     for (const auto& l : ext_sum.logs) tab->console_logs.push_back(l);
 
     std::string all_extra_css = subresource_css + "\n" + ext_css;
+
+    if (push_history) {
+        if (tab->history_index >= 0 &&
+            static_cast<size_t>(tab->history_index + 1) < tab->history.size()) {
+            tab->history.resize(static_cast<size_t>(tab->history_index + 1));
+        }
+        if (tab->history.empty() || tab->history.back() != final_url) {
+            tab->history.push_back(final_url);
+            tab->history_index = static_cast<int>(tab->history.size()) - 1;
+        }
+    }
 
     tab->url = final_url;
     tab->raw_html = html;
@@ -512,11 +719,12 @@ bool BrowserApp::switch_tab(uint32_t tab_id) {
         if (t.state == TabState::Active) t.state = TabState::Warm;
     }
     active_tab_id_ = tab_id;
+    address_bar_focused_ = false;
     target->last_used_tick = ++tick_counter_;
 
     if (target->state == TabState::Dehydrated) {
         target->state = TabState::Active;
-        navigate(tab_id, target->url);
+        navigate(tab_id, target->url, false);
     } else {
         target->state = TabState::Active;
     }
@@ -580,20 +788,95 @@ void BrowserApp::scroll_active_tab(float delta_y) {
 
 ClickResult BrowserApp::click_at(int x, int y) {
     ClickResult out;
-    // 1. Tab strip clicks
-    if (y >= 0 && y < 38 && x >= 88) {
-        size_t idx = static_cast<size_t>((x - 88) / 203);
-        if (idx < tabs_.size()) {
-            switch_tab(tabs_[idx].id);
+
+    // 1. Top Tab Strip (y: 0..38)
+    if (y >= 0 && y < 38) {
+        address_bar_focused_ = false;
+        if (x >= 10 && x <= 82) {
+            if (Tab* act = find_tab(active_tab_id_)) {
+                navigate(act->id, "astra://home", true);
+                out.handled = true;
+                out.action = "navigate";
+                out.detail = "astra://home";
+                return out;
+            }
+        }
+        size_t max_visible = std::min<size_t>(tabs_.size(), 5);
+        int tx = 92;
+        for (size_t i = 0; i < max_visible; ++i) {
+            const int tw = 205;
+            if (x >= tx && x < tx + tw) {
+                // Per-tab [x] close chip
+                if (x >= tx + tw - 26 && x <= tx + tw - 4 && y >= 9 && y <= 31) {
+                    uint32_t cid = tabs_[i].id;
+                    std::string ctitle = tabs_[i].title;
+                    close_tab(cid);
+                    out.handled = true;
+                    out.action = "close_tab";
+                    out.detail = ctitle;
+                    return out;
+                }
+                switch_tab(tabs_[i].id);
+                out.handled = true;
+                out.action = "switch_tab";
+                out.detail = tabs_[i].title;
+                return out;
+            }
+            tx += tw + 8;
+        }
+        // New Tab [+] button
+        if (x >= tx && x <= tx + 32) {
+            uint32_t nid = new_tab("astra://home");
             out.handled = true;
-            out.action = "switch_tab";
-            out.detail = tabs_[idx].title;
+            out.action = "new_tab";
+            out.detail = "tab#" + std::to_string(nid);
             return out;
         }
+        return out;
     }
 
+    // 2. Navigation Bar (y: 38..84)
+    if (y >= 38 && y < Framebuffer::kChromeHeight) {
+        if (x >= 14 && x <= 42) {
+            if (go_back()) {
+                out.handled = true;
+                out.action = "back";
+                out.detail = active_tab() ? active_tab()->url : "";
+            }
+            return out;
+        }
+        if (x >= 48 && x <= 76) {
+            if (go_forward()) {
+                out.handled = true;
+                out.action = "forward";
+                out.detail = active_tab() ? active_tab()->url : "";
+            }
+            return out;
+        }
+        if (x >= 82 && x <= 110) {
+            if (reload_active_tab()) {
+                out.handled = true;
+                out.action = "reload";
+                out.detail = active_tab() ? active_tab()->url : "";
+            }
+            return out;
+        }
+        // Clickable Editable Omnibox (x: 120..880)
+        if (x >= 120 && x <= 880) {
+            focus_address_bar(true);
+            out.handled = true;
+            out.action = "focus_omnibox";
+            out.detail = "omnibox";
+            return out;
+        }
+        return out;
+    }
+
+    // Clicking inside viewport unfocuses the Omnibox
+    address_bar_focused_ = false;
+
     Tab* active = find_tab(active_tab_id_);
-    if (!active || y < Framebuffer::kChromeHeight) return out;
+    if (!active) return out;
 
     const HitRegion* hit = active->cached_display_list.hit_test(
         static_cast<float>(x),
@@ -603,7 +886,7 @@ ClickResult BrowserApp::click_at(int x, int y) {
 
     if (hit->kind == HitRegionKind::Link) {
         std::string next_url = HttpClient::resolve_relative_url(active->url, hit->target);
-        navigate(active->id, next_url);
+        navigate(active->id, next_url, true);
         out.handled = true;
         out.action = "navigate";
         out.detail = next_url;
@@ -640,24 +923,38 @@ ClickResult BrowserApp::click_at(int x, int y) {
         out.action = "orbit_3d";
         out.detail = hit->target;
     } else if (hit->kind == HitRegionKind::Video) {
-        video_frame_idx_ += 6;
-        out.handled = true;
-        out.action = "step_video";
-        out.detail = "frame=" + std::to_string(video_frame_idx_);
+        float local_y = static_cast<float>(y - Framebuffer::kChromeHeight) +
+                        (hit->fixed_viewport ? 0.0f : active->scroll_y) - hit->rect.y;
+        float local_x = static_cast<float>(x) - hit->rect.x;
+        if (local_y >= hit->rect.h - 42.0f && local_x >= 44.0f && hit->rect.w > 64.0f) {
+            float frac = std::clamp((local_x - 44.0f) / (hit->rect.w - 60.0f), 0.0f, 1.0f);
+            video_frame_idx_ = static_cast<uint32_t>(std::round(frac * std::max<uint32_t>(1, last_video_total_frames_ - 1)));
+            out.handled = true;
+            out.action = "seek_video";
+            out.detail = "frame=" + std::to_string(video_frame_idx_);
+        } else {
+            video_frame_idx_ = (video_frame_idx_ + 6) % std::max<uint32_t>(1, last_video_total_frames_);
+            out.handled = true;
+            out.action = "step_video";
+            out.detail = "frame=" + std::to_string(video_frame_idx_);
+        }
     }
     return out;
 }
 
-JsFetchResult BrowserApp::perform_js_fetch(const std::string& base_url, const std::string& url) {
+JsFetchResult BrowserApp::perform_js_fetch(const std::string& base_url,
+                                           const std::string& url,
+                                           const std::string& method,
+                                           const std::string& body) {
     JsFetchResult out;
     std::string resolved = HttpClient::resolve_relative_url(base_url, url);
     if (resolved.rfind("file://", 0) == 0) {
         std::string path = resolved.substr(7);
-        std::string body;
-        if (read_local_file(path, body)) {
+        std::string fbody;
+        if (read_local_file(path, fbody)) {
             out.ok = true;
             out.status = 200;
-            out.body = std::move(body);
+            out.body = std::move(fbody);
         } else {
             out.status = 404;
             out.error = "File not found: " + path;
@@ -666,7 +963,9 @@ JsFetchResult BrowserApp::perform_js_fetch(const std::string& base_url, const st
     }
     ParsedUrl base_p = parse_url(base_url);
     std::string top_site = base_p.valid ? base_p.registrable_domain() : "";
-    HttpResponse resp = http_.get(resolved, top_site, false);
+    HttpResponse resp = (method == "POST" || method == "post")
+                            ? http_.post(resolved, body, "application/json", top_site)
+                            : http_.get(resolved, top_site, false);
     out.status = resp.status_code;
     out.body = std::move(resp.body);
     out.error = resp.error;
@@ -677,6 +976,10 @@ JsFetchResult BrowserApp::perform_js_fetch(const std::string& base_url, const st
 }
 
 bool BrowserApp::type_text(const std::string& text) {
+    if (address_bar_focused_) {
+        address_bar_buffer_ += text;
+        return true;
+    }
     Tab* active = find_tab(active_tab_id_);
     if (!active || !active->live_doc || active->focused_input_selector.empty()) return false;
     DomNode* el = active->live_doc->query_selector(active->focused_input_selector);
@@ -693,6 +996,10 @@ bool BrowserApp::type_text(const std::string& text) {
 }
 
 bool BrowserApp::backspace() {
+    if (address_bar_focused_) {
+        if (!address_bar_buffer_.empty()) address_bar_buffer_.pop_back();
+        return true;
+    }
     Tab* active = find_tab(active_tab_id_);
     if (!active || !active->live_doc || active->focused_input_selector.empty()) return false;
     DomNode* el = active->live_doc->query_selector(active->focused_input_selector);
@@ -709,6 +1016,11 @@ bool BrowserApp::backspace() {
 }
 
 bool BrowserApp::press_enter() {
+    if (address_bar_focused_) {
+        std::string target = normalize_omnibox_url(address_bar_buffer_);
+        address_bar_focused_ = false;
+        return navigate(active_tab_id_, target, true).ok;
+    }
     Tab* active = find_tab(active_tab_id_);
     if (!active || !active->live_doc || active->focused_input_selector.empty()) return false;
     DomNode* el = active->live_doc->query_selector(active->focused_input_selector);
@@ -730,27 +1042,39 @@ bool BrowserApp::decode_video_via_rdd(const std::string& path, uint32_t frame_id
             IpcMessage resp;
             if (media_worker_.channel().recv(resp) && resp.type == IpcMsgType::DecodeVideoResp) {
                 size_t off = 0;
-                uint32_t ok_flag = 0, w = 0, h = 0, idx = 0, bytes_len = 0;
+                uint32_t ok_flag = 0, w = 0, h = 0, idx = 0, total = 0, audio_flag = 0, bytes_len = 0;
+                float pts = 0.0f, dur = 0.0f;
                 std::string label;
                 if (read_u32(resp.payload, off, ok_flag) && ok_flag == 1 &&
                     read_str(resp.payload, off, label) &&
                     read_u32(resp.payload, off, w) &&
                     read_u32(resp.payload, off, h) &&
                     read_u32(resp.payload, off, idx) &&
+                    read_u32(resp.payload, off, total) &&
+                    read_f32(resp.payload, off, pts) &&
+                    read_f32(resp.payload, off, dur) &&
+                    read_u32(resp.payload, off, audio_flag) &&
                     read_u32(resp.payload, off, bytes_len) &&
                     off + bytes_len <= resp.payload.size()) {
                     out.width = static_cast<int>(w);
                     out.height = static_cast<int>(h);
                     out.frame_index = idx;
+                    out.total_frames = total;
+                    out.pts_sec = pts;
+                    out.duration_sec = dur;
+                    out.has_audio = (audio_flag != 0);
                     out.codec_label = label;
                     out.argb.resize(bytes_len / sizeof(uint32_t));
                     std::memcpy(out.argb.data(), resp.payload.data() + off, bytes_len);
+                    if (total > 0) last_video_total_frames_ = total;
                     return true;
                 }
             }
         }
     }
-    return MediaEngine::decode_frame(path, frame_idx, out);
+    bool ok = MediaEngine::decode_frame(path, frame_idx, out);
+    if (ok && out.total_frames > 0) last_video_total_frames_ = out.total_frames;
+    return ok;
 }
 
 bool BrowserApp::paint_active_tab(Framebuffer& fb) {
@@ -761,6 +1085,12 @@ bool BrowserApp::paint_active_tab(Framebuffer& fb) {
     cs.active_url = active->url;
     cs.active_title = active->title;
     cs.tls_verified = active->tls_verified;
+    cs.can_go_back = (active->history_index > 0);
+    cs.can_go_forward = (active->history_index >= 0 &&
+                         static_cast<size_t>(active->history_index + 1) < active->history.size());
+    cs.address_bar_focused = address_bar_focused_;
+    cs.address_bar_text = address_bar_buffer_;
+
     for (size_t i = 0; i < tabs_.size(); ++i) {
         std::string ttl = tabs_[i].title;
         if (tabs_[i].state == TabState::Dehydrated) ttl = "[Z] " + ttl;
@@ -778,13 +1108,25 @@ bool BrowserApp::paint_active_tab(Framebuffer& fb) {
     std::string base_url = active->url;
     fb.composite_display_list(
         active->cached_display_list, content_y, active->scroll_y,
-        [this](const std::string& src, VideoBlitFrame& out) -> bool {
+        [this, base_url](const std::string& src, VideoBlitFrame& out) -> bool {
+            std::string path = src;
+            std::string resolved = HttpClient::resolve_relative_url(base_url, src);
+            if (resolved.rfind("file://", 0) == 0 && std::ifstream(resolved.substr(7))) {
+                path = resolved.substr(7);
+            } else if (!std::ifstream(path) && std::ifstream("astra/" + path)) {
+                path = "astra/" + path;
+            }
             DecodedVideoFrame df;
-            if (!decode_video_via_rdd(src, video_frame_idx_, df)) return false;
+            if (!decode_video_via_rdd(path, video_frame_idx_, df)) return false;
             out.width = df.width;
             out.height = df.height;
             out.argb = std::move(df.argb);
             out.label = df.codec_label;
+            uint32_t total = std::max<uint32_t>(1, df.total_frames > 0 ? df.total_frames : 48);
+            out.progress = static_cast<float>(df.frame_index) / static_cast<float>(std::max<uint32_t>(1, total - 1));
+            out.has_audio = df.has_audio;
+            out.time_label = format_mmss(df.pts_sec) + " / " + format_mmss(df.duration_sec > 0.0 ? df.duration_sec : 2.0) +
+                             (df.has_audio ? " [AUD]" : "");
             return true;
         },
         [this, base_url](const std::string& src, DecodedImage& out) -> bool {

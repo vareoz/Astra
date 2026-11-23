@@ -259,6 +259,56 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
     } else if (p == "font-family") {
         st.monospace = (vl.find("mono") != std::string::npos || vl.find("code") != std::string::npos ||
                         vl.find("consolas") != std::string::npos || vl.find("courier") != std::string::npos);
+    } else if (p == "position") {
+        if (vl == "relative") st.position = PositionType::Relative;
+        else if (vl == "absolute") st.position = PositionType::Absolute;
+        else if (vl == "fixed") st.position = PositionType::Fixed;
+        else st.position = PositionType::Static;
+    } else if (p == "top") {
+        st.has_top = true;
+        st.top = StyleEngine::parse_px(v, 0.0f);
+    } else if (p == "left") {
+        st.has_left = true;
+        st.left = StyleEngine::parse_px(v, 0.0f);
+    } else if (p == "right") {
+        st.has_right = true;
+        st.right = StyleEngine::parse_px(v, 0.0f);
+    } else if (p == "bottom") {
+        st.has_bottom = true;
+        st.bottom = StyleEngine::parse_px(v, 0.0f);
+    } else if (p == "z-index") {
+        st.z_index = std::atoi(v.c_str());
+    } else if (p == "opacity") {
+        st.opacity = std::clamp(std::strtof(v.c_str(), nullptr), 0.0f, 1.0f);
+    } else if (p == "box-shadow") {
+        if (vl == "none") {
+            st.box_shadow.enabled = false;
+        } else {
+            st.box_shadow.enabled = true;
+            // Extract optional rgba(...) or #hex color
+            size_t rgba_pos = vl.find("rgba(");
+            if (rgba_pos == std::string::npos) rgba_pos = vl.find("rgb(");
+            std::string num_part = v;
+            if (rgba_pos != std::string::npos) {
+                size_t rp = vl.find(')', rgba_pos);
+                if (rp != std::string::npos) {
+                    st.box_shadow.color = StyleEngine::parse_color(v.substr(rgba_pos, rp - rgba_pos + 1), Color{0, 0, 0, 120});
+                    num_part = v.substr(0, rgba_pos);
+                }
+            }
+            auto toks = split_ws(num_part);
+            std::vector<float> nums;
+            for (const auto& t : toks) {
+                if (!t.empty() && (t[0] == '#' || std::isalpha(static_cast<unsigned char>(t[0])))) {
+                    st.box_shadow.color = StyleEngine::parse_color(t, st.box_shadow.color);
+                } else {
+                    nums.push_back(StyleEngine::parse_px(t, 0.0f));
+                }
+            }
+            if (nums.size() >= 1) st.box_shadow.offset_x = nums[0];
+            if (nums.size() >= 2) st.box_shadow.offset_y = nums[1];
+            if (nums.size() >= 3) st.box_shadow.blur = std::clamp(nums[2], 0.0f, 40.0f);
+        }
     }
 }
 

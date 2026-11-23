@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "id": "astra-reader-boost@astra",
+  "name": "Astra Reader Boost",
+  "version": "1.0.0",
+  "permissions": ["storage", "declarativeNetRequest"],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "reader_rules",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "css": ["reader.css"],
+      "js": ["reader.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

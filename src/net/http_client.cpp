@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <atomic>
 #include <cctype>
 #include <cstring>
 #include <dlfcn.h>
@@ -9,13 +10,14 @@
 #include <sstream>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <thread>
 #include <unistd.h>
 
 namespace astra {
 
 namespace {
 
-// Dynamic OpenSSL 3.x ABI loader with strict certificate & hostname verification
+// Dynamic OpenSSL 3.x ABI loader with strict certificate + hostname verification + ALPN + TLS version
 struct OpenSslApi {
     void* ssl_lib = nullptr;
     void* crypto_lib = nullptr;
@@ -26,12 +28,15 @@ struct OpenSslApi {
     using SSL_CTX_free_fn = void (*)(void*);
     using SSL_CTX_set_default_verify_paths_fn = int (*)(void*);
     using SSL_CTX_set_verify_fn = void (*)(void*, int, void*);
+    using SSL_CTX_set_alpn_protos_fn = int (*)(void*, const unsigned char*, unsigned int);
     using SSL_new_fn = void* (*)(void*);
     using SSL_free_fn = void (*)(void*);
     using SSL_set_fd_fn = int (*)(void*, int);
     using SSL_ctrl_fn = long (*)(void*, int, long, void*);
     using SSL_set1_host_fn = int (*)(void*, const char*);
     using SSL_get_verify_result_fn = long (*)(const void*);
+    using SSL_get_version_fn = const char* (*)(const void*);
+    using SSL_get0_alpn_selected_fn = void (*)(const void*, const unsigned char**, unsigned int*);
     using SSL_connect_fn = int (*)(void*);
     using SSL_write_fn = int (*)(void*, const void*, int);
     using SSL_read_fn = int (*)(void*, void*, int);
@@ -42,12 +47,15 @@ struct OpenSslApi {
     SSL_CTX_free_fn SSL_CTX_free = nullptr;
     SSL_CTX_set_default_verify_paths_fn SSL_CTX_set_default_verify_paths = nullptr;
     SSL_CTX_set_verify_fn SSL_CTX_set_verify = nullptr;
+    SSL_CTX_set_alpn_protos_fn SSL_CTX_set_alpn_protos = nullptr;
     SSL_new_fn SSL_new = nullptr;
     SSL_free_fn SSL_free = nullptr;
     SSL_set_fd_fn SSL_set_fd = nullptr;
     SSL_ctrl_fn SSL_ctrl = nullptr;
     SSL_set1_host_fn SSL_set1_host = nullptr;
     SSL_get_verify_result_fn SSL_get_verify_result = nullptr;
+    SSL_get_version_fn SSL_get_version = nullptr;
+    SSL_get0_alpn_selected_fn SSL_get0_alpn_selected = nullptr;
     SSL_connect_fn SSL_connect = nullptr;
     SSL_write_fn SSL_write = nullptr;
     SSL_read_fn SSL_read = nullptr;
@@ -70,12 +78,17 @@ struct OpenSslApi {
         SSL_CTX_set_default_verify_paths = reinterpret_cast<SSL_CTX_set_default_verify_paths_fn>(
             dlsym(ssl_lib, "SSL_CTX_set_default_verify_paths"));
         SSL_CTX_set_verify = reinterpret_cast<SSL_CTX_set_verify_fn>(dlsym(ssl_lib, "SSL_CTX_set_verify"));
+        SSL_CTX_set_alpn_protos = reinterpret_cast<SSL_CTX_set_alpn_protos_fn>(
+            dlsym(ssl_lib, "SSL_CTX_set_alpn_protos"));
         SSL_new = reinterpret_cast<SSL_new_fn>(dlsym(ssl_lib, "SSL_new"));
         SSL_free = reinterpret_cast<SSL_free_fn>(dlsym(ssl_lib, "SSL_free"));
         SSL_set_fd = reinterpret_cast<SSL_set_fd_fn>(dlsym(ssl_lib, "SSL_set_fd"));
         SSL_ctrl = reinterpret_cast<SSL_ctrl_fn>(dlsym(ssl_lib, "SSL_ctrl"));
         SSL_set1_host = reinterpret_cast<SSL_set1_host_fn>(dlsym(ssl_lib, "SSL_set1_host"));
         SSL_get_verify_result = reinterpret_cast<SSL_get_verify_result_fn>(dlsym(ssl_lib, "SSL_get_verify_result"));
+        SSL_get_version = reinterpret_cast<SSL_get_version_fn>(dlsym(ssl_lib, "SSL_get_version"));
+        SSL_get0_alpn_selected = reinterpret_cast<SSL_get0_alpn_selected_fn>(
+            dlsym(ssl_lib, "SSL_get0_alpn_selected"));
         SSL_connect = reinterpret_cast<SSL_connect_fn>(dlsym(ssl_lib, "SSL_connect"));
         SSL_write = reinterpret_cast<SSL_write_fn>(dlsym(ssl_lib, "SSL_write"));
         SSL_read = reinterpret_cast<SSL_read_fn>(dlsym(ssl_lib, "SSL_read"));
@@ -291,8 +304,12 @@ HttpResponse HttpClient::get(const std::string& url,
             top_site = prelim.registrable_domain();
         }
 
-        // Step 1: AstraShield inspection
-        PrivacyDecision pdec = shield_.inspect_request(current_url, top_site, is_top_level_navigation);
+        // Step 1: AstraShield inspection (thread-safe)
+        PrivacyDecision pdec;
+        {
+            std::lock_guard<std::mutex> lk(state_mu_);
+            pdec = shield_.inspect_request(current_url, top_site, is_top_level_navigation);
+        }
         if (pdec.blocked) {
             HttpResponse resp;
             resp.final_url = pdec.sanitized_url;
@@ -306,7 +323,11 @@ HttpResponse HttpClient::get(const std::string& url,
         // Step 2: Extension Declarative Net Request (DNR)
         std::vector<std::pair<std::string, std::string>> ext_headers;
         if (dnr_hook_) {
-            DnrHookResult dnr = dnr_hook_(current_url, top_site);
+            DnrHookResult dnr;
+            {
+                std::lock_guard<std::mutex> lk(state_mu_);
+                dnr = dnr_hook_(current_url, top_site);
+            }
             if (dnr.block) {
                 HttpResponse resp;
                 resp.final_url = current_url;
@@ -333,7 +354,12 @@ HttpResponse HttpClient::get(const std::string& url,
         // Step 3: Check bounded RAM/Disk HttpCache before opening any socket
         if (cache_) {
             CachedResource cached;
-            if (cache_->lookup(canonical_url, cached)) {
+            bool hit = false;
+            {
+                std::lock_guard<std::mutex> lk(state_mu_);
+                hit = cache_->lookup(canonical_url, cached);
+            }
+            if (hit) {
                 HttpResponse resp;
                 resp.status_code = 200;
                 resp.final_url = canonical_url;
@@ -346,7 +372,7 @@ HttpResponse HttpClient::get(const std::string& url,
             }
         }
 
-        HttpResponse resp = perform_single_request(parsed, top_site, ext_headers);
+        HttpResponse resp = perform_single_request("GET", parsed, top_site, ext_headers, "", "");
         resp.privacy_decision = pdec;
 
         if ((resp.status_code == 301 || resp.status_code == 302 ||
@@ -367,6 +393,7 @@ HttpResponse HttpClient::get(const std::string& url,
                 cr.etag = resp.headers.count("etag") ? resp.headers["etag"] : "";
                 cr.body = resp.body;
                 cr.max_age_sec = max_age;
+                std::lock_guard<std::mutex> lk(state_mu_);
                 cache_->store(cr);
             }
         }
@@ -379,10 +406,92 @@ HttpResponse HttpClient::get(const std::string& url,
     return err;
 }
 
+HttpResponse HttpClient::post(const std::string& url,
+                              const std::string& body,
+                              const std::string& content_type,
+                              const std::string& top_level_site) {
+    ParsedUrl prelim = parse_url(url);
+    std::string top_site = top_level_site.empty() && prelim.valid ? prelim.registrable_domain() : top_level_site;
+
+    PrivacyDecision pdec;
+    {
+        std::lock_guard<std::mutex> lk(state_mu_);
+        pdec = shield_.inspect_request(url, top_site, false);
+    }
+    if (pdec.blocked) {
+        HttpResponse resp;
+        resp.final_url = pdec.sanitized_url;
+        resp.blocked_by_privacy = true;
+        resp.privacy_decision = pdec;
+        resp.error = pdec.reason;
+        return resp;
+    }
+
+    std::vector<std::pair<std::string, std::string>> ext_headers;
+    if (dnr_hook_) {
+        DnrHookResult dnr;
+        {
+            std::lock_guard<std::mutex> lk(state_mu_);
+            dnr = dnr_hook_(pdec.sanitized_url, top_site);
+        }
+        if (dnr.block) {
+            HttpResponse resp;
+            resp.final_url = pdec.sanitized_url;
+            resp.blocked_by_extension = true;
+            resp.privacy_decision = pdec;
+            resp.error = "Blocked by WebExtension DNR: " + dnr.rule_source;
+            return resp;
+        }
+        ext_headers = std::move(dnr.add_headers);
+    }
+
+    ParsedUrl parsed = parse_url(pdec.sanitized_url);
+    if (!parsed.valid) {
+        HttpResponse resp;
+        resp.error = "Invalid URL: " + url;
+        return resp;
+    }
+    HttpResponse resp = perform_single_request("POST", parsed, top_site, ext_headers, body, content_type);
+    resp.privacy_decision = pdec;
+    return resp;
+}
+
+std::vector<HttpResponse> HttpClient::fetch_batch(const std::vector<std::string>& urls,
+                                                  const std::string& top_level_site,
+                                                  size_t max_threads) {
+    std::vector<HttpResponse> results(urls.size());
+    if (urls.empty()) return results;
+    size_t workers = std::clamp<size_t>(max_threads, 1, std::min<size_t>(4, urls.size()));
+    if (workers == 1) {
+        for (size_t i = 0; i < urls.size(); ++i) {
+            results[i] = get(urls[i], top_level_site, false);
+        }
+        return results;
+    }
+
+    std::atomic<size_t> next_idx{0};
+    std::vector<std::thread> pool;
+    pool.reserve(workers);
+    for (size_t w = 0; w < workers; ++w) {
+        pool.emplace_back([&]() {
+            for (;;) {
+                size_t i = next_idx.fetch_add(1);
+                if (i >= urls.size()) break;
+                results[i] = get(urls[i], top_level_site, false);
+            }
+        });
+    }
+    for (auto& th : pool) th.join();
+    return results;
+}
+
 HttpResponse HttpClient::perform_single_request(
+    const std::string& method,
     const ParsedUrl& parsed,
     const std::string& top_level_site,
-    const std::vector<std::pair<std::string, std::string>>& extra_headers) {
+    const std::vector<std::pair<std::string, std::string>>& extra_headers,
+    const std::string& req_body,
+    const std::string& req_content_type) {
     HttpResponse resp;
     resp.final_url = parsed.rebuild();
 
@@ -395,27 +504,39 @@ HttpResponse HttpClient::perform_single_request(
         return resp;
     }
 
+    std::vector<std::pair<std::string, std::string>> hardened;
+    std::string cookies;
+    {
+        std::lock_guard<std::mutex> lk(state_mu_);
+        hardened = shield_.hardened_headers();
+        cookies = shield_.cookie_header_for(top_level_site, parsed.origin(), use_tls);
+    }
+
     std::ostringstream req;
     std::string target = parsed.path.empty() ? "/" : parsed.path;
     if (!parsed.query.empty()) target += "?" + parsed.query;
 
-    req << "GET " << target << " HTTP/1.1\r\n";
+    req << method << " " << target << " HTTP/1.1\r\n";
     req << "Host: " << parsed.host << "\r\n";
-    req << "Accept: text/html,text/css,image/png,image/bmp,*/*;q=0.8\r\n";
+    req << "Accept: text/html,text/css,image/jpeg,image/png,image/bmp,*/*;q=0.8\r\n";
     req << "Accept-Encoding: gzip, deflate\r\n";
     req << "Connection: close\r\n";
 
-    for (const auto& [k, v] : shield_.hardened_headers()) {
+    for (const auto& [k, v] : hardened) {
         req << k << ": " << v << "\r\n";
     }
     for (const auto& [k, v] : extra_headers) {
         req << k << ": " << v << "\r\n";
     }
-    std::string cookies = shield_.cookie_header_for(top_level_site, parsed.origin(), use_tls);
     if (!cookies.empty()) {
         req << "Cookie: " << cookies << "\r\n";
     }
+    if (!req_body.empty() || method == "POST") {
+        req << "Content-Type: " << (req_content_type.empty() ? "application/octet-stream" : req_content_type) << "\r\n";
+        req << "Content-Length: " << req_body.size() << "\r\n";
+    }
     req << "\r\n";
+    if (!req_body.empty()) req << req_body;
     std::string req_str = req.str();
 
     std::string raw_response;
@@ -431,6 +552,11 @@ HttpResponse HttpClient::perform_single_request(
         if (ctx && strict_tls_ && ssl_api.SSL_CTX_set_default_verify_paths && ssl_api.SSL_CTX_set_verify) {
             ssl_api.SSL_CTX_set_default_verify_paths(ctx);
             ssl_api.SSL_CTX_set_verify(ctx, OpenSslApi::kSslVerifyPeer, nullptr);
+        }
+        if (ctx && ssl_api.SSL_CTX_set_alpn_protos) {
+            // Wire-format ALPN list: "\x08http/1.1"
+            static const unsigned char kAlpn[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+            ssl_api.SSL_CTX_set_alpn_protos(ctx, kAlpn, sizeof(kAlpn));
         }
 
         void* ssl = ctx ? ssl_api.SSL_new(ctx) : nullptr;
@@ -460,6 +586,18 @@ HttpResponse HttpClient::perform_single_request(
 
         if (ssl_api.SSL_get_verify_result) {
             resp.tls_verified = (ssl_api.SSL_get_verify_result(ssl) == 0);
+        }
+        if (ssl_api.SSL_get_version) {
+            const char* ver = ssl_api.SSL_get_version(ssl);
+            if (ver) resp.tls_version = ver;
+        }
+        if (ssl_api.SSL_get0_alpn_selected) {
+            const unsigned char* proto = nullptr;
+            unsigned int plen = 0;
+            ssl_api.SSL_get0_alpn_selected(ssl, &proto, &plen);
+            if (proto && plen > 0) {
+                resp.alpn_protocol.assign(reinterpret_cast<const char*>(proto), plen);
+            }
         }
 
         size_t sent = 0;
@@ -523,6 +661,7 @@ HttpResponse HttpClient::perform_single_request(
         std::string key = to_lower(trim(line.substr(0, colon)));
         std::string val = trim(line.substr(colon + 1));
         if (key == "set-cookie") {
+            std::lock_guard<std::mutex> lk(state_mu_);
             shield_.store_cookie(top_level_site, parsed.origin(), val);
         } else {
             resp.headers[key] = val;

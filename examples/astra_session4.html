@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Astra v4 — Sesión 4 Showcase</title>
+  <style>
+    body { background: #0a0f1a; color: #e2e8f0; padding: 18px 24px; }
+    .fixed-hud {
+      position: fixed;
+      top: 14px;
+      right: 26px;
+      width: 320px;
+      z-index: 50;
+      background: #0f172a;
+      border: 1px solid #38bdf8;
+      border-radius: 10px;
+      padding: 10px 14px;
+      box-shadow: 0 8px 20px rgba(0, 0, 0, 0.65);
+    }
+    .fixed-title { color: #38bdf8; font-size: 11px; font-weight: bold; font-family: monospace; margin-bottom: 3px; }
+    .fixed-val { color: #f8fafc; font-size: 12px; font-family: monospace; }
+    .hero {
+      position: relative;
+      background: #111827;
+      border: 1px solid #1e293b;
+      border-radius: 12px;
+      padding: 18px 22px;
+      margin-bottom: 16px;
+      box-shadow: 0 8px 18px rgba(0, 0, 0, 0.45);
+    }
+    .abs-badge {
+      position: absolute;
+      top: 14px;
+      right: 360px;
+      width: 180px;
+      z-index: 20;
+      background: #065f46;
+      border: 1px solid #34d399;
+      border-radius: 8px;
+      padding: 6px 10px;
+      color: #ecfdf5;
+      font-size: 11px;
+      font-weight: bold;
+      font-family: monospace;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+    }
+    .kicker { color: #38bdf8; font-size: 12px; font-weight: bold; font-family: monospace; margin-bottom: 6px; }
+    .status { color: #6ee7b7; font-size: 13px; font-family: monospace; margin-top: 8px; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+    .card {
+      position: relative;
+      background: #131c2e;
+      border: 1px solid #24324a;
+      border-radius: 10px;
+      padding: 14px;
+      box-shadow: 0 6px 14px rgba(0, 0, 0, 0.40);
+    }
+    .label { color: #7dd3fc; font-size: 12px; font-weight: bold; font-family: monospace; margin-bottom: 8px; }
+    .sub { color: #94a3b8; font-size: 12px; margin-top: 8px; }
+    .ext-chip {
+      background: #1e1b4b;
+      border: 1px solid #6366f1;
+      border-radius: 8px;
+      padding: 8px 12px;
+      color: #c7d2fe;
+      font-size: 12px;
+      font-family: monospace;
+      margin-top: 10px;
+      opacity: 0.95;
+    }
+  </style>
+</head>
+<body>
+  <div class="fixed-hud">
+    <div class="fixed-title">POSITION: FIXED • Z-INDEX: 50</div>
+    <div id="promise-hud" class="fixed-val">Cargando Promises...</div>
+  </div>
+
+  <div class="hero">
+    <div class="abs-badge">ABSOLUTE Z-20 LAYER</div>
+    <div class="kicker">SESIÓN 4 • CHROME v4 • POSITION:FIXED/ABSOLUTE • Z-INDEX • PROMISES • MEDIA v3</div>
+    <h1>Astra v4: Motor Nativo Multiproceso</h1>
+    <p>Prueba en vivo de capas z-index, elementos position:fixed inmunes al scroll APZ, sombras suaves DropShadow, cadenas Promise + fetch().then(), almacenamiento persistente en disco y reproductor de video con barra de progreso interactiva.</p>
+    <div id="promise-out" class="status">Esperando microtasks de Promise...</div>
+    <div id="ext-boost-slot" class="ext-chip">MV3 ReaderBoost: sin extensión</div>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <div class="label">ASTRAMEDIA v3 • BARRA SCRUBBER INTERACTIVA</div>
+      <video src="astra_demo.mp4" style="height: 230px;"></video>
+      <p class="sub">Decodificado en proceso aislado RDD con búsqueda directa en barra de progreso.</p>
+    </div>
+    <div class="card">
+      <div class="label">ASTRA3D v2 • ESCENA PLANETARIA BLINN-PHONG</div>
+      <astra-3d scene="planet" style="height: 230px;"></astra-3d>
+      <p class="sub">Rasterizador Z-buffer 3D nativo sin WebGL ni bibliotecas externas.</p>
+    </div>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <div class="label">DECODIFICADOR JPEG DCT PURO (C++20)</div>
+      <img src="astra_nebula.jpg" width="560" height="210">
+      <p class="sub">Verificación de scroll profundo mientras el HUD position:fixed permanece anclado arriba.</p>
+    </div>
+    <div class="card">
+      <div class="label">RESUMEN DE PERSISTENCIA Y PROMISES</div>
+      <p id="storage-out" class="status">Comprobando localStorage persistente...</p>
+      <p class="sub">Todos los datos de origen persisten en disco bajo /tmp/astra_origin_storage/ con límite acotado de 1 MiB por origen.</p>
+    </div>
+  </div>
+
+  <script>
+    let visits = localStorage.getItem("s4_visits");
+    let next_v = visits ? (visits + "+") : "1";
+    localStorage.setItem("s4_visits", next_v);
+    document.querySelector("#storage-out").textContent = "Persistencia en disco localStorage['s4_visits'] = " + localStorage.getItem("s4_visits");
+
+    Promise.all([Promise.resolve("Promise.all"), Promise.resolve("Microtasks"), Promise.resolve("OK")])
+      .then(function(arr) {
+        return arr.join(" -> ");
+      })
+      .then(function(chainTxt) {
+        document.querySelector("#promise-hud").textContent = chainTxt;
+      });
+
+    fetch("astra_data.json")
+      .then(function(resp) {
+        return resp.json();
+      })
+      .then(function(data) {
+        document.querySelector("#promise-out").textContent =
+          "fetch().then().then(): " + data.engine + " | features=" + data.features.join(", ");
+      });
+  </script>
+</body>
+</html>

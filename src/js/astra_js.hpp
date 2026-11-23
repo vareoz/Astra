@@ -82,9 +82,17 @@ struct BytecodeChunk {
     std::vector<std::string> names;
 };
 
-// Mark-and-Sweep GC-managed heap object (Array, Object, Function)
+// Mark-and-Sweep GC-managed heap object (Array, Object, Function, Promise)
 struct GcObject {
-    enum class Type { Array, Map, Function };
+    enum class Type { Array, Map, Function, Promise };
+    enum class PromiseState : uint8_t { Pending, Fulfilled, Rejected };
+    struct PromiseReaction {
+        GcObject* next = nullptr;
+        JsValue on_fulfilled;
+        JsValue on_rejected;
+        bool is_finally = false;
+    };
+
     Type type = Type::Map;
     bool marked = false;
 
@@ -95,6 +103,11 @@ struct GcObject {
     std::string fn_name;
     std::vector<std::string> params;
     BytecodeChunk chunk;
+
+    // Promise fields
+    PromiseState promise_state = PromiseState::Pending;
+    JsValue promise_value;
+    std::vector<PromiseReaction> reactions;
 };
 
 struct GcStats {
@@ -124,14 +137,17 @@ struct JsFetchResult {
     bool blocked_by_shield = false;
 };
 
-// AstraJS v3: Lexer -> Recursive-Descent Compiler -> Stack Bytecode VM
-// + Mark-and-Sweep GC + Microtask/Timer Event Loop + DOM Events
-// + Web APIs: fetch() (via AstraShield/HttpCache), JSON.parse/stringify, localStorage.
+// AstraJS v4: Lexer -> Recursive-Descent Compiler -> Stack Bytecode VM
+// + Mark-and-Sweep GC + Microtask/Timer Event Loop + Real Promise (.then/.catch/.finally/Promise.all)
+// + DOM Events + Web APIs: fetch() (GET/POST via AstraShield/HttpCache), JSON, localStorage,
+// + WebExtension chrome.storage.local / browser.storage.local.
 class AstraJsEngine {
 public:
     using StorageGetFn = std::function<std::string(const std::string&)>;
     using StorageSetFn = std::function<void(const std::string&, const std::string&)>;
-    using FetchFn = std::function<JsFetchResult(const std::string& url)>;
+    using FetchFn = std::function<JsFetchResult(const std::string& url,
+                                                const std::string& method,
+                                                const std::string& body)>;
 
     AstraJsEngine() = default;
     ~AstraJsEngine();
@@ -158,9 +174,25 @@ private:
         JsValue callback;
     };
 
+    struct MicrotaskEntry {
+        JsValue callback;
+        JsValue arg;
+        bool has_arg = false;
+        GcObject* target_promise = nullptr;
+        bool passthrough_reject = false;
+        bool is_finally = false;
+        bool source_rejected = false;
+    };
+
     GcObject* alloc_object(GcObject::Type type);
     void mark_value(const JsValue& v);
     void mark_object(GcObject* o);
+
+    GcObject* make_resolved_promise(const JsValue& val);
+    GcObject* make_rejected_promise(const JsValue& reason);
+    void settle_promise(GcObject* p, bool rejected, const JsValue& val);
+    void enqueue_reaction(GcObject* p, const GcObject::PromiseReaction& r);
+    GcObject* chain_promise(GcObject* p, const JsValue& on_fulfilled, const JsValue& on_rejected, bool is_finally = false);
 
     JsValue run_chunk(const BytecodeChunk& chunk,
                       std::vector<JsValue>& locals,
@@ -179,7 +211,7 @@ private:
 
     std::unordered_map<std::string, JsValue> globals_;
     std::vector<JsValue> stack_;
-    std::vector<JsValue> microtasks_;
+    std::vector<MicrotaskEntry> microtasks_;
     std::vector<TimerEntry> timers_;
     // DOM event listeners: (node_ptr, event_name) -> callbacks
     std::map<std::pair<DomNode*, std::string>, std::vector<JsValue>> listeners_;

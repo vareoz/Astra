@@ -17,7 +17,7 @@ enum class TokKind {
     KwLet, KwConst, KwVar, KwFunction, KwReturn, KwIf, KwElse, KwWhile, KwFor,
     KwTrue, KwFalse, KwNull,
     LParen, RParen, LBrace, RBrace, LBracket, RBracket,
-    Comma, Semi, Dot, Colon,
+    Comma, Semi, Dot, Colon, Question,
     Plus, Minus, Star, Slash, Percent, Bang,
     Assign, Eq, Neq, Lt, Le, Gt, Ge, AndAnd, OrOr
 };
@@ -114,6 +114,7 @@ std::vector<Token> tokenize(std::string_view src) {
             case ';': out.push_back({TokKind::Semi, ";", 0}); break;
             case '.': out.push_back({TokKind::Dot, ".", 0}); break;
             case ':': out.push_back({TokKind::Colon, ":", 0}); break;
+            case '?': out.push_back({TokKind::Question, "?", 0}); break;
             case '+': out.push_back({TokKind::Plus, "+", 0}); break;
             case '-': out.push_back({TokKind::Minus, "-", 0}); break;
             case '*': out.push_back({TokKind::Star, "*", 0}); break;
@@ -366,7 +367,21 @@ private:
             else emit(OpCode::StoreGlobal, add_name(name));
             return true;
         }
-        return compile_or(err);
+        return compile_ternary(err);
+    }
+
+    bool compile_ternary(std::string& err) {
+        if (!compile_or(err)) return false;
+        if (match(TokKind::Question)) {
+            int32_t j_else = emit(OpCode::JumpIfFalse, 0);
+            if (!compile_assign(err)) return false;
+            int32_t j_end = emit(OpCode::Jump, 0);
+            match(TokKind::Colon);
+            chunk_->code[static_cast<size_t>(j_else)].operand = static_cast<int32_t>(chunk_->code.size());
+            if (!compile_assign(err)) return false;
+            chunk_->code[static_cast<size_t>(j_end)].operand = static_cast<int32_t>(chunk_->code.size());
+        }
+        return true;
     }
 
     bool compile_or(std::string& err) {
@@ -665,6 +680,88 @@ void AstraJsEngine::mark_object(GcObject* o) {
     for (const auto& e : o->elements) mark_value(e);
     for (const auto& [k, v] : o->props) mark_value(v);
     for (const auto& c : o->chunk.constants) mark_value(c);
+    mark_value(o->promise_value);
+    for (const auto& r : o->reactions) {
+        if (r.next) mark_object(r.next);
+        mark_value(r.on_fulfilled);
+        mark_value(r.on_rejected);
+    }
+}
+
+GcObject* AstraJsEngine::make_resolved_promise(const JsValue& val) {
+    GcObject* p = alloc_object(GcObject::Type::Promise);
+    p->promise_state = GcObject::PromiseState::Fulfilled;
+    p->promise_value = val;
+    return p;
+}
+
+GcObject* AstraJsEngine::make_rejected_promise(const JsValue& reason) {
+    GcObject* p = alloc_object(GcObject::Type::Promise);
+    p->promise_state = GcObject::PromiseState::Rejected;
+    p->promise_value = reason;
+    return p;
+}
+
+void AstraJsEngine::enqueue_reaction(GcObject* p, const GcObject::PromiseReaction& r) {
+    if (!p) return;
+    bool rejected = (p->promise_state == GcObject::PromiseState::Rejected);
+    MicrotaskEntry mt;
+    mt.target_promise = r.next;
+    mt.arg = p->promise_value;
+    mt.has_arg = true;
+    mt.is_finally = r.is_finally;
+    mt.source_rejected = rejected;
+    if (r.is_finally) {
+        mt.callback = r.on_fulfilled;
+    } else if (!rejected) {
+        mt.callback = r.on_fulfilled;
+        mt.passthrough_reject = false;
+    } else {
+        mt.callback = r.on_rejected;
+        mt.passthrough_reject = (r.on_rejected.kind == JsValue::Kind::Undefined);
+    }
+    microtasks_.push_back(std::move(mt));
+}
+
+void AstraJsEngine::settle_promise(GcObject* p, bool rejected, const JsValue& val) {
+    if (!p || p->promise_state != GcObject::PromiseState::Pending) return;
+    // Unwrap chained Promise returned from .then()
+    if (!rejected && val.kind == JsValue::Kind::Object && val.obj && val.obj->type == GcObject::Type::Promise) {
+        GcObject* inner = val.obj;
+        if (inner->promise_state == GcObject::PromiseState::Pending) {
+            GcObject::PromiseReaction fwd;
+            fwd.next = p;
+            inner->reactions.push_back(std::move(fwd));
+            return;
+        }
+        rejected = (inner->promise_state == GcObject::PromiseState::Rejected);
+        p->promise_state = rejected ? GcObject::PromiseState::Rejected : GcObject::PromiseState::Fulfilled;
+        p->promise_value = inner->promise_value;
+    } else {
+        p->promise_state = rejected ? GcObject::PromiseState::Rejected : GcObject::PromiseState::Fulfilled;
+        p->promise_value = val;
+    }
+    auto pending = std::move(p->reactions);
+    p->reactions.clear();
+    for (const auto& r : pending) {
+        enqueue_reaction(p, r);
+    }
+}
+
+GcObject* AstraJsEngine::chain_promise(GcObject* p, const JsValue& on_fulfilled,
+                                       const JsValue& on_rejected, bool is_finally) {
+    GcObject* next = alloc_object(GcObject::Type::Promise);
+    GcObject::PromiseReaction r;
+    r.next = next;
+    r.on_fulfilled = on_fulfilled;
+    r.on_rejected = on_rejected;
+    r.is_finally = is_finally;
+    if (p->promise_state == GcObject::PromiseState::Pending) {
+        p->reactions.push_back(std::move(r));
+    } else {
+        enqueue_reaction(p, r);
+    }
+    return next;
 }
 
 size_t AstraJsEngine::gc_collect() {
@@ -672,7 +769,11 @@ size_t AstraJsEngine::gc_collect() {
 
     for (const auto& [k, v] : globals_) mark_value(v);
     for (const auto& v : stack_) mark_value(v);
-    for (const auto& v : microtasks_) mark_value(v);
+    for (const auto& mt : microtasks_) {
+        mark_value(mt.callback);
+        mark_value(mt.arg);
+        if (mt.target_promise) mark_object(mt.target_promise);
+    }
     for (const auto& t : timers_) mark_value(t.callback);
     for (const auto& [key, vec] : listeners_) {
         for (const auto& cb : vec) mark_value(cb);
@@ -706,7 +807,9 @@ JsValue AstraJsEngine::invoke_callable(const JsValue& fn,
     if (fn.kind == JsValue::Kind::String) {
         // Built-in global functions
         if (fn.sval == "__queueMicrotask__" && !args.empty()) {
-            microtasks_.push_back(args[0]);
+            MicrotaskEntry mt;
+            mt.callback = args[0];
+            microtasks_.push_back(std::move(mt));
             return JsValue::make_undefined();
         }
         if (fn.sval == "__setTimeout__" && !args.empty()) {
@@ -719,9 +822,17 @@ JsValue AstraJsEngine::invoke_callable(const JsValue& fn,
         }
         if (fn.sval == "__fetch__" && !args.empty()) {
             std::string url = args[0].to_string();
+            std::string method = "GET";
+            std::string body;
+            if (args.size() >= 2 && args[1].kind == JsValue::Kind::Object && args[1].obj) {
+                auto mit = args[1].obj->props.find("method");
+                if (mit != args[1].obj->props.end()) method = mit->second.to_string();
+                auto bit = args[1].obj->props.find("body");
+                if (bit != args[1].obj->props.end()) body = bit->second.to_string();
+            }
             JsFetchResult fr;
             if (fetch_fn_) {
-                fr = fetch_fn_(url);
+                fr = fetch_fn_(url, method, body);
             } else {
                 fr.error = "No network transport bound";
             }
@@ -785,7 +896,8 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
             case OpCode::LoadGlobal: {
                 const std::string& name = chunk.names[static_cast<size_t>(ins.operand)];
                 if (name == "document" || name == "console" || name == "astra" ||
-                    name == "Math" || name == "JSON" || name == "localStorage") {
+                    name == "Math" || name == "JSON" || name == "localStorage" ||
+                    name == "Promise" || name == "chrome" || name == "browser") {
                     stack_.push_back(JsValue::make_string("__builtin_" + name + "__"));
                 } else if (name == "queueMicrotask") {
                     stack_.push_back(JsValue::make_string("__queueMicrotask__"));
@@ -872,7 +984,11 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
             case OpCode::GetProp: {
                 JsValue key = pop(), obj = pop();
                 std::string k = key.to_string();
-                if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_astra__" && k == "storage") {
+                if (obj.kind == JsValue::Kind::String &&
+                    (obj.sval == "__builtin_astra__" || obj.sval == "__builtin_chrome__" || obj.sval == "__builtin_browser__") &&
+                    k == "storage") {
+                    stack_.push_back(JsValue::make_string("__builtin_astra_storage__"));
+                } else if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_astra_storage__" && k == "local") {
                     stack_.push_back(JsValue::make_string("__builtin_astra_storage__"));
                 } else if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_document__" && k == "title") {
                     stack_.push_back(JsValue::make_string(doc.title()));
@@ -1058,6 +1174,34 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                     } else if (method == "stringify" && !args.empty()) {
                         ret = JsValue::make_string(js_to_json(args[0]));
                     }
+                } else if (recv.kind == JsValue::Kind::String && recv.sval == "__builtin_Promise__") {
+                    if (method == "resolve") {
+                        JsValue v = args.empty() ? JsValue::make_undefined() : args[0];
+                        ret = JsValue::make_obj(make_resolved_promise(v));
+                    } else if (method == "reject") {
+                        JsValue v = args.empty() ? JsValue::make_string("Rejected") : args[0];
+                        ret = JsValue::make_obj(make_rejected_promise(v));
+                    } else if (method == "all" && !args.empty() && args[0].kind == JsValue::Kind::Object &&
+                               args[0].obj && args[0].obj->type == GcObject::Type::Array) {
+                        GcObject* out_arr = alloc_object(GcObject::Type::Array);
+                        bool any_rej = false;
+                        JsValue rej_reason;
+                        for (const auto& item : args[0].obj->elements) {
+                            if (item.kind == JsValue::Kind::Object && item.obj &&
+                                item.obj->type == GcObject::Type::Promise) {
+                                if (item.obj->promise_state == GcObject::PromiseState::Rejected) {
+                                    any_rej = true;
+                                    rej_reason = item.obj->promise_value;
+                                    break;
+                                }
+                                out_arr->elements.push_back(item.obj->promise_value);
+                            } else {
+                                out_arr->elements.push_back(item);
+                            }
+                        }
+                        ret = JsValue::make_obj(any_rej ? make_rejected_promise(rej_reason)
+                                                        : make_resolved_promise(JsValue::make_obj(out_arr)));
+                    }
                 } else if (recv.kind == JsValue::Kind::String) {
                     const std::string& s = recv.sval;
                     if (method == "trim") {
@@ -1077,6 +1221,24 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                         ret = JsValue::make_string(std::move(u));
                     } else if (method == "includes" && !args.empty()) {
                         ret = JsValue::make_bool(s.find(args[0].to_string()) != std::string::npos);
+                    } else if (method == "split" && !args.empty()) {
+                        std::string sep = args[0].to_string();
+                        GcObject* arr = alloc_object(GcObject::Type::Array);
+                        if (sep.empty()) {
+                            for (char c : s) arr->elements.push_back(JsValue::make_string(std::string(1, c)));
+                        } else {
+                            size_t pos = 0;
+                            while (pos <= s.size()) {
+                                size_t hit = s.find(sep, pos);
+                                if (hit == std::string::npos) {
+                                    arr->elements.push_back(JsValue::make_string(s.substr(pos)));
+                                    break;
+                                }
+                                arr->elements.push_back(JsValue::make_string(s.substr(pos, hit - pos)));
+                                pos = hit + sep.size();
+                            }
+                        }
+                        ret = JsValue::make_obj(arr);
                     }
                 } else if (recv.kind == JsValue::Kind::DomRef && recv.node) {
                     if (method == "setAttribute" && args.size() >= 2) {
@@ -1091,9 +1253,36 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                         listeners_[{recv.node, args[0].to_string()}].push_back(args[1]);
                     }
                 } else if (recv.kind == JsValue::Kind::Object && recv.obj) {
-                    if (recv.obj->type == GcObject::Type::Array && method == "push" && !args.empty()) {
+                    if (recv.obj->type == GcObject::Type::Promise) {
+                        if (method == "then") {
+                            JsValue on_f = args.size() >= 1 ? args[0] : JsValue::make_undefined();
+                            JsValue on_r = args.size() >= 2 ? args[1] : JsValue::make_undefined();
+                            ret = JsValue::make_obj(chain_promise(recv.obj, on_f, on_r, false));
+                        } else if (method == "catch") {
+                            JsValue on_r = args.size() >= 1 ? args[0] : JsValue::make_undefined();
+                            ret = JsValue::make_obj(chain_promise(recv.obj, JsValue::make_undefined(), on_r, false));
+                        } else if (method == "finally") {
+                            JsValue on_fin = args.size() >= 1 ? args[0] : JsValue::make_undefined();
+                            ret = JsValue::make_obj(chain_promise(recv.obj, on_fin, JsValue::make_undefined(), true));
+                        }
+                    } else if (recv.obj->type == GcObject::Type::Array && method == "push" && !args.empty()) {
                         recv.obj->elements.push_back(args[0]);
                         ret = JsValue::make_number(static_cast<double>(recv.obj->elements.size()));
+                    } else if (recv.obj->type == GcObject::Type::Array && method == "join") {
+                        std::string sep = args.empty() ? "," : args[0].to_string();
+                        std::string out;
+                        for (size_t i = 0; i < recv.obj->elements.size(); ++i) {
+                            if (i) out += sep;
+                            out += recv.obj->elements[i].to_string();
+                        }
+                        ret = JsValue::make_string(std::move(out));
+                    } else if (recv.obj->type == GcObject::Type::Array && method == "map" && !args.empty()) {
+                        GcObject* mapped = alloc_object(GcObject::Type::Array);
+                        for (size_t i = 0; i < recv.obj->elements.size(); ++i) {
+                            mapped->elements.push_back(
+                                invoke_callable(args[0], {recv.obj->elements[i], JsValue::make_number(static_cast<double>(i))}, doc, rep));
+                        }
+                        ret = JsValue::make_obj(mapped);
                     } else if (recv.obj->props.count("__is_fetch_resp__") && method == "text") {
                         ret = recv.obj->props["body"];
                     } else if (recv.obj->props.count("__is_fetch_resp__") && method == "json") {
@@ -1122,9 +1311,18 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                         } else {
                             ret = JsValue::make_null();
                         }
-                    } else if (recv.obj->props.count("__is_fetch_resp__") && method == "then" && !args.empty()) {
-                        invoke_callable(args[0], {recv}, doc, rep);
-                        ret = recv;
+                    } else if (recv.obj->props.count("__is_fetch_resp__") && method == "then") {
+                        // Promote fetch response into a real microtask-chained Promise!
+                        GcObject* p = make_resolved_promise(recv);
+                        JsValue on_f = args.size() >= 1 ? args[0] : JsValue::make_undefined();
+                        JsValue on_r = args.size() >= 2 ? args[1] : JsValue::make_undefined();
+                        ret = JsValue::make_obj(chain_promise(p, on_f, on_r, false));
+                    } else if (recv.obj->props.count("__is_fetch_resp__") && method == "catch") {
+                        bool failed = !recv.obj->props["ok"].truthy();
+                        GcObject* p = failed ? make_rejected_promise(recv.obj->props["error"])
+                                             : make_resolved_promise(recv);
+                        JsValue on_r = args.size() >= 1 ? args[0] : JsValue::make_undefined();
+                        ret = JsValue::make_obj(chain_promise(p, JsValue::make_undefined(), on_r, false));
                     } else if (recv.obj->props.count(method) > 0) {
                         ret = invoke_callable(recv.obj->props[method], args, doc, rep);
                     }
@@ -1142,17 +1340,41 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
 }
 
 void AstraJsEngine::drain_event_loop(HtmlDocument& doc, JsExecutionReport& rep) {
-    // 1. Drain microtask queue (FIFO)
-    size_t guard = 0;
-    while (!microtasks_.empty() && guard < 1024) {
-        ++guard;
-        auto batch = std::move(microtasks_);
-        microtasks_.clear();
-        for (const auto& cb : batch) {
-            invoke_callable(cb, {}, doc, rep);
-            ++rep.microtasks_run;
+    auto run_microtasks = [&](size_t& guard) {
+        while (!microtasks_.empty() && guard < 2048) {
+            ++guard;
+            auto batch = std::move(microtasks_);
+            microtasks_.clear();
+            for (const auto& mt : batch) {
+                ++rep.microtasks_run;
+                if (mt.target_promise) {
+                    if (mt.is_finally) {
+                        if (mt.callback.kind != JsValue::Kind::Undefined) {
+                            invoke_callable(mt.callback, {}, doc, rep);
+                        }
+                        settle_promise(mt.target_promise, mt.source_rejected, mt.arg);
+                    } else if (mt.passthrough_reject) {
+                        settle_promise(mt.target_promise, true, mt.arg);
+                    } else if (mt.callback.kind != JsValue::Kind::Undefined) {
+                        std::vector<JsValue> call_args;
+                        if (mt.has_arg) call_args.push_back(mt.arg);
+                        JsValue out = invoke_callable(mt.callback, call_args, doc, rep);
+                        settle_promise(mt.target_promise, false, out);
+                    } else {
+                        settle_promise(mt.target_promise, false, mt.arg);
+                    }
+                } else {
+                    std::vector<JsValue> call_args;
+                    if (mt.has_arg) call_args.push_back(mt.arg);
+                    invoke_callable(mt.callback, call_args, doc, rep);
+                }
+            }
         }
-    }
+    };
+
+    size_t guard = 0;
+    run_microtasks(guard);
+
     // 2. Drain scheduled timers sorted by delay_ms
     std::stable_sort(timers_.begin(), timers_.end(), [](const TimerEntry& a, const TimerEntry& b) {
         return a.delay_ms < b.delay_ms;
@@ -1162,16 +1384,7 @@ void AstraJsEngine::drain_event_loop(HtmlDocument& doc, JsExecutionReport& rep) 
     for (const auto& t : timers_batch) {
         invoke_callable(t.callback, {}, doc, rep);
         ++rep.timers_run;
-        // Microtasks queued by a timer run immediately after that timer task
-        while (!microtasks_.empty() && guard < 1024) {
-            ++guard;
-            auto m = std::move(microtasks_);
-            microtasks_.clear();
-            for (const auto& cb : m) {
-                invoke_callable(cb, {}, doc, rep);
-                ++rep.microtasks_run;
-            }
-        }
+        run_microtasks(guard);
     }
 }
 

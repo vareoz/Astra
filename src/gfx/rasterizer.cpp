@@ -283,30 +283,78 @@ int Framebuffer::draw_browser_chrome(const ChromeStatus& st) {
     fill_rect(0, tab_bar_h, width_, nav_bar_h, 0xFF111827u);
     fill_rect(0, total_h - 1, width_, 1, 0xFF1F2937u);
 
+    // Brand button -> astra://home
     fill_rounded_rect(10, 7, 72, 24, 6, 0xFF0284C7u);
     draw_text(20, 12, "ASTRA", 0xFFFFFFFFu, 13.0f, true, false);
 
+    // Tabs with per-tab [x] close button
     int tx = 92;
     size_t max_tabs = std::min<size_t>(st.tab_titles.size(), 5);
+    size_t rendered_tabs = 0;
     for (size_t i = 0; i < max_tabs; ++i) {
+        if (tx + 205 > width_ - 44) break;
         bool active = (i == st.active_tab_index);
         int tw = 205;
         fill_rounded_rect(tx, 6, tw, 28, 8, active ? 0xFF1E293Bu : 0xFF111827u);
         if (active) fill_rect(tx + 12, 6, tw - 24, 2, 0xFF38BDF8u);
         std::string lbl = st.tab_titles[i];
-        if (lbl.size() > 24) lbl = lbl.substr(0, 22) + "..";
+        {
+            size_t cp = 0, cut_pos = 0;
+            bool truncated = false;
+            for (size_t k = 0; k < lbl.size(); ) {
+                unsigned char c = static_cast<unsigned char>(lbl[k]);
+                size_t clen = (c < 0x80) ? 1 : ((c & 0xE0) == 0xC0 ? 2 : ((c & 0xF0) == 0xE0 ? 3 : 4));
+                if (cp == 18) cut_pos = k;
+                if (cp >= 20) { truncated = true; break; }
+                k += std::min(clen, lbl.size() - k);
+                ++cp;
+            }
+            if (truncated && cut_pos > 0) lbl = lbl.substr(0, cut_pos) + "..";
+        }
         draw_text(tx + 12, 13, lbl, active ? 0xFFF8FAFCu : 0xFF94A3B8u, 12.0f, active, false);
+        // Close [x] chip
+        fill_rounded_rect(tx + tw - 24, 11, 18, 18, 4, active ? 0xFF334155u : 0xFF1E293Bu);
+        draw_text(tx + tw - 19, 13, "x", 0xFFCBD5E1u, 11.0f, true, true);
         tx += tw + 8;
-        if (tx + 205 > width_) break;
+        ++rendered_tabs;
+    }
+    (void)rendered_tabs;
+
+    // New Tab [+] button
+    if (tx + 30 < width_) {
+        fill_rounded_rect(tx, 7, 30, 26, 6, 0xFF1E293Bu);
+        stroke_rounded_rect(tx, 7, 30, 26, 6, 1, 0xFF334155u);
+        draw_text(tx + 10, 11, "+", 0xFF38BDF8u, 15.0f, true, true);
     }
 
-    int bar_x = 16;
-    int bar_w = std::max(240, width_ - 416);
-    fill_rounded_rect(bar_x, tab_bar_h + 8, bar_w, 30, 8, 0xFF0B1120u);
-    stroke_rounded_rect(bar_x, tab_bar_h + 8, bar_w, 30, 8, 1,
-                        st.tls_verified ? 0xFF10B981u : 0xFF334155u);
-    std::string url_disp = (st.tls_verified ? "[TLS] " : "") + st.active_url;
+    // Back [<], Forward [>], Reload [R] navigation buttons
+    auto draw_nav_btn = [&](int bx, const char* sym, bool enabled) {
+        fill_rounded_rect(bx, tab_bar_h + 8, 28, 30, 7, enabled ? 0xFF1E293Bu : 0xFF0F172Au);
+        stroke_rounded_rect(bx, tab_bar_h + 8, 28, 30, 7, 1, enabled ? 0xFF334155u : 0xFF1E293Bu);
+        draw_text(bx + 9, tab_bar_h + 15, sym, enabled ? 0xFFE2E8F0u : 0xFF475569u, 13.0f, true, true);
+    };
+    draw_nav_btn(14, "<", st.can_go_back);
+    draw_nav_btn(48, ">", st.can_go_forward);
+    draw_nav_btn(82, "R", true);
+
+    // Editable Omnibox
+    int bar_x = 120;
+    int bar_w = std::max(240, width_ - 520);
+    fill_rounded_rect(bar_x, tab_bar_h + 8, bar_w, 30, 8, st.address_bar_focused ? 0xFF0F1B2Eu : 0xFF0B1120u);
+    uint32_t bar_border = st.address_bar_focused ? 0xFF38BDF8u : (st.tls_verified ? 0xFF10B981u : 0xFF334155u);
+    stroke_rounded_rect(bar_x, tab_bar_h + 8, bar_w, 30, 8, st.address_bar_focused ? 2 : 1, bar_border);
+
+    std::string url_disp = st.address_bar_focused
+                               ? st.address_bar_text
+                               : ((st.tls_verified ? "[TLS] " : "") + st.active_url);
     draw_text(bar_x + 12, tab_bar_h + 15, url_disp, 0xFFE2E8F0u, 13.0f, false, true);
+    if (st.address_bar_focused) {
+        float tw = FontEngine::instance().measure_text(url_disp, 13.0f, false, true);
+        int caret_x = bar_x + 13 + static_cast<int>(std::round(tw));
+        if (caret_x < bar_x + bar_w - 8) {
+            fill_rect(caret_x, tab_bar_h + 14, 2, 16, 0xFF38BDF8u);
+        }
+    }
 
     int rx = bar_x + bar_w + 12;
     std::string shield_txt = "SHIELD:" + std::to_string(st.trackers_blocked);
@@ -340,13 +388,35 @@ void Framebuffer::composite_display_list(const DisplayList& dl,
 
     for (const auto& item : dl.items) {
         int ix = static_cast<int>(std::round(item.rect.x));
-        int iy = static_cast<int>(std::round(item.rect.y - scroll_y)) + y_offset;
+        float eff_y = item.fixed_viewport ? item.rect.y : (item.rect.y - scroll_y);
+        int iy = static_cast<int>(std::round(eff_y)) + y_offset;
         int iw = static_cast<int>(std::round(item.rect.w));
         int ih = static_cast<int>(std::round(item.rect.h));
 
         if (iy >= height_ || iy + ih <= y_offset) continue;
 
         switch (item.type) {
+            case DisplayItemType::DropShadow: {
+                int blur = std::clamp(static_cast<int>(std::round(item.thickness)), 2, 24);
+                uint32_t base_a = (item.color_argb >> 24) & 0xFFu;
+                uint32_t rgb = item.color_argb & 0x00FFFFFFu;
+                const float scales[3] = {0.55f, 0.30f, 0.14f};
+                const int spreads[3] = {std::max(1, blur / 5), std::max(2, blur / 3), std::max(3, blur / 2)};
+                for (int ring = 2; ring >= 0; --ring) {
+                    int sp = spreads[ring];
+                    int sx = ix - sp;
+                    int sy = iy - sp;
+                    int sw = iw + sp * 2;
+                    int sh = ih + sp * 2;
+                    int cy = std::max(y_offset, sy);
+                    int ch = std::min(height_, sy + sh) - cy;
+                    uint32_t ra = static_cast<uint32_t>(std::round(base_a * scales[ring]));
+                    if (ch > 0 && ra > 0) {
+                        fill_rounded_rect(sx, cy, sw, ch, static_cast<int>(item.radius) + sp / 2, (ra << 24) | rgb);
+                    }
+                }
+                break;
+            }
             case DisplayItemType::FillRect: {
                 int cy = std::max(y_offset, iy);
                 int ch = std::min(height_, iy + ih) - cy;
@@ -430,9 +500,27 @@ void Framebuffer::composite_display_list(const DisplayList& dl,
                     frame.width > 0 && frame.height > 0 && !frame.argb.empty()) {
                     blit_scaled(cx, cy, cw, ch, frame.argb.data(), frame.width, frame.height);
                     stroke_rounded_rect(cx, cy, cw, ch, 6, 1, 0xFF34D399u);
-                    int pill_w = std::min(cw - 20, static_cast<int>(FontEngine::instance().measure_text(frame.label, 11.0f, true, true)) + 20);
-                    fill_rounded_rect(cx + 10, cy + ch - 28, pill_w, 22, 4, 0xCC06141Eu);
-                    draw_text(cx + 18, cy + ch - 23, frame.label, 0xFF6EE7B7u, 11.0f, true, true);
+                    // Interactive transport bar at bottom of video frame
+                    if (ch >= 48 && cw >= 160) {
+                        int bar_h = 34;
+                        int by = cy + ch - bar_h - 4;
+                        fill_rounded_rect(cx + 6, by, cw - 12, bar_h, 6, 0xD806141Eu);
+                        // Play indicator button
+                        fill_rounded_rect(cx + 12, by + 6, 24, 22, 4, 0xFF10B981u);
+                        draw_text(cx + 19, by + 10, ">", 0xFF042F2Eu, 12.0f, true, true);
+                        // Scrubber bar
+                        int track_x = cx + 44;
+                        int track_w = std::max(40, cw - 60);
+                        int track_y = by + 7;
+                        fill_rounded_rect(track_x, track_y, track_w, 6, 3, 0xFF1E293Bu);
+                        float prog = std::clamp(frame.progress, 0.0f, 1.0f);
+                        int fill_w = std::max(4, static_cast<int>(track_w * prog));
+                        fill_rounded_rect(track_x, track_y, fill_w, 6, 3, 0xFF34D399u);
+                        fill_rounded_rect(track_x + fill_w - 4, track_y - 2, 8, 10, 4, 0xFFECFDF5u);
+                        // Time & codec label below scrubber
+                        std::string hud = frame.time_label.empty() ? frame.label : (frame.time_label + " | " + frame.label);
+                        draw_text(track_x, by + 16, hud, 0xFF6EE7B7u, 10.5f, true, true);
+                    }
                 } else {
                     fill_rounded_rect(cx, cy, cw, ch, 8, 0xFF0F172Au);
                     stroke_rounded_rect(cx, cy, cw, ch, 8, 1, 0xFF475569u);

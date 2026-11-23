@@ -22,6 +22,10 @@ struct ChromeStatus {
     uint64_t trackers_blocked = 0;
     size_t extensions_loaded = 0;
     bool tls_verified = false;
+    bool can_go_back = false;
+    bool can_go_forward = false;
+    bool address_bar_focused = false;
+    std::string address_bar_text;
 };
 
 struct VideoBlitFrame {
@@ -29,6 +33,9 @@ struct VideoBlitFrame {
     int height = 0;
     std::vector<uint32_t> argb;
     std::string label;
+    float progress = 0.0f;
+    std::string time_label;
+    bool has_audio = false;
 };
 
 class Framebuffer;
@@ -42,9 +49,10 @@ struct InteractiveCallbacks {
     std::function<void(Framebuffer& fb)> on_repaint;
 };
 
-// Astra Compositor v3: ARGB32 software compositor with Anti-Aliased TrueType (AstraFont),
-// APZ-style scroll_y, native PNG/JPEG/BMP/PPM <img> blitting, interactive <input>,
-// smooth Astra3D integration, zero-dep PNG encoder, and interactive Linux X11 desktop window.
+// Astra Compositor v4: ARGB32 software compositor with Anti-Aliased TrueType (AstraFont),
+// z-index layering, position:fixed viewport pinning, soft DropShadow, interactive Chrome v4,
+// APZ scroll_y, native PNG/JPEG/BMP/PPM <img> blitting, interactive <input>, smooth Astra3D,
+// interactive <video> scrubber bar, zero-dep PNG encoder, and interactive X11 window.
 class Framebuffer {
 public:
     static constexpr int kChromeHeight = 84;

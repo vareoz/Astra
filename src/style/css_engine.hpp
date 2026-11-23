@@ -50,6 +50,21 @@ struct GridTrack {
     bool is_fr = true;
 };
 
+enum class PositionType : uint8_t {
+    Static,
+    Relative,
+    Absolute,
+    Fixed
+};
+
+struct BoxShadow {
+    bool enabled = false;
+    float offset_x = 0.0f;
+    float offset_y = 6.0f;
+    float blur = 12.0f;
+    Color color{0, 0, 0, 110};
+};
+
 struct EdgeSizes {
     float top = 0;
     float right = 0;
@@ -60,10 +75,21 @@ struct EdgeSizes {
 struct ComputedStyle {
     DisplayType display = DisplayType::Block;
     FlexDirection flex_direction = FlexDirection::Row;
+    PositionType position = PositionType::Static;
     std::vector<GridTrack> grid_columns;
     float gap = 0.0f;
     float width = -1.0f;   // < 0 means auto
     float height = -1.0f;  // < 0 means auto
+    bool has_top = false;
+    bool has_left = false;
+    bool has_right = false;
+    bool has_bottom = false;
+    float top = 0.0f;
+    float left = 0.0f;
+    float right = 0.0f;
+    float bottom = 0.0f;
+    int z_index = 0;
+    float opacity = 1.0f;
     EdgeSizes margin;
     EdgeSizes padding;
     float border_width = 0.0f;
@@ -71,6 +97,7 @@ struct ComputedStyle {
     Color border_color{0, 0, 0, 0};
     Color background{0, 0, 0, 0};
     Color color{230, 234, 240, 255};
+    BoxShadow box_shadow;
     float font_size = 14.0f;
     bool bold = false;
     bool monospace = false;

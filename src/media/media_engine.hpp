@@ -8,9 +8,10 @@
 namespace astra {
 
 struct VideoContainerInfo {
-    std::string format;       // "MP4/ISOBMFF", "WebM/Matroska", "Y4M/YUV420"
+    std::string format;       // "MP4/ISOBMFF", "WebM/Matroska", "Y4M/YUV420", "WAV/PCM"
     std::string major_brand;  // e.g. "isom", "mp42"
     std::string video_codec;  // e.g. "avc1", "vp09", "av01", "yuv420p"
+    std::string audio_codec;  // e.g. "mp4a", "Opus", "pcm_s16le"
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t timescale = 0;
@@ -18,6 +19,9 @@ struct VideoContainerInfo {
     double duration_sec = 0.0;
     double fps = 30.0;
     uint32_t sample_count = 0;
+    bool has_audio = false;
+    uint32_t audio_sample_rate = 0;
+    uint16_t audio_channels = 0;
     bool valid = false;
     std::string error;
 };
@@ -26,9 +30,22 @@ struct DecodedVideoFrame {
     int width = 0;
     int height = 0;
     uint32_t frame_index = 0;
+    uint32_t total_frames = 0;
     double pts_sec = 0.0;
+    double duration_sec = 0.0;
+    bool has_audio = false;
     std::vector<uint32_t> argb;
     std::string codec_label;
+};
+
+struct DecodedAudioBuffer {
+    uint32_t sample_rate = 44100;
+    uint16_t channels = 2;
+    double duration_sec = 0.0;
+    double rms_level = 0.0;
+    std::vector<int16_t> pcm_s16;
+    bool valid = false;
+    std::string error;
 };
 
 // Bounded-RAM continuous video playback session with A/V presentation clock
@@ -56,8 +73,9 @@ private:
     double current_pts_sec_ = 0.0;
 };
 
-// AstraMedia v2: Firefox RDD-inspired isolated media container parser,
-// native BT.709 YUV420p -> ARGB32 converter, and real multi-frame decoder.
+// AstraMedia v3: Firefox RDD-inspired isolated media container parser,
+// native BT.709 YUV420p -> ARGB32 converter, real multi-frame video decoder,
+// and bounded PCM audio decoder (WAV native + MP4/AAC via isolated RDD pipe).
 class MediaEngine {
 public:
     static VideoContainerInfo probe_container(const std::string& path);
@@ -78,6 +96,10 @@ public:
                               uint32_t max_frames,
                               std::vector<DecodedVideoFrame>& out_frames,
                               std::string* error = nullptr);
+
+    static bool decode_audio_pcm(const std::string& path,
+                                 double max_seconds,
+                                 DecodedAudioBuffer& out_audio);
 };
 
 } // namespace astra

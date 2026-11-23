@@ -75,6 +75,13 @@ void parse_mp4_boxes(const std::vector<uint8_t>& buf, size_t start, size_t end, 
                     info.width = read_be16(buf.data() + body + 40);
                     info.height = read_be16(buf.data() + body + 42);
                 }
+            } else if (fourcc == "mp4a" || fourcc == "Opus" || fourcc == "ac-3" || fourcc == "ec-3" || fourcc == "fLaC") {
+                info.has_audio = true;
+                info.audio_codec = fourcc;
+                if (body + 44 <= body_end) {
+                    info.audio_channels = read_be16(buf.data() + body + 32);
+                    info.audio_sample_rate = read_be32(buf.data() + body + 40) >> 16;
+                }
             }
         } else if (type == "stsz" && body + 12 <= body_end) {
             uint32_t count = read_be32(buf.data() + body + 8);
@@ -253,6 +260,20 @@ VideoContainerInfo MediaEngine::probe_container(const std::string& path) {
         return info;
     }
 
+    if (std::memcmp(buf.data(), "RIFF", 4) == 0 && std::memcmp(buf.data() + 8, "WAVE", 4) == 0) {
+        info.format = "WAV/PCM";
+        info.audio_codec = "pcm_s16le";
+        info.has_audio = true;
+        if (n >= 44) {
+            info.audio_channels = static_cast<uint16_t>(buf[22] | (buf[23] << 8));
+            info.audio_sample_rate = static_cast<uint32_t>(buf[24] | (buf[25] << 8) | (buf[26] << 16) | (buf[27] << 24));
+            uint32_t byte_rate = static_cast<uint32_t>(buf[28] | (buf[29] << 8) | (buf[30] << 16) | (buf[31] << 24));
+            if (byte_rate > 0 && n > 44) info.duration_sec = static_cast<double>(n - 44) / byte_rate;
+        }
+        info.valid = true;
+        return info;
+    }
+
     if (std::memcmp(buf.data() + 4, "ftyp", 4) == 0) {
         parse_mp4_boxes(buf, 0, buf.size(), info);
         if (info.duration_sec > 0.0 && info.sample_count > 0) {
@@ -361,7 +382,16 @@ bool MediaEngine::decode_frames(const std::string& path,
     std::istringstream y4m_stream(y4m_bytes);
     std::string prefix = "AstraMedia RDD " + info.format + " (" +
                          (info.video_codec.empty() ? "video" : info.video_codec) + ")";
-    return decode_y4m_range(y4m_stream, start_frame, max_frames, prefix, out_frames, error);
+    bool ok = decode_y4m_range(y4m_stream, start_frame, max_frames, prefix, out_frames, error);
+    if (ok) {
+        uint32_t total = info.sample_count > 0 ? info.sample_count : static_cast<uint32_t>(std::max<double>(1.0, info.duration_sec * info.fps));
+        for (auto& df : out_frames) {
+            df.total_frames = total;
+            df.duration_sec = info.duration_sec;
+            df.has_audio = info.has_audio;
+        }
+    }
+    return ok;
 }
 
 bool MediaEngine::decode_frame(const std::string& path,
@@ -373,6 +403,93 @@ bool MediaEngine::decode_frame(const std::string& path,
         return false;
     }
     out_frame = std::move(frames[0]);
+    return true;
+}
+
+bool MediaEngine::decode_audio_pcm(const std::string& path,
+                                   double max_seconds,
+                                   DecodedAudioBuffer& out_audio) {
+    out_audio = DecodedAudioBuffer{};
+    VideoContainerInfo info = probe_container(path);
+    if (!info.valid) {
+        out_audio.error = info.error;
+        return false;
+    }
+
+    constexpr size_t kMaxAudioBytes = 4 * 1024 * 1024; // Hard 4 MiB audio buffer cap
+    std::vector<uint8_t> raw_pcm;
+
+    if (info.format == "WAV/PCM") {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) { out_audio.error = "Cannot open WAV"; return false; }
+        std::vector<uint8_t> wav((std::istreambuf_iterator<char>(f)), {});
+        if (wav.size() < 44) { out_audio.error = "Truncated WAV"; return false; }
+        out_audio.channels = static_cast<uint16_t>(wav[22] | (wav[23] << 8));
+        out_audio.sample_rate = static_cast<uint32_t>(wav[24] | (wav[25] << 8) | (wav[26] << 16) | (wav[27] << 24));
+        size_t pos = 12;
+        while (pos + 8 <= wav.size()) {
+            uint32_t csz = static_cast<uint32_t>(wav[pos + 4] | (wav[pos + 5] << 8) | (wav[pos + 6] << 16) | (wav[pos + 7] << 24));
+            if (std::memcmp(wav.data() + pos, "data", 4) == 0) {
+                size_t avail = std::min<size_t>({csz, wav.size() - (pos + 8), kMaxAudioBytes});
+                raw_pcm.assign(wav.begin() + static_cast<ptrdiff_t>(pos + 8),
+                               wav.begin() + static_cast<ptrdiff_t>(pos + 8 + avail));
+                break;
+            }
+            pos += 8 + csz + (csz & 1u);
+        }
+    } else {
+        int pipefd[2];
+        if (::pipe(pipefd) != 0) { out_audio.error = "Pipe error"; return false; }
+        pid_t pid = ::fork();
+        if (pid < 0) { ::close(pipefd[0]); ::close(pipefd[1]); return false; }
+        if (pid == 0) {
+            ::close(pipefd[0]);
+            ::dup2(pipefd[1], STDOUT_FILENO);
+            ::close(pipefd[1]);
+            FILE* devnull = std::fopen("/dev/null", "w");
+            if (devnull) { ::dup2(fileno(devnull), STDERR_FILENO); std::fclose(devnull); }
+            std::string dur_s = std::to_string(std::clamp(max_seconds, 0.25, 10.0));
+            const char* argv[] = {
+                "ffmpeg", "-v", "error", "-i", path.c_str(),
+                "-vn", "-t", dur_s.c_str(), "-ar", "44100", "-ac", "2",
+                "-f", "s16le", "-", nullptr
+            };
+            ::execvp("ffmpeg", const_cast<char* const*>(argv));
+            _exit(127);
+        }
+        ::close(pipefd[1]);
+        uint8_t chunk[8192];
+        ssize_t n = 0;
+        while ((n = ::read(pipefd[0], chunk, sizeof(chunk))) > 0) {
+            size_t take = std::min<size_t>(static_cast<size_t>(n), kMaxAudioBytes - raw_pcm.size());
+            raw_pcm.insert(raw_pcm.end(), chunk, chunk + take);
+            if (raw_pcm.size() >= kMaxAudioBytes) break;
+        }
+        ::close(pipefd[0]);
+        int st = 0;
+        ::waitpid(pid, &st, 0);
+        out_audio.sample_rate = 44100;
+        out_audio.channels = 2;
+    }
+
+    if (raw_pcm.size() < 4) {
+        out_audio.error = "No audio stream decoded";
+        return false;
+    }
+    size_t sample_count = raw_pcm.size() / sizeof(int16_t);
+    out_audio.pcm_s16.resize(sample_count);
+    std::memcpy(out_audio.pcm_s16.data(), raw_pcm.data(), sample_count * sizeof(int16_t));
+
+    double sum_sq = 0.0;
+    for (int16_t s : out_audio.pcm_s16) {
+        double fn = static_cast<double>(s) / 32768.0;
+        sum_sq += fn * fn;
+    }
+    out_audio.rms_level = std::sqrt(sum_sq / static_cast<double>(std::max<size_t>(1, sample_count)));
+    uint32_t ch = std::max<uint16_t>(1, out_audio.channels);
+    uint32_t sr = std::max<uint32_t>(1, out_audio.sample_rate);
+    out_audio.duration_sec = static_cast<double>(sample_count) / static_cast<double>(ch * sr);
+    out_audio.valid = true;
     return true;
 }
 
