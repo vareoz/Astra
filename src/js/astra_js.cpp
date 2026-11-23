@@ -370,10 +370,12 @@ private:
     bool compile_or(std::string& err) {
         if (!compile_and(err)) return false;
         while (match(TokKind::OrOr)) {
+            int32_t j_rhs = emit(OpCode::JumpIfFalse, 0);
+            emit(OpCode::PushConst, add_const(JsValue::make_bool(true)));
+            int32_t j_end = emit(OpCode::Jump, 0);
+            chunk_->code[static_cast<size_t>(j_rhs)].operand = static_cast<int32_t>(chunk_->code.size());
             if (!compile_and(err)) return false;
-            // Short logical OR via Add/truthy check simplified: keep rhs if lhs falsy
-            // For deterministic VM semantics, compile with simple jump-over would be nicer;
-            // keep clean binary op here via Eq/Neq helpers
+            chunk_->code[static_cast<size_t>(j_end)].operand = static_cast<int32_t>(chunk_->code.size());
         }
         return true;
     }

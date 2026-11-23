@@ -109,6 +109,8 @@ void HttpCache::store(const CachedResource& entry) {
     if (copy.stored_epoch_sec == 0) copy.stored_epoch_sec = now_epoch_sec();
 
     // Write to disk cache
+    std::error_code ec;
+    std::filesystem::create_directories(cache_dir_, ec);
     std::ofstream f(disk_path_for(copy.url), std::ios::binary);
     if (f) {
         f << copy.url << "\n"

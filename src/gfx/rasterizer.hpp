@@ -31,6 +31,8 @@ struct VideoBlitFrame {
     std::string label;
 };
 
+class Framebuffer;
+
 struct InteractiveCallbacks {
     std::function<void(int x, int y)> on_click;
     std::function<void(int delta_y)> on_scroll;

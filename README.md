@@ -33,4 +33,17 @@ make -j4
 ./build/astra --test
 ./build/astra --stress-tabs 150 --cap 2048
 ./build/astra --ext examples/astra-privacy-guard --url astra://home --out home.png
+./build/astra --url file://examples/astra_interactive.html --click 300,245 --out after_click.png
+./build/astra --url astra://3d --wireframe --out studio_3d.png
+./build/astra --url astra://home --gui   # Ventana interactiva nativa X11 (Linux con DISPLAY)
 ```
+
+## Resultados verificados (Sesión 2)
+
+- **Compilación**: `g++ -std=c++20 -O2 -Wall -Wextra -pthread -ldl` — **0 errores, 0 warnings**.
+- **Suite de verificación (`--test`)**: **16 / 16 pruebas aprobadas** (SlabArena `munmap`/`madvise`, JSON RFC 8259, AstraShield + Total Cookie Protection, `HttpCache` RAM+Disco con evicción LRU, decodificador nativo PNG, DisplayList binario `ASD2` + `HitRegions`, `AstraJS v2` Bytecode VM + GC Mark-and-Sweep + Event Loop `Microtask -> Timer` + eventos DOM `click`, `Astra3D v2` shaders suaves Blinn-Phong, visor nativo PDF, `AstraMedia v2` MP4 H.264 multiframe acotado a 16 MiB, IPC multiproceso `Main + Content + RDD`, verificación estricta TLS con CA del sistema + cache hit).
+- **Prueba de estrés de 150 pestañas (`--stress-tabs 150 --cap 2048`)**:
+  - 150 pestañas creadas en **367.4 ms** (**2.4 ms/pestaña**).
+  - **RAM total real (Linux `/proc` RSS sumando los 3 procesos)**: **14.58 MB / 2048 MB** (`main`: 10.94 MB, `content`: 2.51 MB, `rdd-media`: 1.13 MB).
+  - Rehidratación de pestañas deshidratadas (Tab #1): **OK**.
+

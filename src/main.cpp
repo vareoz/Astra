@@ -16,6 +16,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -209,6 +210,9 @@ int run_full_test_suite() {
 
     // 11. Multi-Process IPC + Strict TLS + Subresource Loader + Interactive Click/Scroll
     {
+        std::error_code ec;
+        std::filesystem::remove_all("/tmp/astra_http_cache", ec);
+
         BrowserApp app(2ULL * 1024 * 1024 * 1024);
         bool started = app.start_workers();
         expect(started && app.content_pid() > 0 && app.media_pid() > 0,
@@ -222,7 +226,7 @@ int run_full_test_suite() {
         // Test live strict-verified HTTPS + HttpCache hit on second fetch
         auto https1 = app.navigate(tab1, "https://example.com");
         auto https2 = app.navigate(tab1, "https://example.com");
-        expect(https1.ok && https1.tls_verified && https2.ok && https2.from_cache,
+        expect(https1.ok && https1.tls_verified && !https1.from_cache && https2.ok && https2.from_cache,
                "AstraNet enforces strict TLS certificate+hostname verification and hits HttpCache on repeat load");
 
         auto mem = app.memory_snapshot();

@@ -322,27 +322,28 @@ HttpResponse HttpClient::get(const std::string& url,
             ext_headers = std::move(dnr.add_headers);
         }
 
-        // Step 3: Check bounded RAM/Disk HttpCache before opening any socket
-        if (cache_) {
-            CachedResource cached;
-            if (cache_->lookup(current_url, cached)) {
-                HttpResponse resp;
-                resp.status_code = 200;
-                resp.final_url = current_url;
-                resp.content_type = cached.content_type;
-                resp.body = std::move(cached.body);
-                resp.from_cache = true;
-                resp.tls_verified = (current_url.rfind("https://", 0) == 0);
-                resp.privacy_decision = pdec;
-                return resp;
-            }
-        }
-
         ParsedUrl parsed = parse_url(current_url);
         if (!parsed.valid) {
             HttpResponse resp;
             resp.error = "Invalid URL: " + current_url;
             return resp;
+        }
+        std::string canonical_url = parsed.rebuild();
+
+        // Step 3: Check bounded RAM/Disk HttpCache before opening any socket
+        if (cache_) {
+            CachedResource cached;
+            if (cache_->lookup(canonical_url, cached)) {
+                HttpResponse resp;
+                resp.status_code = 200;
+                resp.final_url = canonical_url;
+                resp.content_type = cached.content_type;
+                resp.body = std::move(cached.body);
+                resp.from_cache = true;
+                resp.tls_verified = (canonical_url.rfind("https://", 0) == 0);
+                resp.privacy_decision = pdec;
+                return resp;
+            }
         }
 
         HttpResponse resp = perform_single_request(parsed, top_site, ext_headers);

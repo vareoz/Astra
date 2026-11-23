@@ -371,7 +371,8 @@ void Framebuffer::composite_display_list(const DisplayList& dl,
                     frame.width > 0 && frame.height > 0 && !frame.argb.empty()) {
                     blit_scaled(cx, cy, cw, ch, frame.argb.data(), frame.width, frame.height);
                     stroke_rounded_rect(cx, cy, cw, ch, 6, 1, 0xFF34D399u);
-                    fill_rounded_rect(cx + 10, cy + ch - 28, std::min(cw - 20, 470), 20, 4, 0xCC06141Eu);
+                    int pill_w = std::min(cw - 20, static_cast<int>(frame.label.size()) * 9 + 20);
+                    fill_rounded_rect(cx + 10, cy + ch - 28, pill_w, 20, 4, 0xCC06141Eu);
                     draw_text(cx + 18, cy + ch - 22, frame.label, 0xFF6EE7B7u, 11.0f, true);
                 } else {
                     fill_rounded_rect(cx, cy, cw, ch, 8, 0xFF0F172Au);
