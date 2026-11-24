@@ -62,6 +62,18 @@ enum class OverflowMode : uint8_t {
     Hidden
 };
 
+enum class BoxSizing : uint8_t {
+    ContentBox,
+    BorderBox
+};
+
+struct LinearGradient {
+    bool enabled = false;
+    float angle_deg = 180.0f; // CSS default: top-to-bottom (180deg)
+    Color start{15, 23, 42, 255};
+    Color end{30, 41, 59, 255};
+};
+
 struct BoxShadow {
     bool enabled = false;
     float offset_x = 0.0f;
@@ -82,6 +94,7 @@ struct ComputedStyle {
     FlexDirection flex_direction = FlexDirection::Row;
     PositionType position = PositionType::Static;
     OverflowMode overflow = OverflowMode::Visible;
+    BoxSizing box_sizing = BoxSizing::ContentBox;
     std::vector<GridTrack> grid_columns;
     float gap = 0.0f;
     float width = -1.0f;   // < 0 means auto
@@ -102,6 +115,7 @@ struct ComputedStyle {
     float border_radius = 0.0f;
     Color border_color{0, 0, 0, 0};
     Color background{0, 0, 0, 0};
+    LinearGradient background_gradient;
     Color color{230, 234, 240, 255};
     BoxShadow box_shadow;
     float font_size = 14.0f;

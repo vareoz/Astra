@@ -1,5 +1,6 @@
 #include "js/astra_js.hpp"
 #include "core/json.hpp"
+#include "gfx/font_engine.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -15,6 +16,7 @@ namespace {
 enum class TokKind {
     Eof, Number, String, Ident,
     KwLet, KwConst, KwVar, KwFunction, KwAsync, KwAwait, KwReturn, KwIf, KwElse, KwWhile, KwFor,
+    KwTry, KwCatch, KwFinally, KwThrow,
     KwTrue, KwFalse, KwNull,
     LParen, RParen, LBrace, RBrace, LBracket, RBracket,
     Comma, Semi, Dot, Colon, Question, Arrow,
@@ -85,6 +87,10 @@ std::vector<Token> tokenize(std::string_view src) {
             else if (id == "else") k = TokKind::KwElse;
             else if (id == "while") k = TokKind::KwWhile;
             else if (id == "for") k = TokKind::KwFor;
+            else if (id == "try") k = TokKind::KwTry;
+            else if (id == "catch") k = TokKind::KwCatch;
+            else if (id == "finally") k = TokKind::KwFinally;
+            else if (id == "throw") k = TokKind::KwThrow;
             else if (id == "true") k = TokKind::KwTrue;
             else if (id == "false") k = TokKind::KwFalse;
             else if (id == "null") k = TokKind::KwNull;
@@ -161,6 +167,10 @@ private:
         return t;
     }
     bool check(TokKind k) const { return peek().kind == k; }
+    bool is_ident_or_keyword(TokKind k) const {
+        return k == TokKind::Ident ||
+               (k >= TokKind::KwLet && k <= TokKind::KwNull);
+    }
     bool match(TokKind k) {
         if (!check(k)) return false;
         advance();
@@ -278,8 +288,128 @@ private:
             chunk_->code[static_cast<size_t>(jexit)].operand = static_cast<int32_t>(chunk_->code.size());
             return true;
         }
+        if (match(TokKind::KwThrow)) {
+            if (!compile_expr(err)) return false;
+            match(TokKind::Semi);
+            emit(OpCode::Throw);
+            return true;
+        }
+        if (match(TokKind::KwTry)) {
+            int32_t push_try = emit(OpCode::PushTry, 0);
+            if (!compile_stmt(err)) return false;
+            emit(OpCode::PopTry);
+            int32_t j_end = emit(OpCode::Jump, 0);
+            chunk_->code[static_cast<size_t>(push_try)].operand = static_cast<int32_t>(chunk_->code.size());
+            if (match(TokKind::KwCatch)) {
+                std::string err_var;
+                if (match(TokKind::LParen)) {
+                    if (check(TokKind::Ident)) err_var = advance().text;
+                    match(TokKind::RParen);
+                }
+                if (!err_var.empty()) {
+                    if (in_function_) {
+                        int32_t slot = find_local(err_var);
+                        if (slot < 0) {
+                            slot = static_cast<int32_t>(locals_.size());
+                            locals_.push_back(err_var);
+                        }
+                        emit(OpCode::StoreLocal, slot);
+                    } else {
+                        emit(OpCode::StoreGlobal, add_name(err_var));
+                    }
+                    emit(OpCode::Pop);
+                } else {
+                    emit(OpCode::Pop);
+                }
+                if (!compile_stmt(err)) return false;
+            } else {
+                // try without catch: discard caught value or fall through to finally
+                emit(OpCode::Pop);
+            }
+            chunk_->code[static_cast<size_t>(j_end)].operand = static_cast<int32_t>(chunk_->code.size());
+            if (match(TokKind::KwFinally)) {
+                if (!compile_stmt(err)) return false;
+            }
+            return true;
+        }
         if (match(TokKind::KwFor)) {
             match(TokKind::LParen);
+            // Detect ES6 for..of: for (let x of iterable) or for (x of iterable)
+            bool is_for_of = false;
+            bool has_decl = (check(TokKind::KwLet) || check(TokKind::KwConst) || check(TokKind::KwVar));
+            if (has_decl && peek(1).kind == TokKind::Ident &&
+                peek(2).kind == TokKind::Ident && peek(2).text == "of") {
+                is_for_of = true;
+            } else if (check(TokKind::Ident) &&
+                       peek(1).kind == TokKind::Ident && peek(1).text == "of") {
+                is_for_of = true;
+            }
+            if (is_for_of) {
+                if (has_decl) advance();
+                std::string iter_var = advance().text;
+                advance(); // "of"
+                int id_num = ++forof_counter_;
+                std::string col_name = "__forof_col_" + std::to_string(id_num);
+                std::string idx_name = "__forof_idx_" + std::to_string(id_num);
+
+                auto bind_slot = [&](const std::string& nm) -> int32_t {
+                    if (!in_function_) return -1;
+                    int32_t s = find_local(nm);
+                    if (s < 0) {
+                        s = static_cast<int32_t>(locals_.size());
+                        locals_.push_back(nm);
+                    }
+                    return s;
+                };
+                auto emit_store = [&](const std::string& nm, int32_t slot) {
+                    if (in_function_) emit(OpCode::StoreLocal, slot);
+                    else emit(OpCode::StoreGlobal, add_name(nm));
+                };
+                auto emit_load = [&](const std::string& nm, int32_t slot) {
+                    if (in_function_) emit(OpCode::LoadLocal, slot);
+                    else emit(OpCode::LoadGlobal, add_name(nm));
+                };
+
+                int32_t col_slot = bind_slot(col_name);
+                int32_t idx_slot = bind_slot(idx_name);
+                int32_t var_slot = bind_slot(iter_var);
+
+                if (!compile_expr(err)) return false;
+                match(TokKind::RParen);
+                emit_store(col_name, col_slot);
+                emit(OpCode::Pop);
+
+                emit(OpCode::PushConst, add_const(JsValue::make_number(0.0)));
+                emit_store(idx_name, idx_slot);
+                emit(OpCode::Pop);
+
+                int32_t loop_start = static_cast<int32_t>(chunk_->code.size());
+                emit_load(idx_name, idx_slot);
+                emit_load(col_name, col_slot);
+                emit(OpCode::PushConst, add_const(JsValue::make_string("length")));
+                emit(OpCode::GetProp);
+                emit(OpCode::Lt);
+                int32_t jexit = emit(OpCode::JumpIfFalse, 0);
+
+                emit_load(col_name, col_slot);
+                emit_load(idx_name, idx_slot);
+                emit(OpCode::GetProp);
+                emit_store(iter_var, var_slot);
+                emit(OpCode::Pop);
+
+                if (!compile_stmt(err)) return false;
+
+                emit_load(idx_name, idx_slot);
+                emit(OpCode::PushConst, add_const(JsValue::make_number(1.0)));
+                emit(OpCode::Add);
+                emit_store(idx_name, idx_slot);
+                emit(OpCode::Pop);
+
+                emit(OpCode::Jump, loop_start);
+                chunk_->code[static_cast<size_t>(jexit)].operand = static_cast<int32_t>(chunk_->code.size());
+                return true;
+            }
+
             if (!check(TokKind::Semi)) {
                 if (!compile_stmt(err)) return false;
             } else {
@@ -529,7 +659,7 @@ private:
         if (!compile_primary(err)) return false;
         for (;;) {
             if (match(TokKind::Dot)) {
-                if (!check(TokKind::Ident)) { err = "Expected property name"; return false; }
+                if (!is_ident_or_keyword(peek().kind)) { err = "Expected property name"; return false; }
                 std::string prop = advance().text;
                 if (match(TokKind::Assign)) {
                     emit(OpCode::PushConst, add_const(JsValue::make_string(prop)));
@@ -678,7 +808,7 @@ private:
             int32_t count = 0;
             while (!check(TokKind::RBrace) && !check(TokKind::Eof)) {
                 std::string key;
-                if (check(TokKind::Ident) || check(TokKind::String)) key = advance().text;
+                if (is_ident_or_keyword(peek().kind) || check(TokKind::String)) key = advance().text;
                 else { err = "Expected object key"; return false; }
                 match(TokKind::Colon);
                 emit(OpCode::PushConst, add_const(JsValue::make_string(key)));
@@ -716,9 +846,278 @@ private:
     BytecodeChunk* chunk_ = nullptr;
     std::vector<std::string> locals_;
     bool in_function_ = false;
+    int forof_counter_ = 0;
 };
 
 } // namespace
+
+// ---------------- CanvasSurface (Bounded ARGB32 2D Canvas) ----------------
+
+uint32_t CanvasSurface::parse_css_color(std::string_view raw, uint32_t fallback) {
+    auto trim = [](std::string_view sv) {
+        size_t a = 0, b = sv.size();
+        while (a < b && std::isspace(static_cast<unsigned char>(sv[a]))) ++a;
+        while (b > a && std::isspace(static_cast<unsigned char>(sv[b - 1]))) --b;
+        return sv.substr(a, b - a);
+    };
+    std::string s(trim(raw));
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (s.empty()) return fallback;
+    if (s == "transparent") return 0x00000000u;
+    if (s == "white") return 0xFFFFFFFFu;
+    if (s == "black") return 0xFF000000u;
+    if (s == "red") return 0xFFEF4444u;
+    if (s == "green") return 0xFF22C55Eu;
+    if (s == "blue") return 0xFF3B82F6u;
+    if (s == "cyan") return 0xFF38BDF8u;
+    if (s == "yellow") return 0xFFFACC15u;
+    if (s == "orange") return 0xFFF97316u;
+
+    if (s[0] == '#') {
+        auto hex = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+            return 0;
+        };
+        if (s.size() == 4) {
+            uint32_t r = static_cast<uint32_t>(hex(s[1]) * 17);
+            uint32_t g = static_cast<uint32_t>(hex(s[2]) * 17);
+            uint32_t b = static_cast<uint32_t>(hex(s[3]) * 17);
+            return 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+        if (s.size() == 7 || s.size() == 9) {
+            uint32_t r = static_cast<uint32_t>(hex(s[1]) * 16 + hex(s[2]));
+            uint32_t g = static_cast<uint32_t>(hex(s[3]) * 16 + hex(s[4]));
+            uint32_t b = static_cast<uint32_t>(hex(s[5]) * 16 + hex(s[6]));
+            uint32_t a = (s.size() == 9) ? static_cast<uint32_t>(hex(s[7]) * 16 + hex(s[8])) : 255u;
+            return (a << 24) | (r << 16) | (g << 8) | b;
+        }
+    }
+    if (s.rfind("rgb(", 0) == 0 || s.rfind("rgba(", 0) == 0) {
+        size_t lp = s.find('('), rp = s.rfind(')');
+        if (lp != std::string::npos && rp != std::string::npos && rp > lp) {
+            std::string inner = s.substr(lp + 1, rp - lp - 1);
+            std::replace(inner.begin(), inner.end(), ',', ' ');
+            std::istringstream iss(inner);
+            float r = 0, g = 0, b = 0, a = 1.0f;
+            if (iss >> r >> g >> b) {
+                if (!(iss >> a)) a = 1.0f;
+                uint32_t ur = static_cast<uint32_t>(std::clamp(static_cast<int>(std::round(r)), 0, 255));
+                uint32_t ug = static_cast<uint32_t>(std::clamp(static_cast<int>(std::round(g)), 0, 255));
+                uint32_t ub = static_cast<uint32_t>(std::clamp(static_cast<int>(std::round(b)), 0, 255));
+                uint32_t ua = static_cast<uint32_t>(std::clamp(static_cast<int>(std::round(a * 255.0f)), 0, 255));
+                return (ua << 24) | (ur << 16) | (ug << 8) | ub;
+            }
+        }
+    }
+    return fallback;
+}
+
+void CanvasSurface::resize(int w, int h) {
+    width = std::clamp(w, 1, kMaxDim);
+    height = std::clamp(h, 1, kMaxDim);
+    argb.assign(static_cast<size_t>(width) * static_cast<size_t>(height), 0x00000000u);
+}
+
+void CanvasSurface::blend_pixel(int x, int y, uint32_t c) {
+    if (x < 0 || y < 0 || x >= width || y >= height) return;
+    uint32_t sa = (c >> 24) & 0xFFu;
+    if (sa == 0) return;
+    uint32_t& dst = argb[static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)];
+    if (sa == 255 || ((dst >> 24) & 0xFFu) == 0) {
+        dst = c;
+        return;
+    }
+    uint32_t inv = 255u - sa;
+    uint32_t sr = (c >> 16) & 0xFFu, sg = (c >> 8) & 0xFFu, sb = c & 0xFFu;
+    uint32_t dr = (dst >> 16) & 0xFFu, dg = (dst >> 8) & 0xFFu, db = dst & 0xFFu;
+    uint32_t da = (dst >> 24) & 0xFFu;
+    uint32_t oa = std::min<uint32_t>(255u, sa + (da * inv) / 255u);
+    dst = (oa << 24) |
+          (((sr * sa + dr * inv) / 255u) << 16) |
+          (((sg * sa + dg * inv) / 255u) << 8) |
+          ((sb * sa + db * inv) / 255u);
+}
+
+void CanvasSurface::clear_rect(float x, float y, float w, float h) {
+    int x0 = std::max(0, static_cast<int>(std::floor(x)));
+    int y0 = std::max(0, static_cast<int>(std::floor(y)));
+    int x1 = std::min(width, static_cast<int>(std::ceil(x + w)));
+    int y1 = std::min(height, static_cast<int>(std::ceil(y + h)));
+    for (int py = y0; py < y1; ++py) {
+        for (int px = x0; px < x1; ++px) {
+            argb[static_cast<size_t>(py) * static_cast<size_t>(width) + static_cast<size_t>(px)] = 0x00000000u;
+        }
+    }
+}
+
+void CanvasSurface::fill_rect(float x, float y, float w, float h) {
+    if (w <= 0.0f || h <= 0.0f) return;
+    int x0 = std::max(0, static_cast<int>(std::floor(x)));
+    int y0 = std::max(0, static_cast<int>(std::floor(y)));
+    int x1 = std::min(width, static_cast<int>(std::ceil(x + w)));
+    int y1 = std::min(height, static_cast<int>(std::ceil(y + h)));
+    for (int py = y0; py < y1; ++py) {
+        for (int px = x0; px < x1; ++px) blend_pixel(px, py, fill_color);
+    }
+}
+
+void CanvasSurface::stroke_rect(float x, float y, float w, float h) {
+    if (w <= 0.0f || h <= 0.0f) return;
+    int lw = std::max(1, static_cast<int>(std::round(line_width)));
+    int x0 = static_cast<int>(std::floor(x));
+    int y0 = static_cast<int>(std::floor(y));
+    int iw = static_cast<int>(std::ceil(w));
+    int ih = static_cast<int>(std::ceil(h));
+    auto hline = [&](int rx, int ry, int rw, int rh) {
+        for (int py = std::max(0, ry); py < std::min(height, ry + rh); ++py)
+            for (int px = std::max(0, rx); px < std::min(width, rx + rw); ++px)
+                blend_pixel(px, py, stroke_color);
+    };
+    hline(x0, y0, iw, lw);
+    hline(x0, y0 + ih - lw, iw, lw);
+    hline(x0, y0, lw, ih);
+    hline(x0 + iw - lw, y0, lw, ih);
+}
+
+void CanvasSurface::begin_path() {
+    path.clear();
+}
+
+void CanvasSurface::move_to(float x, float y) {
+    path.push_back({x, y, true});
+}
+
+void CanvasSurface::line_to(float x, float y) {
+    path.push_back({x, y, path.empty()});
+}
+
+void CanvasSurface::close_path() {
+    if (path.size() < 2) return;
+    size_t start = path.size() - 1;
+    while (start > 0 && !path[start].move_to) --start;
+    path.push_back({path[start].x, path[start].y, false});
+}
+
+void CanvasSurface::arc(float cx, float cy, float r, float start_rad, float end_rad) {
+    if (r <= 0.0f) return;
+    float sweep = end_rad - start_rad;
+    int segs = std::clamp(static_cast<int>(std::ceil(std::abs(sweep) * std::max(r, 12.0f) * 0.5f)), 16, 72);
+    for (int i = 0; i <= segs; ++i) {
+        float ang = start_rad + sweep * (static_cast<float>(i) / static_cast<float>(segs));
+        float px = cx + std::cos(ang) * r;
+        float py = cy + std::sin(ang) * r;
+        path.push_back({px, py, (i == 0 && path.empty())});
+    }
+}
+
+void CanvasSurface::fill_path() {
+    if (path.size() < 3) return;
+    // Collect subpaths and scanline-fill each closed polygon
+    size_t i = 0;
+    while (i < path.size()) {
+        size_t j = i + 1;
+        while (j < path.size() && !path[j].move_to) ++j;
+        size_t m = j - i;
+        if (m >= 3) {
+            float min_y = path[i].y, max_y = path[i].y;
+            for (size_t k = i + 1; k < j; ++k) {
+                min_y = std::min(min_y, path[k].y);
+                max_y = std::max(max_y, path[k].y);
+            }
+            int y0 = std::max(0, static_cast<int>(std::floor(min_y)));
+            int y1 = std::min(height - 1, static_cast<int>(std::ceil(max_y)));
+            std::vector<float> xs;
+            for (int y = y0; y <= y1; ++y) {
+                xs.clear();
+                float fy = static_cast<float>(y) + 0.5f;
+                for (size_t k = 0; k < m; ++k) {
+                    const auto& a = path[i + k];
+                    const auto& b = path[i + ((k + 1) % m)];
+                    if ((a.y <= fy && b.y > fy) || (b.y <= fy && a.y > fy)) {
+                        float t = (fy - a.y) / (b.y - a.y);
+                        xs.push_back(a.x + t * (b.x - a.x));
+                    }
+                }
+                std::sort(xs.begin(), xs.end());
+                for (size_t s = 0; s + 1 < xs.size(); s += 2) {
+                    int x0 = std::max(0, static_cast<int>(std::ceil(xs[s] - 0.5f)));
+                    int x1 = std::min(width - 1, static_cast<int>(std::floor(xs[s + 1] - 0.5f)));
+                    for (int x = x0; x <= x1; ++x) blend_pixel(x, y, fill_color);
+                }
+            }
+        }
+        i = j;
+    }
+}
+
+void CanvasSurface::stroke_path() {
+    if (path.size() < 2) return;
+    float rad = std::max(0.5f, line_width * 0.5f);
+    int ir = static_cast<int>(std::ceil(rad));
+    float rad2 = rad * rad;
+
+    auto stamp = [&](float fx, float fy) {
+        int cx = static_cast<int>(std::round(fx));
+        int cy = static_cast<int>(std::round(fy));
+        if (ir <= 1 && line_width <= 1.5f) {
+            blend_pixel(cx, cy, stroke_color);
+            return;
+        }
+        for (int dy = -ir; dy <= ir; ++dy) {
+            for (int dx = -ir; dx <= ir; ++dx) {
+                if (static_cast<float>(dx * dx + dy * dy) <= rad2 + 0.25f) {
+                    blend_pixel(cx + dx, cy + dy, stroke_color);
+                }
+            }
+        }
+    };
+
+    for (size_t i = 1; i < path.size(); ++i) {
+        if (path[i].move_to) continue;
+        float x0 = path[i - 1].x, y0 = path[i - 1].y;
+        float x1 = path[i].x, y1 = path[i].y;
+        float dx = x1 - x0, dy = y1 - y0;
+        float dist = std::hypot(dx, dy);
+        int steps = std::max(1, static_cast<int>(std::ceil(dist * 1.5f)));
+        for (int s = 0; s <= steps; ++s) {
+            float t = static_cast<float>(s) / static_cast<float>(steps);
+            stamp(x0 + dx * t, y0 + dy * t);
+        }
+    }
+}
+
+void CanvasSurface::fill_text(std::string_view text, float x, float y) {
+    auto& fe = FontEngine::instance();
+    if (!fe.freetype_active()) return;
+    int px = static_cast<int>(std::round(std::clamp(font_size, 8.0f, 64.0f)));
+    int baseline_y = static_cast<int>(std::round(y));
+    int cx = static_cast<int>(std::round(x));
+    uint32_t base_a = (fill_color >> 24) & 0xFFu;
+    uint32_t rgb = fill_color & 0x00FFFFFFu;
+    size_t idx = 0;
+    while (idx < text.size()) {
+        uint32_t cp = FontEngine::next_utf8_codepoint(text, idx);
+        const CachedGlyph* g = fe.get_glyph(cp, px, font_bold, font_mono);
+        if (!g) { cx += px / 2; continue; }
+        int gx0 = cx + g->bearing_x;
+        int gy0 = baseline_y - g->bearing_y;
+        for (int row = 0; row < g->height; ++row) {
+            int py = gy0 + row;
+            if (py < 0 || py >= height) continue;
+            for (int col = 0; col < g->width; ++col) {
+                uint8_t cov = g->alpha[static_cast<size_t>(row * g->width + col)];
+                if (cov == 0) continue;
+                int pxx = gx0 + col;
+                if (pxx < 0 || pxx >= width) continue;
+                uint32_t eff_a = (base_a * cov) / 255u;
+                if (eff_a > 0) blend_pixel(pxx, py, (eff_a << 24) | rgb);
+            }
+        }
+        cx += g->advance_x;
+        if (cx > width) break;
+    }
+}
 
 std::string JsValue::to_string() const {
     switch (kind) {
@@ -739,6 +1138,7 @@ std::string JsValue::to_string() const {
             if (!obj) return "null";
             if (obj->type == GcObject::Type::Array) return "[Array(" + std::to_string(obj->elements.size()) + ")]";
             if (obj->type == GcObject::Type::Function) return "[Function " + obj->fn_name + "]";
+            if (obj->type == GcObject::Type::Canvas2D) return "[CanvasRenderingContext2D #" + obj->canvas_id + "]";
             return "[Object]";
     }
     return {};
@@ -898,6 +1298,8 @@ size_t AstraJsEngine::gc_collect() {
         if (mt.target_promise) mark_object(mt.target_promise);
     }
     for (const auto& t : timers_) mark_value(t.callback);
+    for (const auto& cb : raf_callbacks_) mark_value(cb);
+    mark_value(exception_value_);
     for (const auto& [key, vec] : listeners_) {
         for (const auto& cb : vec) mark_value(cb);
     }
@@ -940,6 +1342,12 @@ JsValue AstraJsEngine::invoke_callable(const JsValue& fn,
             timers_.push_back({delay, args[0]});
             return JsValue::make_number(static_cast<double>(timers_.size()));
         }
+        if (fn.sval == "__requestAnimationFrame__" && !args.empty()) {
+            if (raf_callbacks_.size() < 64) {
+                raf_callbacks_.push_back(args[0]);
+            }
+            return JsValue::make_number(static_cast<double>(++raf_id_counter_));
+        }
         if (fn.sval == "__gc__") {
             return JsValue::make_number(static_cast<double>(gc_collect()));
         }
@@ -981,6 +1389,12 @@ JsValue AstraJsEngine::invoke_callable(const JsValue& fn,
     }
     JsValue out = run_chunk(fn.obj->chunk, locals, doc, rep, fn.obj->closure_env);
     if (fn.obj->is_async) {
+        if (exception_active_) {
+            JsValue reason = exception_value_;
+            exception_active_ = false;
+            exception_value_ = JsValue::make_undefined();
+            return JsValue::make_obj(make_rejected_promise(reason));
+        }
         if (out.kind == JsValue::Kind::Object && out.obj && out.obj->type == GcObject::Type::Promise) {
             return out;
         }
@@ -999,11 +1413,32 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
     const size_t kMaxSteps = 200000;
     std::shared_ptr<std::unordered_map<std::string, JsValue>> frame_env;
 
+    struct TryHandler {
+        size_t catch_ip = 0;
+        size_t stack_depth = 0;
+    };
+    std::vector<TryHandler> try_stack;
+
     auto pop = [&]() -> JsValue {
         if (stack_.empty()) return JsValue::make_undefined();
         JsValue v = std::move(stack_.back());
         stack_.pop_back();
         return v;
+    };
+
+    auto try_unwind = [&]() -> bool {
+        if (!exception_active_) return false;
+        if (!try_stack.empty()) {
+            TryHandler h = try_stack.back();
+            try_stack.pop_back();
+            if (stack_.size() > h.stack_depth) stack_.resize(h.stack_depth);
+            stack_.push_back(exception_value_);
+            exception_active_ = false;
+            exception_value_ = JsValue::make_undefined();
+            ip = h.catch_ip;
+            return true;
+        }
+        return false;
     };
 
     while (ip < n && rep.instructions_executed < kMaxSteps) {
@@ -1070,6 +1505,8 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                     stack_.push_back(JsValue::make_string("__queueMicrotask__"));
                 } else if (name == "setTimeout") {
                     stack_.push_back(JsValue::make_string("__setTimeout__"));
+                } else if (name == "requestAnimationFrame") {
+                    stack_.push_back(JsValue::make_string("__requestAnimationFrame__"));
                 } else if (name == "gc") {
                     stack_.push_back(JsValue::make_string("__gc__"));
                 } else if (name == "fetch") {
@@ -1166,12 +1603,25 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                     stack_.push_back(JsValue::make_string("__builtin_astra_storage__"));
                 } else if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_document__" && k == "title") {
                     stack_.push_back(JsValue::make_string(doc.title()));
+                } else if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_Math__" && k == "PI") {
+                    stack_.push_back(JsValue::make_number(3.14159265358979323846));
                 } else if (obj.kind == JsValue::Kind::DomRef && obj.node) {
                     if (k == "textContent") stack_.push_back(JsValue::make_string(obj.node->text_content()));
                     else if (k == "innerHTML") stack_.push_back(JsValue::make_string(obj.node->inner_html()));
                     else if (k == "tagName") stack_.push_back(JsValue::make_string(obj.node->tag));
                     else if (k == "className") stack_.push_back(JsValue::make_string(obj.node->get_attr("class")));
-                    else if (k == "classList") {
+                    else if (obj.node->tag == "canvas" && (k == "width" || k == "height")) {
+                        std::string cid = obj.node->get_attr("id");
+                        if (cid.empty()) cid = "canvas";
+                        auto cit = canvases_.find(cid);
+                        if (cit != canvases_.end()) {
+                            stack_.push_back(JsValue::make_number(k == "width" ? cit->second.width : cit->second.height));
+                        } else {
+                            std::string av = obj.node->get_attr(k);
+                            double dv = av.empty() ? (k == "width" ? 300.0 : 150.0) : std::strtod(av.c_str(), nullptr);
+                            stack_.push_back(JsValue::make_number(dv));
+                        }
+                    } else if (k == "classList") {
                         GcObject* cl = alloc_object(GcObject::Type::Map);
                         cl->classlist_node = obj.node;
                         stack_.push_back(JsValue::make_obj(cl));
@@ -1184,12 +1634,31 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                             size_t idx = static_cast<size_t>(std::max(0.0, key.to_number()));
                             stack_.push_back(idx < obj.obj->elements.size() ? obj.obj->elements[idx] : JsValue::make_undefined());
                         }
+                    } else if (obj.obj->type == GcObject::Type::Canvas2D) {
+                        auto cit = canvases_.find(obj.obj->canvas_id);
+                        if (cit != canvases_.end() && k == "width") {
+                            stack_.push_back(JsValue::make_number(static_cast<double>(cit->second.width)));
+                        } else if (cit != canvases_.end() && k == "height") {
+                            stack_.push_back(JsValue::make_number(static_cast<double>(cit->second.height)));
+                        } else {
+                            auto it = obj.obj->props.find(k);
+                            stack_.push_back(it != obj.obj->props.end() ? it->second : JsValue::make_undefined());
+                        }
                     } else {
                         auto it = obj.obj->props.find(k);
                         stack_.push_back(it != obj.obj->props.end() ? it->second : JsValue::make_undefined());
                     }
-                } else if (obj.kind == JsValue::Kind::String && k == "length") {
-                    stack_.push_back(JsValue::make_number(static_cast<double>(obj.sval.size())));
+                } else if (obj.kind == JsValue::Kind::String) {
+                    if (k == "length") {
+                        stack_.push_back(JsValue::make_number(static_cast<double>(obj.sval.size())));
+                    } else if (key.kind == JsValue::Kind::Number) {
+                        size_t idx = static_cast<size_t>(std::max(0.0, key.nval));
+                        stack_.push_back(idx < obj.sval.size()
+                                             ? JsValue::make_string(std::string(1, obj.sval[idx]))
+                                             : JsValue::make_undefined());
+                    } else {
+                        stack_.push_back(JsValue::make_undefined());
+                    }
                 } else {
                     stack_.push_back(JsValue::make_undefined());
                 }
@@ -1209,6 +1678,35 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                         size_t idx = static_cast<size_t>(std::max(0.0, key.to_number()));
                         if (idx >= obj.obj->elements.size()) obj.obj->elements.resize(idx + 1, JsValue::make_undefined());
                         obj.obj->elements[idx] = val;
+                    } else if (obj.obj->type == GcObject::Type::Canvas2D) {
+                        obj.obj->props[k] = val;
+                        auto cit = canvases_.find(obj.obj->canvas_id);
+                        if (cit != canvases_.end()) {
+                            CanvasSurface& surf = cit->second;
+                            if (k == "fillStyle") {
+                                surf.fill_color = CanvasSurface::parse_css_color(val.to_string(), surf.fill_color);
+                            } else if (k == "strokeStyle") {
+                                surf.stroke_color = CanvasSurface::parse_css_color(val.to_string(), surf.stroke_color);
+                            } else if (k == "lineWidth") {
+                                surf.line_width = std::clamp(static_cast<float>(val.to_number()), 0.5f, 32.0f);
+                            } else if (k == "font") {
+                                std::string fs = val.to_string();
+                                std::string low = fs;
+                                std::transform(low.begin(), low.end(), low.begin(),
+                                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                                surf.font_bold = (low.find("bold") != std::string::npos);
+                                surf.font_mono = (low.find("mono") != std::string::npos);
+                                size_t px_pos = low.find("px");
+                                if (px_pos != std::string::npos) {
+                                    size_t d = px_pos;
+                                    while (d > 0 && (std::isdigit(static_cast<unsigned char>(low[d - 1])) || low[d - 1] == '.')) --d;
+                                    if (d < px_pos) {
+                                        float sz = std::strtof(low.substr(d, px_pos - d).c_str(), nullptr);
+                                        if (sz >= 6.0f && sz <= 72.0f) surf.font_size = sz;
+                                    }
+                                }
+                            }
+                        }
                     } else {
                         obj.obj->props[k] = val;
                     }
@@ -1221,7 +1719,12 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                 std::vector<JsValue> args(static_cast<size_t>(argc));
                 for (int32_t i = argc - 1; i >= 0; --i) args[static_cast<size_t>(i)] = pop();
                 JsValue callee = pop();
-                stack_.push_back(invoke_callable(callee, args, doc, rep));
+                JsValue res = invoke_callable(callee, args, doc, rep);
+                if (exception_active_) {
+                    if (try_unwind()) break;
+                    return JsValue::make_undefined();
+                }
+                stack_.push_back(std::move(res));
                 break;
             }
             case OpCode::CallMethod: {
@@ -1265,6 +1768,11 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                     else if (method == "ceil" && !args.empty()) ret = JsValue::make_number(std::ceil(args[0].to_number()));
                     else if (method == "round" && !args.empty()) ret = JsValue::make_number(std::round(args[0].to_number()));
                     else if (method == "sqrt" && !args.empty()) ret = JsValue::make_number(std::sqrt(args[0].to_number()));
+                    else if (method == "sin" && !args.empty()) ret = JsValue::make_number(std::sin(args[0].to_number()));
+                    else if (method == "cos" && !args.empty()) ret = JsValue::make_number(std::cos(args[0].to_number()));
+                    else if (method == "abs" && !args.empty()) ret = JsValue::make_number(std::abs(args[0].to_number()));
+                    else if (method == "min" && args.size() >= 2) ret = JsValue::make_number(std::min(args[0].to_number(), args[1].to_number()));
+                    else if (method == "max" && args.size() >= 2) ret = JsValue::make_number(std::max(args[0].to_number(), args[1].to_number()));
                 } else if (recv.kind == JsValue::Kind::String && recv.sval == "__builtin_localStorage__") {
                     if (method == "setItem" && args.size() >= 2) {
                         std::string k = args[0].to_string();
@@ -1435,9 +1943,75 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                         ret = args[0];
                     } else if (method == "addEventListener" && args.size() >= 2) {
                         listeners_[{recv.node, args[0].to_string()}].push_back(args[1]);
+                    } else if (method == "getContext" && !args.empty() && args[0].to_string() == "2d") {
+                        std::string cid = recv.node->get_attr("id");
+                        if (cid.empty()) cid = "canvas";
+                        auto& surf = canvases_[cid];
+                        if (surf.argb.empty()) {
+                            int cw = 300, ch = 150;
+                            std::string wa = recv.node->get_attr("width");
+                            std::string ha = recv.node->get_attr("height");
+                            if (!wa.empty()) cw = std::atoi(wa.c_str());
+                            if (!ha.empty()) ch = std::atoi(ha.c_str());
+                            if (cw <= 0) cw = 300;
+                            if (ch <= 0) ch = 150;
+                            surf.resize(cw, ch);
+                        }
+                        GcObject* ctx = alloc_object(GcObject::Type::Canvas2D);
+                        ctx->canvas_id = cid;
+                        ctx->props["fillStyle"] = JsValue::make_string("#ffffff");
+                        ctx->props["strokeStyle"] = JsValue::make_string("#38bdf8");
+                        ctx->props["lineWidth"] = JsValue::make_number(1.5);
+                        ctx->props["font"] = JsValue::make_string("13px sans-serif");
+                        ret = JsValue::make_obj(ctx);
                     }
                 } else if (recv.kind == JsValue::Kind::Object && recv.obj) {
-                    if (recv.obj->classlist_node) {
+                    if (recv.obj->type == GcObject::Type::Canvas2D) {
+                        auto cit = canvases_.find(recv.obj->canvas_id);
+                        if (cit != canvases_.end()) {
+                            CanvasSurface& surf = cit->second;
+                            if (method == "clearRect" && args.size() >= 4) {
+                                surf.clear_rect(static_cast<float>(args[0].to_number()),
+                                                static_cast<float>(args[1].to_number()),
+                                                static_cast<float>(args[2].to_number()),
+                                                static_cast<float>(args[3].to_number()));
+                            } else if (method == "fillRect" && args.size() >= 4) {
+                                surf.fill_rect(static_cast<float>(args[0].to_number()),
+                                               static_cast<float>(args[1].to_number()),
+                                               static_cast<float>(args[2].to_number()),
+                                               static_cast<float>(args[3].to_number()));
+                            } else if (method == "strokeRect" && args.size() >= 4) {
+                                surf.stroke_rect(static_cast<float>(args[0].to_number()),
+                                                 static_cast<float>(args[1].to_number()),
+                                                 static_cast<float>(args[2].to_number()),
+                                                 static_cast<float>(args[3].to_number()));
+                            } else if (method == "beginPath") {
+                                surf.begin_path();
+                            } else if (method == "moveTo" && args.size() >= 2) {
+                                surf.move_to(static_cast<float>(args[0].to_number()),
+                                             static_cast<float>(args[1].to_number()));
+                            } else if (method == "lineTo" && args.size() >= 2) {
+                                surf.line_to(static_cast<float>(args[0].to_number()),
+                                             static_cast<float>(args[1].to_number()));
+                            } else if (method == "closePath") {
+                                surf.close_path();
+                            } else if (method == "arc" && args.size() >= 5) {
+                                surf.arc(static_cast<float>(args[0].to_number()),
+                                         static_cast<float>(args[1].to_number()),
+                                         static_cast<float>(args[2].to_number()),
+                                         static_cast<float>(args[3].to_number()),
+                                         static_cast<float>(args[4].to_number()));
+                            } else if (method == "fill") {
+                                surf.fill_path();
+                            } else if (method == "stroke") {
+                                surf.stroke_path();
+                            } else if (method == "fillText" && args.size() >= 3) {
+                                surf.fill_text(args[0].to_string(),
+                                               static_cast<float>(args[1].to_number()),
+                                               static_cast<float>(args[2].to_number()));
+                            }
+                        }
+                    } else if (recv.obj->classlist_node) {
                         DomNode* dn = recv.obj->classlist_node;
                         if (method == "add" && !args.empty()) {
                             for (const auto& a : args) dn->add_class(a.to_string());
@@ -1522,8 +2096,24 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                         ret = invoke_callable(recv.obj->props[method], args, doc, rep);
                     }
                 }
+                if (exception_active_) {
+                    if (try_unwind()) break;
+                    return JsValue::make_undefined();
+                }
                 stack_.push_back(std::move(ret));
                 break;
+            }
+            case OpCode::PushTry:
+                try_stack.push_back({static_cast<size_t>(ins.operand), stack_.size()});
+                break;
+            case OpCode::PopTry:
+                if (!try_stack.empty()) try_stack.pop_back();
+                break;
+            case OpCode::Throw: {
+                exception_value_ = pop();
+                exception_active_ = true;
+                if (try_unwind()) break;
+                return JsValue::make_undefined();
             }
             case OpCode::Await: {
                 JsValue awaited = pop();
@@ -1598,6 +2188,9 @@ void AstraJsEngine::drain_event_loop(HtmlDocument& doc, JsExecutionReport& rep) 
 
 JsExecutionReport AstraJsEngine::execute(std::string_view code, HtmlDocument& doc) {
     JsExecutionReport rep;
+    exception_active_ = false;
+    exception_value_ = JsValue::make_undefined();
+
     auto tokens = tokenize(code);
     BytecodeChunk chunk;
     BytecodeCompiler compiler(tokens, [this](GcObject::Type t) { return alloc_object(t); });
@@ -1609,7 +2202,14 @@ JsExecutionReport AstraJsEngine::execute(std::string_view code, HtmlDocument& do
 
     std::vector<JsValue> locals;
     run_chunk(chunk, locals, doc, rep);
-    drain_event_loop(doc, rep);
+    if (exception_active_) {
+        rep.ok = false;
+        rep.error = "Uncaught exception: " + exception_value_.to_string();
+        exception_active_ = false;
+        exception_value_ = JsValue::make_undefined();
+    } else {
+        drain_event_loop(doc, rep);
+    }
 
     // Run GC if heap grew large
     if (heap_.size() > 64) {
@@ -1626,11 +2226,48 @@ JsExecutionReport AstraJsEngine::dispatch_event(DomNode* target, const std::stri
         auto cbs = it->second;
         for (const auto& cb : cbs) {
             invoke_callable(cb, {}, doc, rep);
+            if (exception_active_) {
+                rep.ok = false;
+                rep.error = "Uncaught exception: " + exception_value_.to_string();
+                exception_active_ = false;
+                exception_value_ = JsValue::make_undefined();
+            }
         }
         drain_event_loop(doc, rep);
     }
     rep.gc = gc_stats();
     return rep;
+}
+
+JsExecutionReport AstraJsEngine::run_animation_frame(double timestamp_ms, HtmlDocument& doc) {
+    JsExecutionReport rep;
+    if (raf_callbacks_.empty()) {
+        rep.gc = gc_stats();
+        return rep;
+    }
+    auto batch = std::move(raf_callbacks_);
+    raf_callbacks_.clear();
+    for (const auto& cb : batch) {
+        invoke_callable(cb, {JsValue::make_number(timestamp_ms)}, doc, rep);
+        ++rep.raf_run;
+        if (exception_active_) {
+            rep.ok = false;
+            rep.error = "Uncaught exception in rAF: " + exception_value_.to_string();
+            exception_active_ = false;
+            exception_value_ = JsValue::make_undefined();
+        }
+    }
+    drain_event_loop(doc, rep);
+    if (heap_.size() > 64) gc_collect();
+    rep.gc = gc_stats();
+    return rep;
+}
+
+const CanvasSurface* AstraJsEngine::find_canvas(const std::string& id) const {
+    auto it = canvases_.find(id);
+    if (it != canvases_.end()) return &it->second;
+    if (canvases_.size() == 1) return &canvases_.begin()->second;
+    return nullptr;
 }
 
 } // namespace astra

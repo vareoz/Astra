@@ -130,13 +130,21 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
 
     float box_x = x + st.margin.left;
     float box_y = y + st.margin.top;
-    float box_w = (st.width > 0.0f)
-                      ? std::min(st.width, std::max(40.0f, avail_w - st.margin.left - st.margin.right))
-                      : std::max(40.0f, avail_w - st.margin.left - st.margin.right);
-
     float pad_x = st.padding.left + st.border_width;
     float pad_y = st.padding.top + st.border_width;
-    float inner_w = std::max(24.0f, box_w - pad_x - st.padding.right - st.border_width);
+    float horiz_extra = pad_x + st.padding.right + st.border_width;
+    float vert_extra = pad_y + st.padding.bottom + st.border_width;
+    float max_avail = std::max(40.0f, avail_w - st.margin.left - st.margin.right);
+
+    float box_w = max_avail;
+    if (st.width > 0.0f) {
+        float target_border_w = (st.box_sizing == BoxSizing::BorderBox)
+                                    ? st.width
+                                    : (st.width + horiz_extra);
+        box_w = std::min(target_border_w, max_avail);
+    }
+
+    float inner_w = std::max(16.0f, box_w - horiz_extra);
 
     frame->border_box.x = box_x;
     frame->border_box.y = box_y;
@@ -146,19 +154,30 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
     frame->content_box.y = box_y + pad_y;
     frame->content_box.w = inner_w;
 
-    // Replaced / embedded elements (<astra-3d>, <video>, <img>, <input>)
+    // Replaced / embedded elements (<astra-3d>, <video>, <audio>, <canvas>, <img>, <input>)
     if (frame->node && frame->node->type == NodeType::Element) {
         const std::string& tag = frame->node->tag;
         if (tag == "astra-3d" || tag == "video") {
             float h = (st.height > 0.0f) ? st.height : 260.0f;
             frame->content_box.h = h;
-            frame->border_box.h = h + pad_y + st.padding.bottom + st.border_width;
+            frame->border_box.h = h + vert_extra;
             return;
         }
         if (tag == "audio") {
             float h = (st.height > 0.0f) ? st.height : 76.0f;
             frame->content_box.h = h;
-            frame->border_box.h = h + pad_y + st.padding.bottom + st.border_width;
+            frame->border_box.h = h + vert_extra;
+            return;
+        }
+        if (tag == "canvas") {
+            float aw = static_cast<float>(std::atoi(frame->node->get_attr("width").c_str()));
+            float ah = static_cast<float>(std::atoi(frame->node->get_attr("height").c_str()));
+            float w = (st.width > 0.0f) ? st.width : (aw > 0.0f ? aw : std::min(inner_w, 300.0f));
+            float h = (st.height > 0.0f) ? st.height : (ah > 0.0f ? ah : 150.0f);
+            frame->content_box.w = std::min(w, inner_w);
+            frame->content_box.h = h;
+            frame->border_box.w = frame->content_box.w + horiz_extra;
+            frame->border_box.h = h + vert_extra;
             return;
         }
         if (tag == "img") {
@@ -168,14 +187,14 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
             float h = (st.height > 0.0f) ? st.height : (ah > 0.0f ? ah : 160.0f);
             frame->content_box.w = std::min(w, inner_w);
             frame->content_box.h = h;
-            frame->border_box.w = frame->content_box.w + pad_x + st.padding.right + st.border_width;
-            frame->border_box.h = h + pad_y + st.padding.bottom + st.border_width;
+            frame->border_box.w = frame->content_box.w + horiz_extra;
+            frame->border_box.h = h + vert_extra;
             return;
         }
         if (tag == "input" || tag == "textarea") {
             float h = (st.height > 0.0f) ? st.height : (tag == "textarea" ? 88.0f : 38.0f);
             frame->border_box.h = h;
-            frame->content_box.h = std::max(16.0f, h - pad_y - st.padding.bottom - st.border_width);
+            frame->content_box.h = std::max(16.0f, h - vert_extra);
             return;
         }
     }
@@ -263,14 +282,17 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
 
     float measured_h = std::max(0.0f, cur_y - frame->content_box.y);
     if (st.height > 0.0f) {
+        float target_content_h = (st.box_sizing == BoxSizing::BorderBox)
+                                     ? std::max(0.0f, st.height - vert_extra)
+                                     : st.height;
         if (st.overflow == OverflowMode::Hidden) {
-            measured_h = st.height;
+            measured_h = target_content_h;
         } else {
-            measured_h = std::max(measured_h, st.height);
+            measured_h = std::max(measured_h, target_content_h);
         }
     }
     frame->content_box.h = measured_h;
-    frame->border_box.h = measured_h + pad_y + st.padding.bottom + st.border_width;
+    frame->border_box.h = measured_h + vert_extra;
 
     // Update containing block height now that this container's final height is known
     Rect final_cb = (st.position != PositionType::Static) ? frame->border_box : containing_block;
@@ -357,7 +379,19 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
         dl.items.push_back(std::move(sh));
     }
 
-    if (st.background.a > 0 && f->border_box.w > 0 && f->border_box.h > 0) {
+    if (st.background_gradient.enabled && f->border_box.w > 0 && f->border_box.h > 0) {
+        DisplayItem item;
+        item.type = DisplayItemType::FillGradient;
+        item.rect = f->border_box;
+        item.color_argb = apply_opacity(st.background_gradient.start.to_argb(), eff_opacity);
+        item.color2_argb = apply_opacity(st.background_gradient.end.to_argb(), eff_opacity);
+        item.angle_deg = st.background_gradient.angle_deg;
+        item.radius = st.border_radius;
+        item.z_index = eff_z;
+        item.fixed_viewport = eff_fixed;
+        attach_clip(item);
+        dl.items.push_back(std::move(item));
+    } else if (st.background.a > 0 && f->border_box.w > 0 && f->border_box.h > 0) {
         DisplayItem item;
         item.type = DisplayItemType::FillRect;
         item.rect = f->border_box;
@@ -439,6 +473,18 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
             item.text = f->node->get_attr("src");
             attach_clip(item);
             dl.hit_regions.push_back(HitRegion{HitRegionKind::Audio, f->content_box, eff_z, eff_fixed, item.text});
+            dl.items.push_back(std::move(item));
+            return;
+        } else if (tag == "canvas") {
+            DisplayItem item;
+            item.type = DisplayItemType::EmbedCanvas;
+            item.rect = f->content_box;
+            item.radius = st.border_radius;
+            item.z_index = eff_z;
+            item.fixed_viewport = eff_fixed;
+            std::string cid = f->node->id();
+            item.text = cid.empty() ? "canvas" : cid;
+            attach_clip(item);
             dl.items.push_back(std::move(item));
             return;
         } else if (tag == "img") {
@@ -524,8 +570,8 @@ const HitRegion* DisplayList::hit_test(float x, float y, float scroll_y) const {
 
 std::vector<uint8_t> DisplayList::serialize() const {
     std::vector<uint8_t> buf;
-    buf.reserve(64 + items.size() * 68 + hit_regions.size() * 40);
-    write_u32(buf, 0x41534434u); // Magic 'ASD4' (Session 5 format with WebRender per-item clip_rect)
+    buf.reserve(64 + items.size() * 76 + hit_regions.size() * 40);
+    write_u32(buf, 0x41534435u); // Magic 'ASD5' (Session 6: FillGradient + EmbedCanvas + WebRender clip_rect)
     write_u32(buf, viewport_width);
     write_u32(buf, viewport_height);
     write_f32(buf, content_height);
@@ -538,6 +584,8 @@ std::vector<uint8_t> DisplayList::serialize() const {
         write_f32(buf, it.rect.w);
         write_f32(buf, it.rect.h);
         write_u32(buf, it.color_argb);
+        write_u32(buf, it.color2_argb);
+        write_f32(buf, it.angle_deg);
         write_f32(buf, it.radius);
         write_f32(buf, it.thickness);
         write_f32(buf, it.font_size);
@@ -571,7 +619,9 @@ std::vector<uint8_t> DisplayList::serialize() const {
 bool DisplayList::deserialize(const std::vector<uint8_t>& blob, DisplayList& out) {
     size_t off = 0;
     uint32_t magic = 0, count = 0;
-    if (!read_u32(blob, off, magic) || (magic != 0x41534434u && magic != 0x41534433u)) return false;
+    if (!read_u32(blob, off, magic) ||
+        (magic != 0x41534435u && magic != 0x41534434u && magic != 0x41534433u)) return false;
+    bool is_v5 = (magic == 0x41534435u);
     if (!read_u32(blob, off, out.viewport_width)) return false;
     if (!read_u32(blob, off, out.viewport_height)) return false;
     if (!read_f32(blob, off, out.content_height)) return false;
@@ -590,6 +640,10 @@ bool DisplayList::deserialize(const std::vector<uint8_t>& blob, DisplayList& out
         if (!read_f32(blob, off, it.rect.w)) return false;
         if (!read_f32(blob, off, it.rect.h)) return false;
         if (!read_u32(blob, off, it.color_argb)) return false;
+        if (is_v5) {
+            if (!read_u32(blob, off, it.color2_argb)) return false;
+            if (!read_f32(blob, off, it.angle_deg)) return false;
+        }
         if (!read_f32(blob, off, it.radius)) return false;
         if (!read_f32(blob, off, it.thickness)) return false;
         if (!read_f32(blob, off, it.font_size)) return false;

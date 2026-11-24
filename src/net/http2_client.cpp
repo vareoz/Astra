@@ -427,83 +427,138 @@ Http2Response Http2Client::execute_request(
     const std::string& req_body) {
     Http2Response resp;
 
-    // 1. Send RFC 7540 client connection preface
+    Http2RequestSpec spec;
+    spec.method = method;
+    spec.scheme = scheme;
+    spec.authority = authority;
+    spec.path = path;
+    spec.extra_headers = extra_headers;
+    spec.body = req_body;
+    auto batch = execute_multiplexed_batch(read_fn, write_fn, {spec});
+    return batch.empty() ? Http2Response{} : std::move(batch[0]);
+}
+
+std::vector<Http2Response> Http2Client::execute_multiplexed_batch(
+    const ReadFn& read_fn,
+    const WriteFn& write_fn,
+    const std::vector<Http2RequestSpec>& requests) {
+    std::vector<Http2Response> responses(requests.size());
+    if (requests.empty()) return responses;
+
+    // 1. Send RFC 7540 client connection preface ONCE for all multiplexed streams
     static constexpr char kPreface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     if (!write_all(write_fn, reinterpret_cast<const uint8_t*>(kPreface), 24)) {
-        resp.error = "HTTP/2 failed to send preface";
-        return resp;
+        for (auto& r : responses) r.error = "HTTP/2 failed to send preface";
+        return responses;
     }
 
-    // 2. Send client SETTINGS frame (ENABLE_PUSH=0, INITIAL_WINDOW_SIZE=1MiB)
+    // 2. Send client SETTINGS frame (ENABLE_PUSH=0, MAX_CONCURRENT_STREAMS=32, INITIAL_WINDOW_SIZE=1MiB)
     Http2Frame settings;
     settings.type = Http2FrameType::Settings;
     settings.flags = 0;
     settings.stream_id = 0;
     settings.payload = {
         0x00, 0x02, 0x00, 0x00, 0x00, 0x00, // SETTINGS_ENABLE_PUSH = 0
+        0x00, 0x03, 0x00, 0x00, 0x00, 0x20, // SETTINGS_MAX_CONCURRENT_STREAMS = 32
         0x00, 0x04, 0x00, 0x10, 0x00, 0x00  // SETTINGS_INITIAL_WINDOW_SIZE = 1048576
     };
     auto sf_bytes = pack_frame(settings);
     if (!write_all(write_fn, sf_bytes.data(), sf_bytes.size())) {
-        resp.error = "HTTP/2 failed to send SETTINGS";
-        return resp;
+        for (auto& r : responses) r.error = "HTTP/2 failed to send SETTINGS";
+        return responses;
     }
 
-    // 3. Send HEADERS frame on Stream 1
+    // 3. Dispatch all N requests on odd client-initiated streams (1, 3, 5, ...) over the same connection
+    struct StreamState {
+        size_t req_index = 0;
+        std::vector<uint8_t> header_block;
+        bool collecting_headers = false;
+        bool done = false;
+    };
+    std::map<uint32_t, StreamState> streams;
     HpackCodec encoder;
-    std::vector<std::pair<std::string, std::string>> hlist;
-    hlist.emplace_back(":method", method);
-    hlist.emplace_back(":scheme", scheme);
-    hlist.emplace_back(":authority", authority);
-    hlist.emplace_back(":path", path.empty() ? "/" : path);
-    hlist.emplace_back("accept", "text/html,text/css,image/jpeg,image/png,*/*;q=0.8");
-    hlist.emplace_back("accept-encoding", "gzip, deflate");
-    for (const auto& [k, v] : extra_headers) {
-        std::string lk = to_lower_ascii(k);
-        if (lk == "host" || lk == "connection" || lk == "transfer-encoding" || lk == "keep-alive") continue;
-        hlist.emplace_back(lk, v);
-    }
+    uint32_t last_sid = 1;
 
-    Http2Frame hframe;
-    hframe.type = Http2FrameType::Headers;
-    hframe.flags = 0x04u | (req_body.empty() ? 0x01u : 0x00u); // END_HEADERS | (END_STREAM if no body)
-    hframe.stream_id = 1;
-    hframe.payload = encoder.encode_headers(hlist);
-    auto hf_bytes = pack_frame(hframe);
-    if (!write_all(write_fn, hf_bytes.data(), hf_bytes.size())) {
-        resp.error = "HTTP/2 failed to send HEADERS";
-        return resp;
-    }
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& req = requests[i];
+        uint32_t sid = static_cast<uint32_t>(i * 2 + 1);
+        last_sid = sid;
+        streams[sid].req_index = i;
 
-    // Optional request DATA frame
-    if (!req_body.empty()) {
-        Http2Frame dframe;
-        dframe.type = Http2FrameType::Data;
-        dframe.flags = 0x01u; // END_STREAM
-        dframe.stream_id = 1;
-        dframe.payload.assign(req_body.begin(), req_body.end());
-        auto df_bytes = pack_frame(dframe);
-        if (!write_all(write_fn, df_bytes.data(), df_bytes.size())) {
-            resp.error = "HTTP/2 failed to send DATA";
-            return resp;
+        std::vector<std::pair<std::string, std::string>> hlist;
+        hlist.emplace_back(":method", req.method.empty() ? "GET" : req.method);
+        hlist.emplace_back(":scheme", req.scheme.empty() ? "https" : req.scheme);
+        hlist.emplace_back(":authority", req.authority);
+        hlist.emplace_back(":path", req.path.empty() ? "/" : req.path);
+        hlist.emplace_back("accept", "text/html,text/css,image/jpeg,image/png,*/*;q=0.8");
+        hlist.emplace_back("accept-encoding", "gzip, deflate");
+        for (const auto& [k, v] : req.extra_headers) {
+            std::string lk = to_lower_ascii(k);
+            if (lk == "host" || lk == "connection" || lk == "transfer-encoding" || lk == "keep-alive") continue;
+            hlist.emplace_back(lk, v);
+        }
+
+        Http2Frame hframe;
+        hframe.type = Http2FrameType::Headers;
+        hframe.flags = 0x04u | (req.body.empty() ? 0x01u : 0x00u); // END_HEADERS | (END_STREAM if no body)
+        hframe.stream_id = sid;
+        hframe.payload = encoder.encode_headers(hlist);
+        auto hf_bytes = pack_frame(hframe);
+        if (!write_all(write_fn, hf_bytes.data(), hf_bytes.size())) {
+            responses[i].error = "HTTP/2 failed to send HEADERS on stream " + std::to_string(sid);
+            streams[sid].done = true;
+            continue;
+        }
+
+        if (!req.body.empty()) {
+            Http2Frame dframe;
+            dframe.type = Http2FrameType::Data;
+            dframe.flags = 0x01u; // END_STREAM
+            dframe.stream_id = sid;
+            dframe.payload.assign(req.body.begin(), req.body.end());
+            auto df_bytes = pack_frame(dframe);
+            if (!write_all(write_fn, df_bytes.data(), df_bytes.size())) {
+                responses[i].error = "HTTP/2 failed to send DATA on stream " + std::to_string(sid);
+                streams[sid].done = true;
+            }
         }
     }
 
-    // 4. Receive binary frames until stream 1 receives END_STREAM (or GOAWAY / RST_STREAM)
-    HpackCodec decoder;
-    std::vector<uint8_t> header_block;
-    bool collecting_headers = false;
-    bool stream_ended = false;
-    uint8_t hdr9[9];
+    // 4. Demultiplex interleaved binary frames until all active streams complete
+    size_t remaining = 0;
+    for (const auto& [sid, st] : streams) {
+        if (!st.done) ++remaining;
+    }
 
-    while (!stream_ended && resp.frames_received < 4096) {
+    HpackCodec decoder;
+    size_t total_frames = 0;
+    uint8_t hdr9[9];
+    const size_t max_frames = 4096 * std::max<size_t>(1, requests.size());
+
+    auto send_wu = [&](uint32_t sid, uint32_t inc) {
+        Http2Frame wu;
+        wu.type = Http2FrameType::WindowUpdate;
+        wu.stream_id = sid;
+        wu.payload = {
+            static_cast<uint8_t>((inc >> 24) & 0x7Fu),
+            static_cast<uint8_t>((inc >> 16) & 0xFFu),
+            static_cast<uint8_t>((inc >> 8) & 0xFFu),
+            static_cast<uint8_t>(inc & 0xFFu)
+        };
+        auto wb = pack_frame(wu);
+        write_all(write_fn, wb.data(), wb.size());
+    };
+
+    while (remaining > 0 && total_frames < max_frames) {
         if (!read_exact(read_fn, hdr9, 9)) break;
         uint32_t plen = (static_cast<uint32_t>(hdr9[0]) << 16) |
                         (static_cast<uint32_t>(hdr9[1]) << 8) |
                         static_cast<uint32_t>(hdr9[2]);
         if (plen > 4 * 1024 * 1024) {
-            resp.error = "HTTP/2 frame exceeds 4 MiB limit";
-            return resp;
+            for (auto& r : responses) {
+                if (!r.ok && r.error.empty()) r.error = "HTTP/2 frame exceeds 4 MiB limit";
+            }
+            break;
         }
         Http2Frame f;
         f.type = static_cast<Http2FrameType>(hdr9[3]);
@@ -514,11 +569,10 @@ Http2Response Http2Client::execute_request(
                       static_cast<uint32_t>(hdr9[8]);
         f.payload.resize(plen);
         if (plen > 0 && !read_exact(read_fn, f.payload.data(), plen)) break;
-        ++resp.frames_received;
+        ++total_frames;
 
         if (f.type == Http2FrameType::Settings) {
             if ((f.flags & 0x01u) == 0) {
-                // Reply with SETTINGS ACK
                 Http2Frame ack;
                 ack.type = Http2FrameType::Settings;
                 ack.flags = 0x01u;
@@ -526,7 +580,9 @@ Http2Response Http2Client::execute_request(
                 auto ab = pack_frame(ack);
                 write_all(write_fn, ab.data(), ab.size());
             }
-        } else if (f.type == Http2FrameType::Ping) {
+            continue;
+        }
+        if (f.type == Http2FrameType::Ping) {
             if ((f.flags & 0x01u) == 0 && f.payload.size() == 8) {
                 Http2Frame pong;
                 pong.type = Http2FrameType::Ping;
@@ -536,18 +592,27 @@ Http2Response Http2Client::execute_request(
                 auto pb = pack_frame(pong);
                 write_all(write_fn, pb.data(), pb.size());
             }
-        } else if (f.type == Http2FrameType::GoAway) {
+            continue;
+        }
+        if (f.type == Http2FrameType::GoAway) {
             break;
-        } else if (f.type == Http2FrameType::RstStream && f.stream_id == 1) {
-            resp.error = "HTTP/2 stream 1 reset by peer";
-            break;
-        } else if ((f.type == Http2FrameType::Headers || f.type == Http2FrameType::Continuation) &&
-                   f.stream_id == 1) {
+        }
+
+        auto sit = streams.find(f.stream_id);
+        if (sit == streams.end()) continue;
+        StreamState& st = sit->second;
+        Http2Response& resp = responses[st.req_index];
+        ++resp.frames_received;
+
+        if (f.type == Http2FrameType::RstStream) {
+            resp.error = "HTTP/2 stream " + std::to_string(f.stream_id) + " reset by peer";
+            if (!st.done) { st.done = true; --remaining; }
+        } else if (f.type == Http2FrameType::Headers || f.type == Http2FrameType::Continuation) {
             size_t start = 0;
             size_t end = f.payload.size();
             if (f.type == Http2FrameType::Headers) {
-                header_block.clear();
-                collecting_headers = true;
+                st.header_block.clear();
+                st.collecting_headers = true;
                 if ((f.flags & 0x08u) && start < end) { // PADDED
                     uint8_t pad = f.payload[start++];
                     if (end >= pad) end -= pad;
@@ -556,15 +621,15 @@ Http2Response Http2Client::execute_request(
                     start += 5;
                 }
             }
-            if (collecting_headers && start <= end) {
-                header_block.insert(header_block.end(),
-                                    f.payload.begin() + static_cast<ptrdiff_t>(start),
-                                    f.payload.begin() + static_cast<ptrdiff_t>(end));
+            if (st.collecting_headers && start <= end) {
+                st.header_block.insert(st.header_block.end(),
+                                       f.payload.begin() + static_cast<ptrdiff_t>(start),
+                                       f.payload.begin() + static_cast<ptrdiff_t>(end));
             }
             if (f.flags & 0x04u) { // END_HEADERS
-                collecting_headers = false;
+                st.collecting_headers = false;
                 std::vector<std::pair<std::string, std::string>> decoded;
-                if (decoder.decode_headers(header_block.data(), header_block.size(), decoded)) {
+                if (decoder.decode_headers(st.header_block.data(), st.header_block.size(), decoded)) {
                     for (const auto& [k, v] : decoded) {
                         if (k == ":status") {
                             resp.status_code = std::atoi(v.c_str());
@@ -577,9 +642,9 @@ Http2Response Http2Client::execute_request(
                 }
             }
             if (f.type == Http2FrameType::Headers && (f.flags & 0x01u)) {
-                stream_ended = true;
+                if (!st.done) { st.done = true; --remaining; }
             }
-        } else if (f.type == Http2FrameType::Data && f.stream_id == 1) {
+        } else if (f.type == Http2FrameType::Data) {
             size_t start = 0;
             size_t end = f.payload.size();
             if ((f.flags & 0x08u) && start < end) { // PADDED
@@ -589,25 +654,13 @@ Http2Response Http2Client::execute_request(
             if (start < end && resp.body.size() < 16 * 1024 * 1024) {
                 resp.body.append(reinterpret_cast<const char*>(f.payload.data() + start), end - start);
             }
-            // Replenish connection + stream flow control window for larger payloads
             if (plen > 0 && !(f.flags & 0x01u)) {
-                auto send_wu = [&](uint32_t sid, uint32_t inc) {
-                    Http2Frame wu;
-                    wu.type = Http2FrameType::WindowUpdate;
-                    wu.stream_id = sid;
-                    wu.payload = {
-                        static_cast<uint8_t>((inc >> 24) & 0x7Fu),
-                        static_cast<uint8_t>((inc >> 16) & 0xFFu),
-                        static_cast<uint8_t>((inc >> 8) & 0xFFu),
-                        static_cast<uint8_t>(inc & 0xFFu)
-                    };
-                    auto wb = pack_frame(wu);
-                    write_all(write_fn, wb.data(), wb.size());
-                };
                 send_wu(0, plen);
-                send_wu(1, plen);
+                send_wu(f.stream_id, plen);
             }
-            if (f.flags & 0x01u) stream_ended = true;
+            if (f.flags & 0x01u) {
+                if (!st.done) { st.done = true; --remaining; }
+            }
         }
     }
 
@@ -615,13 +668,21 @@ Http2Response Http2Client::execute_request(
     Http2Frame goaway;
     goaway.type = Http2FrameType::GoAway;
     goaway.stream_id = 0;
-    goaway.payload = {0, 0, 0, 1, 0, 0, 0, 0};
+    goaway.payload = {
+        static_cast<uint8_t>((last_sid >> 24) & 0x7Fu),
+        static_cast<uint8_t>((last_sid >> 16) & 0xFFu),
+        static_cast<uint8_t>((last_sid >> 8) & 0xFFu),
+        static_cast<uint8_t>(last_sid & 0xFFu),
+        0, 0, 0, 0
+    };
     auto gb = pack_frame(goaway);
     write_all(write_fn, gb.data(), gb.size());
 
-    resp.ok = (resp.status_code > 0);
-    if (!resp.ok && resp.error.empty()) resp.error = "HTTP/2 incomplete response";
-    return resp;
+    for (auto& r : responses) {
+        r.ok = (r.status_code > 0);
+        if (!r.ok && r.error.empty()) r.error = "HTTP/2 incomplete response";
+    }
+    return responses;
 }
 
 } // namespace astra

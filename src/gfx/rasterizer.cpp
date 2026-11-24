@@ -198,6 +198,52 @@ void Framebuffer::fill_rounded_rect(int x, int y, int w, int h, int radius, uint
     }
 }
 
+void Framebuffer::fill_gradient_rounded_rect(int x, int y, int w, int h, int radius,
+                                             uint32_t start_argb, uint32_t end_argb, float angle_deg) {
+    if (w <= 0 || h <= 0) return;
+    constexpr float kPi = 3.14159265358979323846f;
+    float rad = angle_deg * (kPi / 180.0f);
+    // CSS linear-gradient angle: 0deg=up, 90deg=right, 135deg=bottom-right, 180deg=down
+    float vx = std::sin(rad);
+    float vy = -std::cos(rad);
+
+    float p00 = 0.0f;
+    float p10 = static_cast<float>(w) * vx;
+    float p01 = static_cast<float>(h) * vy;
+    float p11 = p10 + p01;
+    float min_p = std::min({p00, p10, p01, p11});
+    float max_p = std::max({p00, p10, p01, p11});
+    float inv_span = (max_p - min_p > 1e-4f) ? (1.0f / (max_p - min_p)) : 0.0f;
+
+    float a0 = static_cast<float>((start_argb >> 24) & 0xFFu);
+    float r0 = static_cast<float>((start_argb >> 16) & 0xFFu);
+    float g0 = static_cast<float>((start_argb >> 8) & 0xFFu);
+    float b0 = static_cast<float>(start_argb & 0xFFu);
+
+    float a1 = static_cast<float>((end_argb >> 24) & 0xFFu);
+    float r1 = static_cast<float>((end_argb >> 16) & 0xFFu);
+    float g1 = static_cast<float>((end_argb >> 8) & 0xFFu);
+    float b1 = static_cast<float>(end_argb & 0xFFu);
+
+    int x0 = std::max(0, x), y0 = std::max(0, y);
+    int x1 = std::min(width_, x + w), y1 = std::min(height_, y + h);
+    for (int py = y0; py < y1; ++py) {
+        int ly = py - y;
+        float py_term = (static_cast<float>(ly) + 0.5f) * vy;
+        for (int px = x0; px < x1; ++px) {
+            int lx = px - x;
+            if (radius > 0 && !inside_rounded(lx, ly, w, h, radius)) continue;
+            float proj = (static_cast<float>(lx) + 0.5f) * vx + py_term;
+            float t = std::clamp((proj - min_p) * inv_span, 0.0f, 1.0f);
+            uint32_t ca = static_cast<uint32_t>(std::round(a0 + (a1 - a0) * t));
+            uint32_t cr = static_cast<uint32_t>(std::round(r0 + (r1 - r0) * t));
+            uint32_t cg = static_cast<uint32_t>(std::round(g0 + (g1 - g0) * t));
+            uint32_t cb = static_cast<uint32_t>(std::round(b0 + (b1 - b0) * t));
+            blend_pixel(px, py, (ca << 24) | (cr << 16) | (cg << 8) | cb);
+        }
+    }
+}
+
 void Framebuffer::stroke_rounded_rect(int x, int y, int w, int h, int radius, int thickness, uint32_t argb) {
     thickness = std::max(1, thickness);
     int x0 = std::max(0, x), y0 = std::max(0, y);
@@ -397,7 +443,8 @@ void Framebuffer::composite_display_list(const DisplayList& dl,
                                          const ImageProvider& image_provider,
                                          const Camera3D& cam3d,
                                          float time3d_sec,
-                                         const AudioProvider& audio_provider) {
+                                         const AudioProvider& audio_provider,
+                                         const CanvasProvider& canvas_provider) {
     clear_clip_rect();
     fill_rect(0, y_offset, width_, height_ - y_offset, dl.clear_color_argb);
 
@@ -447,6 +494,13 @@ void Framebuffer::composite_display_list(const DisplayList& dl,
                 int cy = std::max(y_offset, iy);
                 int ch = std::min(height_, iy + ih) - cy;
                 if (ch > 0) fill_rounded_rect(ix, cy, iw, ch, static_cast<int>(item.radius), item.color_argb);
+                break;
+            }
+            case DisplayItemType::FillGradient: {
+                if (iw > 0 && ih > 0) {
+                    fill_gradient_rounded_rect(ix, iy, iw, ih, static_cast<int>(item.radius),
+                                               item.color_argb, item.color2_argb, item.angle_deg);
+                }
                 break;
             }
             case DisplayItemType::StrokeRect: {
@@ -603,6 +657,23 @@ void Framebuffer::composite_display_list(const DisplayList& dl,
                 }
                 break;
             }
+            case DisplayItemType::EmbedCanvas: {
+                int cx = std::max(0, ix);
+                int cy = std::max(y_offset, iy);
+                int cw = std::min(width_ - cx, iw);
+                int ch = std::min(height_ - cy, ih);
+                CanvasBlitFrame cframe;
+                if (canvas_provider && canvas_provider(item.text, cframe) &&
+                    cframe.width > 0 && cframe.height > 0 && cframe.argb != nullptr) {
+                    blit_scaled(cx, cy, cw, ch, cframe.argb, cframe.width, cframe.height);
+                    stroke_rounded_rect(cx, cy, cw, ch, 6, 1, 0xFF334155u);
+                } else {
+                    fill_rounded_rect(cx, cy, cw, ch, 6, 0xFF0B1324u);
+                    stroke_rounded_rect(cx, cy, cw, ch, 6, 1, 0xFF334155u);
+                    draw_text(cx + 12, cy + ch / 2 - 6, "[CANVAS] #" + item.text, 0xFF64748Bu, 12.0f, false, true);
+                }
+                break;
+            }
         }
     }
     clear_clip_rect();
@@ -710,6 +781,7 @@ bool Framebuffer::present_x11_interactive(const std::string& window_title,
     auto XCreateImage = reinterpret_cast<void* (*)(void*, void*, unsigned, int, int, char*, unsigned, unsigned, int, int)>(dlsym(x11, "XCreateImage"));
     auto XPutImage = reinterpret_cast<int (*)(void*, unsigned long, void*, void*, int, int, int, int, unsigned, unsigned)>(dlsym(x11, "XPutImage"));
     auto XNextEvent = reinterpret_cast<int (*)(void*, XEv*)>(dlsym(x11, "XNextEvent"));
+    auto XPending = reinterpret_cast<int (*)(void*)>(dlsym(x11, "XPending"));
     auto XFlush = reinterpret_cast<int (*)(void*)>(dlsym(x11, "XFlush"));
     auto XCloseDisplay = reinterpret_cast<int (*)(void*)>(dlsym(x11, "XCloseDisplay"));
 
@@ -744,6 +816,13 @@ bool Framebuffer::present_x11_interactive(const std::string& window_title,
     blit_now();
     bool running = true;
     while (running) {
+        if (callbacks.on_tick && XPending && XPending(dpy) == 0) {
+            callbacks.on_tick();
+            if (callbacks.on_repaint) callbacks.on_repaint(*this);
+            blit_now();
+            usleep(16000);
+            continue;
+        }
         XEv ev{};
         XNextEvent(dpy, &ev);
         if (ev.type == 12) { // Expose

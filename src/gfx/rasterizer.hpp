@@ -45,6 +45,12 @@ struct AudioBlitCard {
     std::vector<float> waveform_peaks;
 };
 
+struct CanvasBlitFrame {
+    int width = 0;
+    int height = 0;
+    const uint32_t* argb = nullptr;
+};
+
 class Framebuffer;
 
 struct InteractiveCallbacks {
@@ -53,11 +59,13 @@ struct InteractiveCallbacks {
     std::function<void(const std::string& text)> on_text;
     std::function<void()> on_backspace;
     std::function<void()> on_enter;
+    std::function<void()> on_tick;
     std::function<void(Framebuffer& fb)> on_repaint;
 };
 
-// Astra Compositor v5: ARGB32 software compositor with Anti-Aliased TrueType (AstraFont),
-// WebRender-style per-item overflow:hidden pixel clipping, z-index layering, position:fixed pinning,
+// Astra Compositor v6: ARGB32 software compositor with Anti-Aliased TrueType (AstraFont),
+// WebRender-style per-item overflow:hidden pixel clipping, CSS linear-gradient rasterization,
+// HTML5 <canvas> 2D surface blitting (ASD5), z-index layering, position:fixed pinning,
 // soft DropShadow, interactive Chrome v4, APZ scroll_y, native PNG/JPEG/BMP/PPM <img> blitting,
 // interactive <input>, smooth Astra3D, interactive <video> scrubber + <audio> waveform card,
 // zero-dep PNG encoder, and interactive X11 window.
@@ -79,6 +87,8 @@ public:
     void blend_pixel(int x, int y, uint32_t argb);
     void fill_rect(int x, int y, int w, int h, uint32_t argb);
     void fill_rounded_rect(int x, int y, int w, int h, int radius, uint32_t argb);
+    void fill_gradient_rounded_rect(int x, int y, int w, int h, int radius,
+                                    uint32_t start_argb, uint32_t end_argb, float angle_deg);
     void stroke_rounded_rect(int x, int y, int w, int h, int radius, int thickness, uint32_t argb);
     void draw_text(int x, int y, std::string_view text, uint32_t argb, float font_size,
                    bool bold = false, bool monospace = false);
@@ -90,6 +100,7 @@ public:
     using VideoProvider = std::function<bool(const std::string& src, VideoBlitFrame& out)>;
     using ImageProvider = std::function<bool(const std::string& src, DecodedImage& out)>;
     using AudioProvider = std::function<bool(const std::string& src, AudioBlitCard& out)>;
+    using CanvasProvider = std::function<bool(const std::string& id, CanvasBlitFrame& out)>;
 
     void composite_display_list(const DisplayList& dl,
                                 int y_offset,
@@ -98,11 +109,12 @@ public:
                                 const ImageProvider& image_provider = nullptr,
                                 const Camera3D& cam3d = Camera3D{},
                                 float time3d_sec = 0.72f,
-                                const AudioProvider& audio_provider = nullptr);
+                                const AudioProvider& audio_provider = nullptr,
+                                const CanvasProvider& canvas_provider = nullptr);
 
     bool save_png(const std::string& path) const;
 
-    // Interactive Linux X11 desktop window with live Expose/Click/Scroll/Key loop.
+    // Interactive Linux X11 desktop window with live Expose/Click/Scroll/Key/rAF loop.
     bool present_x11_interactive(const std::string& window_title,
                                  const InteractiveCallbacks& callbacks);
 

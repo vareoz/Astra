@@ -68,7 +68,16 @@ private:
     size_t max_dynamic_bytes_ = 4096;
 };
 
-// AstraNet v4 Native Binary HTTP/2 Client (RFC 7540 + RFC 7541 HPACK)
+struct Http2RequestSpec {
+    std::string method = "GET";
+    std::string scheme = "https";
+    std::string authority;
+    std::string path = "/";
+    std::vector<std::pair<std::string, std::string>> extra_headers;
+    std::string body;
+};
+
+// AstraNet v5 Native Binary HTTP/2 Client (RFC 7540 Multi-Stream Multiplexing + RFC 7541 HPACK)
 class Http2Client {
 public:
     using ReadFn = std::function<int(uint8_t* buf, size_t len)>;
@@ -87,6 +96,12 @@ public:
         const std::string& path,
         const std::vector<std::pair<std::string, std::string>>& extra_headers,
         const std::string& req_body);
+
+    // Multiplex N concurrent HTTP/2 streams (stream IDs 1, 3, 5, ...) over a single TLS ALPN "h2" connection.
+    static std::vector<Http2Response> execute_multiplexed_batch(
+        const ReadFn& read_fn,
+        const WriteFn& write_fn,
+        const std::vector<Http2RequestSpec>& requests);
 };
 
 } // namespace astra

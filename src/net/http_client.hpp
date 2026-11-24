@@ -27,6 +27,7 @@ struct HttpResponse {
     bool from_cache = false;
     bool tls_verified = false;
     bool used_http2 = false;
+    bool multiplexed_h2 = false;
     bool reused_connection = false;
     PrivacyDecision privacy_decision;
 };
@@ -69,6 +70,7 @@ public:
                                           size_t max_threads = 4);
 
     size_t http2_requests() const { return http2_requests_.load(); }
+    size_t http2_multiplexed_streams() const { return http2_multiplexed_streams_.load(); }
     size_t keepalive_reuses() const { return keepalive_reuses_.load(); }
 
     static bool decompress_gzip_or_zlib(const uint8_t* data, size_t len, std::string& out);
@@ -104,6 +106,7 @@ private:
     bool strict_tls_ = true;
     bool http2_enabled_ = true;
     std::atomic<size_t> http2_requests_{0};
+    std::atomic<size_t> http2_multiplexed_streams_{0};
     std::atomic<size_t> keepalive_reuses_{0};
     mutable std::mutex state_mu_;
     std::mutex pool_mu_;

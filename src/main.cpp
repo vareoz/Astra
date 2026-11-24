@@ -44,7 +44,7 @@ void expect(bool cond, const std::string& label) {
 }
 
 int run_full_test_suite() {
-    std::cout << "=== Astra Browser Core v5 — Full Subsystem Verification Suite ===\n\n";
+    std::cout << "=== Astra Browser Core v6 — Full Subsystem Verification Suite ===\n\n";
 
     // 1. SlabArena + OS Reclamation
     {
@@ -632,6 +632,155 @@ int run_full_test_suite() {
                    "AstraMedia v4 computes 40-bar PCM waveform peaks and probes Linux ALSA output via dlopen safely");
         }
 
+        // 29. AstraNet v5: True HTTP/2 Multi-Stream Multiplexing over a Single TLS 1.3 Socket
+        {
+            std::error_code ec;
+            std::filesystem::remove_all("/tmp/astra_h2mux_test_cache", ec);
+            AstraShield msh;
+            HttpCache mhc("/tmp/astra_h2mux_test_cache", 4 * 1024 * 1024);
+            HttpClient mnet(msh, &mhc);
+            auto batch = mnet.fetch_batch({
+                "https://example.com/",
+                "https://example.com/?mux=2",
+                "https://example.com/?mux=3"
+            }, "example.com", 4);
+            expect(batch.size() == 3 &&
+                   batch[0].status_code == 200 && batch[1].status_code == 200 && batch[2].status_code == 200 &&
+                   batch[0].multiplexed_h2 && batch[1].multiplexed_h2 && batch[2].multiplexed_h2 &&
+                   mnet.http2_multiplexed_streams() >= 3,
+                   "AstraNet v5 multiplexes 3 concurrent HTTP/2 streams over a single TLS 1.3 ALPN h2 connection");
+        }
+
+        // 30. AstraJS v6: try/catch/throw Multi-Frame Stack Unwinding + ES6 for..of (Array & String)
+        {
+            SlabArena ea;
+            HtmlDocument edoc = HtmlDocument::parse(ea, "<html><body><div id=\"e\"></div></body></html>");
+            AstraJsEngine evm;
+            std::string js =
+                "function deepThrow(x) { throw \"err:\" + x; }\n"
+                "function mid(x) { return deepThrow(x); }\n"
+                "let caught = \"none\";\n"
+                "let afterTry = false;\n"
+                "try { mid(42); } catch (e) { caught = e; } finally { afterTry = true; }\n"
+                "let sum = 0;\n"
+                "for (let n of [3, 5, 7, 10]) { sum = sum + n; }\n"
+                "let chars = \"\";\n"
+                "for (let ch of \"ASTRA\") { chars = chars + ch + \"-\"; }\n";
+            auto rep = evm.execute(js, edoc);
+            std::string caught = evm.globals().count("caught") ? evm.globals().at("caught").to_string() : "";
+            double sum = evm.globals().count("sum") ? evm.globals().at("sum").to_number() : 0.0;
+            std::string chars = evm.globals().count("chars") ? evm.globals().at("chars").to_string() : "";
+            bool fin = evm.globals().count("afterTry") && evm.globals().at("afterTry").truthy();
+            expect(rep.ok && caught == "err:42" && fin && sum == 25.0 && chars == "A-S-T-R-A-",
+                   "AstraJS v6 unwinds try/catch/finally/throw across call frames and iterates Arrays & Strings via for..of");
+        }
+
+        // 31. AstraJS v6: Native HTML5 <canvas> 2D API + requestAnimationFrame Queue
+        {
+            SlabArena ca;
+            HtmlDocument cdoc = HtmlDocument::parse(
+                ca, "<html><body><canvas id=\"c1\" width=\"120\" height=\"80\"></canvas><p id=\"st\">0</p></body></html>");
+            AstraJsEngine cvm;
+            std::string js =
+                "let cv = document.querySelector(\"#c1\");\n"
+                "let ctx = cv.getContext(\"2d\");\n"
+                "ctx.fillStyle = \"#0f172a\"; ctx.fillRect(0, 0, 120, 80);\n"
+                "ctx.fillStyle = \"#ef4444\"; ctx.fillRect(10, 10, 30, 30);\n"
+                "ctx.fillStyle = \"#3b82f6\"; ctx.beginPath(); ctx.arc(75, 35, 14, 0, Math.PI * 2); ctx.fill();\n"
+                "ctx.strokeStyle = \"#38bdf8\"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(5, 70); ctx.lineTo(115, 70); ctx.stroke();\n"
+                "ctx.font = \"bold 12px monospace\"; ctx.fillStyle = \"#ffffff\"; ctx.fillText(\"OK\", 8, 62);\n"
+                "let frame = 0;\n"
+                "function tick(ts) {\n"
+                "  frame = frame + 1;\n"
+                "  ctx.fillStyle = \"#22c55e\";\n"
+                "  ctx.fillRect(10 + frame * 15, 50, 10, 10);\n"
+                "  document.querySelector(\"#st\").textContent = \"frame:\" + frame;\n"
+                "  requestAnimationFrame(tick);\n"
+                "}\n"
+                "requestAnimationFrame(tick);\n";
+            auto rep0 = cvm.execute(js, cdoc);
+            bool queued = (cvm.pending_raf_count() == 1);
+            auto rep1 = cvm.run_animation_frame(16.67, cdoc);
+            auto rep2 = cvm.run_animation_frame(33.34, cdoc);
+            const CanvasSurface* surf = cvm.find_canvas("c1");
+            uint32_t red_px = (surf && surf->argb.size() == 120u * 80u) ? surf->argb[20 * 120 + 20] : 0;
+            uint32_t blue_px = (surf && surf->argb.size() == 120u * 80u) ? surf->argb[35 * 120 + 75] : 0;
+            uint32_t green_px = (surf && surf->argb.size() == 120u * 80u) ? surf->argb[55 * 120 + 45] : 0;
+            std::string st_txt = cdoc.query_selector("#st")->text_content();
+            expect(rep0.ok && queued && rep1.raf_run == 1 && rep2.raf_run == 1 &&
+                   surf && surf->width == 120 && surf->height == 80 &&
+                   red_px == 0xFFEF4444u && blue_px == 0xFF3B82F6u && green_px == 0xFF22C55Eu &&
+                   st_txt == "frame:2",
+                   "AstraJS v6 renders native HTML5 <canvas> 2D shapes/text and steps requestAnimationFrame callbacks cleanly");
+        }
+
+        // 32. CSS Box Sizing Level 3: box-sizing: border-box vs content-box Geometry
+        {
+            SlabArena ba;
+            HtmlDocument bdoc = HtmlDocument::parse(
+                ba,
+                "<html><head><style>"
+                "body { margin: 0; padding: 0; }"
+                ".bb { box-sizing: border-box; width: 240px; height: 100px; padding: 20px; border: 4px solid #38bdf8; }"
+                ".cb { box-sizing: content-box; width: 240px; height: 100px; padding: 20px; border: 4px solid #38bdf8; }"
+                "</style></head><body><div class=\"bb\"></div><div class=\"cb\"></div></body></html>");
+            CssStylesheet bsheet;
+            bsheet.parse(bdoc.collect_stylesheets());
+            LayoutFrame* broot = LayoutEngine::build_layout(ba, bdoc, bsheet, 800.0f, 600.0f);
+            bool ok_bs = broot && broot->children.size() == 2 &&
+                         std::abs(broot->children[0]->border_box.w - 240.0f) < 0.5f &&
+                         std::abs(broot->children[0]->border_box.h - 100.0f) < 0.5f &&
+                         std::abs(broot->children[0]->content_box.w - 192.0f) < 0.5f &&
+                         std::abs(broot->children[0]->content_box.h - 52.0f) < 0.5f &&
+                         std::abs(broot->children[1]->border_box.w - 288.0f) < 0.5f &&
+                         std::abs(broot->children[1]->border_box.h - 148.0f) < 0.5f &&
+                         std::abs(broot->children[1]->content_box.w - 240.0f) < 0.5f &&
+                         std::abs(broot->children[1]->content_box.h - 100.0f) < 0.5f;
+            expect(ok_bs,
+                   "CSS box-sizing: border-box vs content-box computes exact border_box and content_box dimensions");
+        }
+
+        // 33. CSS linear-gradient(...) + ASD5 DisplayList Roundtrip + Per-Pixel Gradient Interpolation
+        {
+            SlabArena ga;
+            HtmlDocument gdoc = HtmlDocument::parse(
+                ga,
+                "<html><head><style>"
+                "body { margin: 0; padding: 0; }"
+                ".grad { width: 200px; height: 60px; background: linear-gradient(90deg, #ef4444, #3b82f6); }"
+                "</style></head><body><div class=\"grad\"></div></body></html>");
+            CssStylesheet gsheet;
+            gsheet.parse(gdoc.collect_stylesheets());
+            LayoutFrame* groot = LayoutEngine::build_layout(ga, gdoc, gsheet, 400.0f, 200.0f);
+            DisplayList gdl = LayoutEngine::build_display_list(groot, 400, 200);
+            auto blob = gdl.serialize();
+            size_t moff = 0;
+            uint32_t magic = 0;
+            bool is_asd5 = read_u32(blob, moff, magic) && magic == 0x41534435u;
+            DisplayList rt;
+            bool rt_ok = DisplayList::deserialize(blob, rt);
+            bool has_grad = false;
+            for (const auto& it : rt.items) {
+                if (it.type == DisplayItemType::FillGradient &&
+                    it.color_argb == 0xFFEF4444u && it.color2_argb == 0xFF3B82F6u &&
+                    std::abs(it.angle_deg - 90.0f) < 0.5f) {
+                    has_grad = true;
+                }
+            }
+            Framebuffer gfb(220, 80);
+            gfb.composite_display_list(rt, 0, 0.0f);
+            uint32_t left_px = gfb.pixels()[30 * 220 + 5];
+            uint32_t mid_px = gfb.pixels()[30 * 220 + 100];
+            uint32_t right_px = gfb.pixels()[30 * 220 + 195];
+            auto r_ch = [](uint32_t c) { return (c >> 16) & 0xFFu; };
+            auto b_ch = [](uint32_t c) { return c & 0xFFu; };
+            bool grad_interp = (r_ch(left_px) > 220 && b_ch(left_px) < 85 &&
+                                r_ch(mid_px) > 120 && b_ch(mid_px) > 120 &&
+                                b_ch(right_px) > 220 && r_ch(right_px) < 85);
+            expect(is_asd5 && rt_ok && has_grad && grad_interp,
+                   "CSS linear-gradient(90deg) roundtrips in ASD5 DisplayList and rasterizes smooth per-pixel RGB interpolation");
+        }
+
         app.stop_workers();
     }
 
@@ -640,7 +789,7 @@ int run_full_test_suite() {
 }
 
 int run_stress_test(int tab_count, uint64_t ceiling_mb) {
-    std::cout << "=== Astra v5 Multi-Tab Stress Test (" << tab_count << " tabs, ceiling " << ceiling_mb << " MB) ===\n";
+    std::cout << "=== Astra v6 Multi-Tab Stress Test (" << tab_count << " tabs, ceiling " << ceiling_mb << " MB) ===\n";
     BrowserApp app(ceiling_mb * 1024ULL * 1024ULL);
     app.start_workers();
 
@@ -699,14 +848,15 @@ int run_stress_test(int tab_count, uint64_t ceiling_mb) {
 
 void print_help() {
     std::cout
-        << "Astra Browser Core v5 (Native C++20 Multi-Process Engine)\n"
+        << "Astra Browser Core v6 (Native C++20 Multi-Process Engine)\n"
         << "Usage:\n"
-        << "  astra --test                                Run full Session 5 subsystem suite (33 tests)\n"
+        << "  astra --test                                Run full Session 6 subsystem suite (38 tests)\n"
         << "  astra --url <URL> [--out <file.png>]        Load URL & render PNG\n"
         << "        [--download <URL>]                    Download URL to /tmp/astra_downloads/ with SHA-256\n"
         << "        [--ext <extension_dir>]               Load Manifest V3 WebExtension (repeatable)\n"
         << "        [--scroll <px>] [--click <x,y>]       Simulate APZ scroll or mouse click before render\n"
         << "        [--type <text>] [--enter]             Type into Omnibox or focused <input> and press Enter\n"
+        << "        [--raf-step <N>]                      Step N requestAnimationFrame frames before render\n"
         << "        [--video-frame <N>] [--wireframe]     Select video frame or 3D wireframe mode\n"
         << "        [--gui]                               Open interactive Linux X11 desktop window\n"
         << "  astra --stress-tabs <N> [--cap <MB>]        Stress-test N tabs with real /proc RSS check\n"
@@ -727,6 +877,7 @@ int main(int argc, char** argv) {
     std::vector<std::pair<std::string, std::string>> cli_actions;
     bool run_tests = false, open_gui = false, run_repl = false, wireframe = false;
     int stress_tabs = 0;
+    int raf_steps = 0;
     float scroll_px = 0.0f;
     uint32_t video_frame = 12;
     uint64_t cap_mb = 2048;
@@ -745,6 +896,7 @@ int main(int argc, char** argv) {
         else if (arg == "--type" && i + 1 < argc) cli_actions.emplace_back("type", argv[++i]);
         else if (arg == "--enter") cli_actions.emplace_back("enter", "");
         else if (arg == "--scroll" && i + 1 < argc) scroll_px = std::strtof(argv[++i], nullptr);
+        else if (arg == "--raf-step" && i + 1 < argc) raf_steps = std::atoi(argv[++i]);
         else if (arg == "--video-frame" && i + 1 < argc) video_frame = static_cast<uint32_t>(std::atoi(argv[++i]));
         else if (arg == "--stress-tabs" && i + 1 < argc) stress_tabs = std::atoi(argv[++i]);
         else if (arg == "--cap" && i + 1 < argc) cap_mb = static_cast<uint64_t>(std::atoll(argv[++i]));
@@ -793,6 +945,10 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        if (raf_steps > 0) {
+            app.step_animation_frames(raf_steps);
+            std::cout << "[Astra] Stepped " << raf_steps << " requestAnimationFrame frame(s)\n";
+        }
         if (scroll_px != 0.0f) {
             app.scroll_active_tab(scroll_px);
         }
@@ -842,7 +998,7 @@ int main(int argc, char** argv) {
     }
 
     if (run_repl) {
-        std::cout << "Astra v5 Interactive Shell (open <url>, download <url>, downloads, back, forward, reload, close <id>, tabs, switch <id>, scroll <px>, click <x> <y>, type <text>, enter, mem, shield, cache, render <file.png>, quit)\n";
+        std::cout << "Astra v6 Interactive Shell (open <url>, download <url>, downloads, back, forward, reload, close <id>, tabs, switch <id>, scroll <px>, click <x> <y>, type <text>, enter, raf [N], mem, shield, cache, render <file.png>, quit)\n";
         app.new_tab("astra://home");
         std::string line;
         while (std::cout << "astra> " && std::getline(std::cin, line)) {
@@ -895,6 +1051,11 @@ int main(int argc, char** argv) {
                 std::cout << (app.type_text(txt) ? "Typed.\n" : "No focused input.\n");
             } else if (cmd == "enter") {
                 std::cout << (app.press_enter() ? "Submitted.\n" : "No focused input.\n");
+            } else if (cmd == "raf") {
+                int n = 1;
+                if (!(iss >> n) || n < 1) n = 1;
+                std::cout << (app.step_animation_frames(n) ? ("Stepped " + std::to_string(n) + " rAF frame(s).\n")
+                                                           : "No pending rAF callbacks.\n");
             } else if (cmd == "mem") {
                 auto m = app.memory_snapshot();
                 std::cout << "Total RSS: " << (m.total_rss_bytes / (1024.0 * 1024.0)) << " MB / "

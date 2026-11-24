@@ -519,10 +519,236 @@ std::vector<HttpResponse> HttpClient::fetch_batch(const std::vector<std::string>
                                                   size_t max_threads) {
     std::vector<HttpResponse> results(urls.size());
     if (urls.empty()) return results;
-    size_t workers = std::clamp<size_t>(max_threads, 1, std::min<size_t>(4, urls.size()));
-    if (workers == 1) {
+
+    std::vector<bool> done(urls.size(), false);
+
+    // Phase 1: Same-origin HTTP/2 Multi-Stream Multiplexing over a single TLS 1.3 socket
+    if (http2_enabled_ && urls.size() >= 2 && tls_available()) {
+        struct PendingItem {
+            size_t idx = 0;
+            ParsedUrl parsed;
+            std::string top_site;
+            PrivacyDecision pdec;
+            std::vector<std::pair<std::string, std::string>> extra_hdrs;
+        };
+        std::map<std::string, std::vector<PendingItem>> origin_groups;
+
         for (size_t i = 0; i < urls.size(); ++i) {
-            results[i] = get(urls[i], top_level_site, false);
+            ParsedUrl prelim = parse_url(urls[i]);
+            std::string top_site = top_level_site.empty() && prelim.valid
+                                       ? prelim.registrable_domain()
+                                       : top_level_site;
+            PrivacyDecision pdec;
+            {
+                std::lock_guard<std::mutex> lk(state_mu_);
+                pdec = shield_.inspect_request(urls[i], top_site, false);
+            }
+            if (pdec.blocked) {
+                results[i].final_url = pdec.sanitized_url;
+                results[i].blocked_by_privacy = true;
+                results[i].privacy_decision = pdec;
+                results[i].error = pdec.reason;
+                done[i] = true;
+                continue;
+            }
+            std::vector<std::pair<std::string, std::string>> ext_hdrs;
+            if (dnr_hook_) {
+                DnrHookResult dnr;
+                {
+                    std::lock_guard<std::mutex> lk(state_mu_);
+                    dnr = dnr_hook_(pdec.sanitized_url, top_site);
+                }
+                if (dnr.block) {
+                    results[i].final_url = pdec.sanitized_url;
+                    results[i].blocked_by_extension = true;
+                    results[i].privacy_decision = pdec;
+                    results[i].error = "Blocked by WebExtension DNR: " + dnr.rule_source;
+                    done[i] = true;
+                    continue;
+                }
+                if (!dnr.redirect_url.empty()) continue; // Let regular get() handle redirects
+                ext_hdrs = std::move(dnr.add_headers);
+            }
+            if (cache_) {
+                CachedResource cached;
+                bool hit = false;
+                {
+                    std::lock_guard<std::mutex> lk(state_mu_);
+                    hit = cache_->lookup(pdec.sanitized_url, cached);
+                }
+                if (hit) {
+                    results[i].status_code = 200;
+                    results[i].final_url = pdec.sanitized_url;
+                    results[i].content_type = cached.content_type;
+                    results[i].body = std::move(cached.body);
+                    results[i].from_cache = true;
+                    results[i].tls_verified = (pdec.sanitized_url.rfind("https://", 0) == 0);
+                    results[i].privacy_decision = pdec;
+                    done[i] = true;
+                    continue;
+                }
+            }
+            ParsedUrl pu = parse_url(pdec.sanitized_url);
+            if (pu.valid && pu.scheme == "https") {
+                uint16_t port = pu.port ? pu.port : 443;
+                std::string gkey = pu.host + ":" + std::to_string(port);
+                origin_groups[gkey].push_back(PendingItem{i, std::move(pu), std::move(top_site), pdec, std::move(ext_hdrs)});
+            }
+        }
+
+        auto& ssl_api = openssl();
+        for (auto& [gkey, items] : origin_groups) {
+            if (items.size() < 2) continue;
+            const std::string& host = items[0].parsed.host;
+            uint16_t port = items[0].parsed.port ? items[0].parsed.port : 443;
+
+            PooledConn conn;
+            conn.key = gkey + ":tls";
+            conn.fd = connect_tcp(host, port);
+            if (conn.fd < 0) continue;
+
+            conn.ctx = ssl_api.SSL_CTX_new(ssl_api.TLS_client_method());
+            if (conn.ctx && strict_tls_ && ssl_api.SSL_CTX_set_default_verify_paths && ssl_api.SSL_CTX_set_verify) {
+                ssl_api.SSL_CTX_set_default_verify_paths(conn.ctx);
+                ssl_api.SSL_CTX_set_verify(conn.ctx, OpenSslApi::kSslVerifyPeer, nullptr);
+            }
+            if (conn.ctx && ssl_api.SSL_CTX_set_alpn_protos) {
+                static const unsigned char kAlpnH2[] = {2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+                ssl_api.SSL_CTX_set_alpn_protos(conn.ctx, kAlpnH2, sizeof(kAlpnH2));
+            }
+            conn.ssl = conn.ctx ? ssl_api.SSL_new(conn.ctx) : nullptr;
+            if (!conn.ctx || !conn.ssl) {
+                close_conn(conn);
+                continue;
+            }
+            ssl_api.SSL_set_fd(conn.ssl, conn.fd);
+            ssl_api.SSL_ctrl(conn.ssl, OpenSslApi::kSslCtrlSetTlsextHostname,
+                             OpenSslApi::kTlsextNametypeHostName,
+                             const_cast<char*>(host.c_str()));
+            if (strict_tls_ && ssl_api.SSL_set1_host) {
+                ssl_api.SSL_set1_host(conn.ssl, host.c_str());
+            }
+            if (ssl_api.SSL_connect(conn.ssl) != 1) {
+                close_conn(conn);
+                continue;
+            }
+            if (ssl_api.SSL_get_verify_result) conn.tls_verified = (ssl_api.SSL_get_verify_result(conn.ssl) == 0);
+            if (ssl_api.SSL_get_version) {
+                const char* ver = ssl_api.SSL_get_version(conn.ssl);
+                if (ver) conn.tls_version = ver;
+            }
+            if (ssl_api.SSL_get0_alpn_selected) {
+                const unsigned char* proto = nullptr;
+                unsigned int plen = 0;
+                ssl_api.SSL_get0_alpn_selected(conn.ssl, &proto, &plen);
+                if (proto && plen > 0) conn.alpn.assign(reinterpret_cast<const char*>(proto), plen);
+            }
+
+            if (conn.alpn != "h2") {
+                // Server chose HTTP/1.1 — save socket in keep-alive pool and fall through to Phase 2
+                return_pooled(std::move(conn));
+                continue;
+            }
+
+            std::vector<Http2RequestSpec> specs;
+            specs.reserve(items.size());
+            std::vector<std::pair<std::string, std::string>> hardened;
+            {
+                std::lock_guard<std::mutex> lk(state_mu_);
+                hardened = shield_.hardened_headers();
+            }
+
+            for (const auto& item : items) {
+                Http2RequestSpec sp;
+                sp.method = "GET";
+                sp.scheme = "https";
+                sp.authority = item.parsed.host;
+                sp.path = item.parsed.path.empty() ? "/" : item.parsed.path;
+                if (!item.parsed.query.empty()) sp.path += "?" + item.parsed.query;
+                for (const auto& kv : hardened) sp.extra_headers.push_back(kv);
+                for (const auto& kv : item.extra_hdrs) sp.extra_headers.push_back(kv);
+                std::string cookies;
+                {
+                    std::lock_guard<std::mutex> lk(state_mu_);
+                    cookies = shield_.cookie_header_for(item.top_site, item.parsed.origin(), true);
+                }
+                if (!cookies.empty()) sp.extra_headers.emplace_back("cookie", cookies);
+                specs.push_back(std::move(sp));
+            }
+
+            auto h2_resps = Http2Client::execute_multiplexed_batch(
+                [&](uint8_t* b, size_t l) { return ssl_api.SSL_read(conn.ssl, b, static_cast<int>(l)); },
+                [&](const uint8_t* b, size_t l) { return ssl_api.SSL_write(conn.ssl, b, static_cast<int>(l)); },
+                specs);
+
+            close_conn(conn);
+
+            for (size_t k = 0; k < items.size() && k < h2_resps.size(); ++k) {
+                auto& h2 = h2_resps[k];
+                if (!h2.ok || (h2.status_code >= 300 && h2.status_code < 400)) {
+                    continue; // Fall back to regular get() for redirects or errors
+                }
+                const auto& item = items[k];
+                HttpResponse& r = results[item.idx];
+                r.final_url = item.parsed.rebuild();
+                r.status_code = h2.status_code;
+                r.headers = std::move(h2.headers);
+                r.tls_verified = conn.tls_verified;
+                r.tls_version = conn.tls_version;
+                r.alpn_protocol = "h2";
+                r.used_http2 = true;
+                r.multiplexed_h2 = true;
+                r.privacy_decision = item.pdec;
+                http2_requests_.fetch_add(1);
+                http2_multiplexed_streams_.fetch_add(1);
+
+                for (const auto& sc : h2.set_cookies) {
+                    std::lock_guard<std::mutex> lk(state_mu_);
+                    shield_.store_cookie(item.top_site, item.parsed.origin(), sc);
+                }
+                std::string body_raw = std::move(h2.body);
+                if (r.headers.count("content-encoding")) {
+                    std::string enc = to_lower(r.headers["content-encoding"]);
+                    if (enc.find("gzip") != std::string::npos || enc.find("deflate") != std::string::npos) {
+                        std::string inflated;
+                        if (decompress_gzip_or_zlib(reinterpret_cast<const uint8_t*>(body_raw.data()),
+                                                    body_raw.size(), inflated)) {
+                            body_raw = std::move(inflated);
+                        }
+                    }
+                }
+                r.content_type = r.headers.count("content-type") ? r.headers["content-type"] : "text/html";
+                r.body = std::move(body_raw);
+
+                if (cache_ && r.status_code == 200 && !r.body.empty()) {
+                    std::string cc = r.headers.count("cache-control") ? to_lower(r.headers["cache-control"]) : "";
+                    if (cc.find("no-store") == std::string::npos) {
+                        CachedResource cr;
+                        cr.url = r.final_url;
+                        cr.content_type = r.content_type;
+                        cr.etag = r.headers.count("etag") ? r.headers["etag"] : "";
+                        cr.body = r.body;
+                        cr.max_age_sec = 300;
+                        std::lock_guard<std::mutex> lk(state_mu_);
+                        cache_->store(cr);
+                    }
+                }
+                done[item.idx] = true;
+            }
+        }
+    }
+
+    // Phase 2: Bounded worker pool (max 4 threads) for any remaining non-multiplexed URLs
+    std::vector<size_t> remaining_indices;
+    for (size_t i = 0; i < urls.size(); ++i) {
+        if (!done[i]) remaining_indices.push_back(i);
+    }
+    if (remaining_indices.empty()) return results;
+
+    size_t workers = std::clamp<size_t>(max_threads, 1, std::min<size_t>(4, remaining_indices.size()));
+    if (workers == 1) {
+        for (size_t idx : remaining_indices) {
+            results[idx] = get(urls[idx], top_level_site, false);
         }
         return results;
     }
@@ -533,9 +759,10 @@ std::vector<HttpResponse> HttpClient::fetch_batch(const std::vector<std::string>
     for (size_t w = 0; w < workers; ++w) {
         pool.emplace_back([&]() {
             for (;;) {
-                size_t i = next_idx.fetch_add(1);
-                if (i >= urls.size()) break;
-                results[i] = get(urls[i], top_level_site, false);
+                size_t k = next_idx.fetch_add(1);
+                if (k >= remaining_indices.size()) break;
+                size_t idx = remaining_indices[k];
+                results[idx] = get(urls[idx], top_level_site, false);
             }
         });
     }

@@ -35,13 +35,17 @@ enum class DisplayItemType : uint32_t {
     DrawImage = 6,
     DrawInput = 7,
     DropShadow = 8,
-    EmbedAudio = 9
+    EmbedAudio = 9,
+    FillGradient = 10,
+    EmbedCanvas = 11
 };
 
 struct DisplayItem {
     DisplayItemType type = DisplayItemType::FillRect;
     Rect rect;
     uint32_t color_argb = 0xFFFFFFFF;
+    uint32_t color2_argb = 0xFFFFFFFF;
+    float angle_deg = 180.0f;
     float radius = 0.0f;
     float thickness = 1.0f;
     float font_size = 14.0f;

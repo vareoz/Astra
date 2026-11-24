@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Astra Sesión 6 — Canvas 2D, Gradientes CSS y HTTP/2 Multiplexado</title>
+  <style>
+    body {
+      background: #090e1a;
+      color: #e2e8f0;
+      padding: 16px 24px;
+      margin: 0;
+    }
+    .hero {
+      box-sizing: border-box;
+      background: linear-gradient(135deg, #0f172a, #1e3a5f);
+      border: 1px solid #2b4c7e;
+      border-radius: 12px;
+      padding: 14px 20px;
+      margin-bottom: 14px;
+      box-shadow: 0 6px 16px rgba(0, 0, 0, 0.45);
+    }
+    .kicker {
+      color: #38bdf8;
+      font-size: 11px;
+      font-weight: bold;
+      font-family: monospace;
+      margin-bottom: 4px;
+    }
+    h1 {
+      color: #f8fafc;
+      font-size: 22px;
+      margin: 0 0 6px 0;
+    }
+    .subtitle {
+      color: #cbd5e1;
+      font-size: 13px;
+      margin: 0;
+    }
+    .main-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    .panel {
+      box-sizing: border-box;
+      background: #111827;
+      border: 1px solid #1e293b;
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin-bottom: 12px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+    }
+    .panel-title {
+      color: #7dd3fc;
+      font-size: 12px;
+      font-weight: bold;
+      font-family: monospace;
+      margin-bottom: 8px;
+    }
+    .status-line {
+      color: #34d399;
+      font-size: 12px;
+      font-family: monospace;
+      margin: 8px 0 0 0;
+    }
+    .grad-cards {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .gcard-emerald {
+      box-sizing: border-box;
+      background: linear-gradient(135deg, #064e3b, #0f766e);
+      border: 1px solid #14b8a6;
+      border-radius: 10px;
+      padding: 12px 14px;
+      height: 86px;
+    }
+    .gcard-indigo {
+      box-sizing: border-box;
+      background: linear-gradient(135deg, #1e1b4b, #1d4ed8);
+      border: 1px solid #60a5fa;
+      border-radius: 10px;
+      padding: 12px 14px;
+      height: 86px;
+    }
+    .gcard-lbl {
+      color: #e2e8f0;
+      font-size: 11px;
+      font-weight: bold;
+      font-family: monospace;
+      margin-bottom: 4px;
+    }
+    .gcard-val {
+      color: #ffffff;
+      font-size: 17px;
+      font-weight: bold;
+      margin-bottom: 2px;
+    }
+    .gcard-sub {
+      color: #cbd5e1;
+      font-size: 11px;
+    }
+    .js-box {
+      box-sizing: border-box;
+      background: linear-gradient(90deg, #132238, #1e293b);
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 12px 14px;
+    }
+    .mono-out {
+      color: #f8fafc;
+      font-size: 12px;
+      font-family: monospace;
+      margin: 4px 0 0 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="hero">
+    <div class="kicker">ASTRA BROWSER v6 | H2 MULTI-STREAM MUX | HTML5 CANVAS 2D + rAF | TRY/CATCH + FOR..OF | LINEAR-GRADIENT</div>
+    <h1>Astra Sesión 6 — Motor Nativo C++20</h1>
+    <p class="subtitle">Multiplexación HTTP/2 en un solo socket TLS 1.3 ALPN, Canvas 2D con animación requestAnimationFrame, box-sizing: border-box y gradientes CSS en ASD5.</p>
+  </div>
+
+  <div class="main-grid">
+    <div>
+      <div class="panel">
+        <div class="panel-title">HTML5 &lt;CANVAS&gt; 2D API + REQUESTANIMATIONFRAME (ASTRAJS v6)</div>
+        <canvas id="telemetry-canvas" width="560" height="215" style="width: 560px; height: 215px;"></canvas>
+        <p id="raf-status" class="status-line">Inicializando bucle de telemetría...</p>
+      </div>
+
+      <div class="js-box">
+        <div class="panel-title">ASTRAJS v6 — TRY / CATCH / THROW + BUCLES FOR..OF</div>
+        <p id="js-v6-try" class="mono-out">Esperando ejecución...</p>
+        <p id="js-v6-forof" class="mono-out">Esperando iteradores...</p>
+      </div>
+    </div>
+
+    <div>
+      <div class="grad-cards">
+        <div class="gcard-emerald">
+          <div class="gcard-lbl">BOX-SIZING: BORDER-BOX</div>
+          <div class="gcard-val">100% Exacto</div>
+          <div class="gcard-sub">linear-gradient(135deg)</div>
+        </div>
+        <div class="gcard-indigo">
+          <div class="gcard-lbl">HTTP/2 MULTIPLEXADO</div>
+          <div class="gcard-val">1 Socket TLS 1.3</div>
+          <div class="gcard-sub">Streams 1, 3, 5... en paralelo</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">ASTRA3D v2 — TOROIDE SUAVIZADO EN TIEMPO REAL</div>
+        <astra-3d scene="torus" style="height: 175px;"></astra-3d>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">ASTRAMEDIA v4 — ONDA PCM NATIVA + ALSA</div>
+        <audio src="astra_chime.wav"></audio>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // 1. Verificación de try/catch/throw con desenrollado multi-frame y for..of
+    function validarPresupuesto(mb) {
+      if (mb > 2048) {
+        throw "LimiteRAMExcedido(" + mb + "MB)";
+      }
+      return "OK";
+    }
+
+    function verificarSistema(mb) {
+      return validarPresupuesto(mb);
+    }
+
+    let resultadoTry = "sin-error";
+    try {
+      verificarSistema(4096);
+    } catch (err) {
+      resultadoTry = "Capturado multi-frame -> " + err;
+    }
+    document.querySelector("#js-v6-try").textContent = "[try/catch] " + resultadoTry;
+
+    let subsistemas = ["H2-Mux", "Canvas2D", "rAF", "ASD5"];
+    let resumen = "";
+    for (let s of subsistemas) {
+      resumen = resumen + "[" + s + "] ";
+    }
+    let sigla = "";
+    for (let ch of "ASTRA") {
+      sigla = sigla + ch + ".";
+    }
+    document.querySelector("#js-v6-forof").textContent = "[for..of] " + resumen + "| " + sigla;
+
+    // 2. Gráfica de telemetría nativa en <canvas> 2D + requestAnimationFrame
+    let canvas = document.querySelector("#telemetry-canvas");
+    let ctx = canvas.getContext("2d");
+    let frameNum = 0;
+
+    function dibujarTelemetria(ts) {
+      frameNum = frameNum + 1;
+      let W = 560;
+      let H = 215;
+
+      // Fondo oscuro del lienzo
+      ctx.fillStyle = "#080f1e";
+      ctx.fillRect(0, 0, W, H);
+
+      // Rejilla horizontal sutil
+      ctx.strokeStyle = "#1e293b";
+      ctx.lineWidth = 1;
+      for (let gy = 40; gy < H - 20; gy = gy + 36) {
+        ctx.beginPath();
+        ctx.moveTo(20, gy);
+        ctx.lineTo(W - 20, gy);
+        ctx.stroke();
+      }
+
+      // Barras de rendimiento por stream HTTP/2 (iteradas con for..of)
+      let valores = [42, 68, 54, 88, 76, 94, 62, 82];
+      let bx = 34;
+      let idx = 0;
+      for (let v of valores) {
+        let wave = Math.sin(frameNum * 0.45 + idx * 0.8) * 10;
+        let bh = Math.max(16, v + wave);
+        ctx.fillStyle = (idx % 2 === 0) ? "#0ea5e9" : "#10b981";
+        ctx.fillRect(bx, H - 28 - bh, 36, bh);
+        ctx.strokeStyle = "#0f172a";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(bx, H - 28 - bh, 36, bh);
+        ctx.font = "11px monospace";
+        ctx.fillStyle = "#94a3b8";
+        let sid = idx * 2 + 1;
+        ctx.fillText("S" + sid, bx + (sid < 10 ? 11 : 7), H - 10);
+        bx = bx + 64;
+        idx = idx + 1;
+      }
+
+      // Curva sinusoidal de latencia (beginPath / moveTo / lineTo / stroke)
+      ctx.strokeStyle = "#facc15";
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      for (let x = 24; x <= W - 24; x = x + 12) {
+        let phase = (x / 52) + frameNum * 0.35;
+        let y = 76 + Math.sin(phase) * 28 + Math.cos(phase * 0.5) * 10;
+        if (x === 24) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+
+      // Nodos circulares destacados (arc + fill)
+      for (let k = 0; k < 5; k = k + 1) {
+        let nx = 68 + k * 106;
+        let nphase = (nx / 52) + frameNum * 0.35;
+        let ny = 76 + Math.sin(nphase) * 28 + Math.cos(nphase * 0.5) * 10;
+        ctx.fillStyle = "#38bdf8";
+        ctx.beginPath();
+        ctx.arc(nx, ny, 5.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // Etiqueta principal TrueType anti-aliased
+      ctx.font = "bold 13px monospace";
+      ctx.fillStyle = "#f8fafc";
+      ctx.fillText("TELEMETRIA H2 + CANVAS 2D | FRAME #" + frameNum, 20, 22);
+
+      document.querySelector("#raf-status").textContent =
+        "rAF activo: Frame #" + frameNum + " | t=" + Math.round(ts) + "ms | Canvas 560x215 ARGB32";
+
+      requestAnimationFrame(dibujarTelemetria);
+    }
+
+    // Primer render inmediato y registro en cola rAF
+    dibujarTelemetria(0);
+  </script>
+</body>
+</html>

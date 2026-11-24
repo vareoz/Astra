@@ -232,9 +232,73 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
         st.padding.left = StyleEngine::parse_px(v);
     } else if (p == "padding-right") {
         st.padding.right = StyleEngine::parse_px(v);
-    } else if (p == "background" || p == "background-color") {
-        auto toks = split_ws(v);
-        if (!toks.empty()) st.background = StyleEngine::parse_color(toks[0], st.background);
+    } else if (p == "background" || p == "background-color" || p == "background-image") {
+        size_t lg = vl.find("linear-gradient(");
+        if (lg != std::string::npos) {
+            size_t start = lg + 16;
+            int depth = 1;
+            size_t end = start;
+            while (end < v.size() && depth > 0) {
+                if (v[end] == '(') ++depth;
+                else if (v[end] == ')') --depth;
+                if (depth > 0) ++end;
+            }
+            std::string inner = v.substr(start, end - start);
+            // Split top-level comma-separated args (preserving rgb(...) / rgba(...) commas)
+            std::vector<std::string> args;
+            int pd = 0;
+            size_t seg = 0;
+            for (size_t i = 0; i <= inner.size(); ++i) {
+                if (i < inner.size()) {
+                    if (inner[i] == '(') ++pd;
+                    else if (inner[i] == ')') --pd;
+                }
+                if (i == inner.size() || (inner[i] == ',' && pd == 0)) {
+                    std::string tok = trim(inner.substr(seg, i - seg));
+                    if (!tok.empty()) args.push_back(std::move(tok));
+                    seg = i + 1;
+                }
+            }
+            if (args.size() >= 2) {
+                float angle = 180.0f;
+                size_t color_idx = 0;
+                std::string a0 = to_lower(args[0]);
+                if (a0.find("deg") != std::string::npos) {
+                    angle = std::strtof(a0.c_str(), nullptr);
+                    color_idx = 1;
+                } else if (a0.rfind("to ", 0) == 0) {
+                    if (a0.find("right") != std::string::npos && a0.find("bottom") != std::string::npos) angle = 135.0f;
+                    else if (a0.find("right") != std::string::npos && a0.find("top") != std::string::npos) angle = 45.0f;
+                    else if (a0.find("left") != std::string::npos && a0.find("bottom") != std::string::npos) angle = 225.0f;
+                    else if (a0.find("left") != std::string::npos && a0.find("top") != std::string::npos) angle = 315.0f;
+                    else if (a0.find("right") != std::string::npos) angle = 90.0f;
+                    else if (a0.find("left") != std::string::npos) angle = 270.0f;
+                    else if (a0.find("top") != std::string::npos) angle = 0.0f;
+                    else angle = 180.0f;
+                    color_idx = 1;
+                }
+                if (color_idx + 1 < args.size()) {
+                    auto strip_stop = [](const std::string& s) {
+                        if (s.find('(') != std::string::npos) {
+                            size_t rp = s.find(')');
+                            return rp != std::string::npos ? s.substr(0, rp + 1) : s;
+                        }
+                        auto parts = split_ws(s);
+                        return parts.empty() ? s : parts[0];
+                    };
+                    st.background_gradient.enabled = true;
+                    st.background_gradient.angle_deg = angle;
+                    st.background_gradient.start = StyleEngine::parse_color(strip_stop(args[color_idx]), Color{15, 23, 42, 255});
+                    st.background_gradient.end = StyleEngine::parse_color(strip_stop(args.back()), Color{30, 58, 138, 255});
+                }
+            }
+        } else if (p != "background-image") {
+            st.background_gradient.enabled = false;
+            auto toks = split_ws(v);
+            if (!toks.empty()) st.background = StyleEngine::parse_color(toks[0], st.background);
+        }
+    } else if (p == "box-sizing") {
+        st.box_sizing = (vl == "border-box") ? BoxSizing::BorderBox : BoxSizing::ContentBox;
     } else if (p == "color") {
         st.color = StyleEngine::parse_color(v, st.color);
     } else if (p == "border") {

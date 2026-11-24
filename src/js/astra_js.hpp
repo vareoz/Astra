@@ -37,7 +37,7 @@ struct JsValue {
     double to_number() const;
 };
 
-// Bytecode instruction set for AstraJS v2 Stack VM
+// Bytecode instruction set for AstraJS v6 Stack VM
 enum class OpCode : uint8_t {
     PushConst,
     LoadLocal,
@@ -68,6 +68,9 @@ enum class OpCode : uint8_t {
     CallMethod,
     Await,
     MakeClosure,
+    PushTry,
+    PopTry,
+    Throw,
     Return,
     Halt
 };
@@ -85,9 +88,48 @@ struct BytecodeChunk {
     std::vector<std::string> local_names;
 };
 
-// Mark-and-Sweep GC-managed heap object (Array, Object, Function, Promise)
+// Bounded ARGB32 offscreen 2D Canvas backing store (max 1024x1024 = 4 MiB)
+struct CanvasSurface {
+    static constexpr int kMaxDim = 1024;
+
+    struct PathPoint {
+        float x = 0.0f;
+        float y = 0.0f;
+        bool move_to = false;
+    };
+
+    int width = 300;
+    int height = 150;
+    std::vector<uint32_t> argb;
+
+    uint32_t fill_color = 0xFFFFFFFFu;
+    uint32_t stroke_color = 0xFF38BDF8u;
+    float line_width = 1.5f;
+    float font_size = 13.0f;
+    bool font_bold = false;
+    bool font_mono = false;
+    std::vector<PathPoint> path;
+
+    void resize(int w, int h);
+    void blend_pixel(int x, int y, uint32_t c);
+    void clear_rect(float x, float y, float w, float h);
+    void fill_rect(float x, float y, float w, float h);
+    void stroke_rect(float x, float y, float w, float h);
+    void begin_path();
+    void move_to(float x, float y);
+    void line_to(float x, float y);
+    void close_path();
+    void arc(float cx, float cy, float r, float start_rad, float end_rad);
+    void fill_path();
+    void stroke_path();
+    void fill_text(std::string_view text, float x, float y);
+
+    static uint32_t parse_css_color(std::string_view s, uint32_t fallback);
+};
+
+// Mark-and-Sweep GC-managed heap object (Array, Map, Function, Promise, Canvas2D)
 struct GcObject {
-    enum class Type { Array, Map, Function, Promise };
+    enum class Type { Array, Map, Function, Promise, Canvas2D };
     enum class PromiseState : uint8_t { Pending, Fulfilled, Rejected };
     struct PromiseReaction {
         GcObject* next = nullptr;
@@ -109,8 +151,9 @@ struct GcObject {
     bool is_async = false;
     std::shared_ptr<std::unordered_map<std::string, JsValue>> closure_env;
 
-    // DOM classList proxy target
+    // DOM classList proxy target & Canvas2D binding
     DomNode* classlist_node = nullptr;
+    std::string canvas_id;
 
     // Promise fields
     PromiseState promise_state = PromiseState::Pending;
@@ -133,6 +176,7 @@ struct JsExecutionReport {
     size_t bytecode_size = 0;
     size_t microtasks_run = 0;
     size_t timers_run = 0;
+    size_t raf_run = 0;
     GcStats gc;
 };
 
@@ -145,10 +189,11 @@ struct JsFetchResult {
     bool blocked_by_shield = false;
 };
 
-// AstraJS v4: Lexer -> Recursive-Descent Compiler -> Stack Bytecode VM
-// + Mark-and-Sweep GC + Microtask/Timer Event Loop + Real Promise (.then/.catch/.finally/Promise.all)
-// + DOM Events + Web APIs: fetch() (GET/POST via AstraShield/HttpCache), JSON, localStorage,
-// + WebExtension chrome.storage.local / browser.storage.local.
+// AstraJS v6: Lexer -> Recursive-Descent Compiler -> Stack Bytecode VM
+// + try/catch/throw stack unwinding + for..of + async/await + lexical closures
+// + Mark-and-Sweep GC + Microtask/Timer/requestAnimationFrame Event Loop
+// + HTML5 <canvas> 2D API (bounded ARGB32 CanvasSurface) + Real Promises
+// + DOM Events/innerHTML/classList + fetch() + JSON + localStorage + MV3 storage.
 class AstraJsEngine {
 public:
     using StorageGetFn = std::function<std::string(const std::string&)>;
@@ -169,6 +214,13 @@ public:
 
     // Dispatch a real DOM event (e.g. "click", "input", "submit") to registered JS bytecode handlers
     JsExecutionReport dispatch_event(DomNode* target, const std::string& event_name, HtmlDocument& doc);
+
+    // Execute one queued requestAnimationFrame batch (callbacks may re-enqueue for the next frame)
+    JsExecutionReport run_animation_frame(double timestamp_ms, HtmlDocument& doc);
+    size_t pending_raf_count() const { return raf_callbacks_.size(); }
+
+    // Lookup offscreen <canvas> surface by element id (or "canvas" fallback)
+    const CanvasSurface* find_canvas(const std::string& id) const;
 
     // Trigger explicit Mark-and-Sweep Garbage Collection cycle
     size_t gc_collect();
@@ -223,6 +275,13 @@ private:
     std::vector<JsValue> stack_;
     std::vector<MicrotaskEntry> microtasks_;
     std::vector<TimerEntry> timers_;
+    std::vector<JsValue> raf_callbacks_;
+    uint32_t raf_id_counter_ = 0;
+
+    bool exception_active_ = false;
+    JsValue exception_value_;
+
+    std::unordered_map<std::string, CanvasSurface> canvases_;
     // DOM event listeners: (node_ptr, event_name) -> callbacks
     std::map<std::pair<DomNode*, std::string>, std::vector<JsValue>> listeners_;
     std::unordered_map<std::string, std::string> local_storage_;

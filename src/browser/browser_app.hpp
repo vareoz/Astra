@@ -88,13 +88,13 @@ struct ClickResult {
     std::string detail;
 };
 
-// Astra v4 Multi-Process Desktop Browser Coordinator:
+// Astra v6 Multi-Process Desktop Browser Coordinator:
 // - Main + Content + RDD Media workers over AF_UNIX IPC
 // - Hard <= 2 GB RAM governor + LRU Tab Dehydration + 32 MiB HttpCache
 // - Interactive Chrome v4 (Omnibox, Back/Forward/Reload, [+]/[x] tabs, History stack)
-// - Strict TLS + ALPN + parallel batch subresources + AstraShield + Multi-Extension MV3
-// - AstraJS v4 Bytecode VM (Promises, GC, fetch GET/POST, JSON, disk-persisted localStorage)
-// - CSS Grid + position:absolute/fixed + z-index + box-shadow + AstraFont + JPEG/PNG + Astra3D + AstraMedia v3
+// - AstraNet v5: True HTTP/2 multi-stream multiplexing over single TLS 1.3 ALPN h2 + AstraShield + Multi-Ext MV3
+// - AstraJS v6 Bytecode VM (try/catch/throw, for..of, async/await, closures, rAF, HTML5 <canvas> 2D, Promises, GC, fetch)
+// - CSS3 v6 (box-sizing:border-box, linear-gradient, Grid, @media, overflow:hidden, ASD5) + AstraFont + Astra3D + AstraMedia v4
 class BrowserApp {
 public:
     explicit BrowserApp(uint64_t ram_ceiling_bytes = MemoryGovernor::kDefaultCeilingBytes);
@@ -128,6 +128,7 @@ public:
     void set_3d_camera(const Camera3D& cam) { cam3d_ = cam; }
     void set_video_frame(uint32_t idx) { video_frame_idx_ = idx; }
     uint32_t video_frame() const { return video_frame_idx_; }
+    bool step_animation_frames(int count = 1, double dt_ms = 16.67);
 
     bool paint_active_tab(Framebuffer& fb);
     bool render_active_tab(const std::string& out_png_path,
@@ -207,6 +208,7 @@ private:
 
     Camera3D cam3d_;
     float time3d_sec_ = 0.72f;
+    double raf_clock_ms_ = 0.0;
     uint32_t video_frame_idx_ = 12;
     uint32_t last_video_total_frames_ = 48;
 };

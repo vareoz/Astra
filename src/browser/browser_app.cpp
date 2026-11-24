@@ -144,30 +144,30 @@ std::string build_downloads_html(const std::vector<DownloadRecord>& downloads) {
 
 std::string build_home_html(const AstraShield& shield, size_t ext_count,
                             const MemorySnapshot& mem, const CacheStats& cstats,
-                            size_t h2_count, size_t dl_count) {
+                            size_t h2_count, size_t h2_mux_count, size_t dl_count) {
     std::ostringstream html;
-    html << "<!doctype html><html><head><title>Astra Browser v5 — Native Core</title>"
+    html << "<!doctype html><html><head><title>Astra Browser v6 — Native Core</title>"
          << "<style>"
-         << "body { background: #0b0f19; color: #e2e8f0; padding: 18px 26px; }"
-         << ".hero { background: #111827; border: 1px solid #1e293b; border-radius: 12px; padding: 16px 22px; margin-bottom: 14px; box-shadow: 0 6px 16px rgba(0,0,0,0.45); }"
+         << "body { background: #0b0f19; color: #e2e8f0; padding: 14px 24px; }"
+         << ".hero { box-sizing: border-box; background: linear-gradient(135deg, #0f172a, #1e3a5f); border: 1px solid #2b4c7e; border-radius: 12px; padding: 14px 20px; margin-bottom: 12px; box-shadow: 0 6px 16px rgba(0,0,0,0.45); }"
          << ".kicker { color: #38bdf8; font-size: 12px; font-weight: bold; font-family: monospace; margin-bottom: 6px; }"
-         << ".grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 14px; }"
-         << ".card { background: #131c2e; border: 1px solid #24324a; border-radius: 10px; padding: 14px; box-shadow: 0 4px 12px rgba(0,0,0,0.35); }"
+         << ".grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 12px; }"
+         << ".card { box-sizing: border-box; background: #131c2e; border: 1px solid #24324a; border-radius: 10px; padding: 12px 14px; box-shadow: 0 4px 12px rgba(0,0,0,0.35); }"
          << ".card-title { color: #7dd3fc; font-size: 12px; font-weight: bold; font-family: monospace; margin-bottom: 6px; }"
          << ".metric { color: #f8fafc; font-size: 20px; font-weight: bold; margin-bottom: 4px; }"
          << ".muted { color: #94a3b8; font-size: 12px; }"
          << ".media-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }"
-         << ".panel { background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.35); }"
+         << ".panel { box-sizing: border-box; background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.35); }"
          << "</style></head><body>"
          << "<div class=\"hero\">"
-         << "<div class=\"kicker\">ASTRA v5 NATIVE C++20 | HTTP/2 + HPACK | ASYNC/AWAIT + CLOSURES | @MEDIA + CLIPPING | ALSA AUDIO</div>"
-         << "<h1 id=\"headline\">Astra Desktop Browser — Session 5</h1>"
-         << "<p>Multi-process e10s engine (Main + Content + RDD Media) with native HTTP/2 (RFC 7540 + HPACK/Huffman), keep-alive pool, AstraJS v5 async/await + lexical closures + innerHTML/classList, CSS @media + WebRender overflow:hidden clipping (ASD4), ALSA audio waveform player, and SHA-256 Downloads Manager.</p>"
+         << "<div class=\"kicker\">ASTRA v6 NATIVE C++20 | H2 MULTI-STREAM MUX | CANVAS 2D + rAF | TRY/CATCH + FOR..OF | LINEAR-GRADIENT</div>"
+         << "<h1 id=\"headline\">Astra Desktop Browser — Session 6</h1>"
+         << "<p>Multi-process e10s engine (Main + Content + RDD Media) with true single-socket HTTP/2 multi-stream multiplexing over TLS 1.3 ALPN, AstraJS v6 (try/catch/throw, for..of, requestAnimationFrame, native HTML5 &lt;canvas&gt; 2D), CSS linear-gradient + box-sizing: border-box (ASD5), ALSA audio waveform, and SHA-256 Downloads.</p>"
          << "</div>"
          << "<div class=\"grid\">"
-         << "<div class=\"card\"><div class=\"card-title\">MEMORY GOVERNOR</div>"
+         << "<div class=\"card\"><div class=\"card-title\">MEMORY &amp; H2 MULTIPLEX</div>"
          << "<div class=\"metric\">" << (mem.total_rss_bytes / (1024 * 1024)) << " / " << (mem.ceiling_bytes / (1024 * 1024)) << " MB</div>"
-         << "<div class=\"muted\">Real Linux /proc RSS | Cache Hits: " << cstats.hits << " | H2: " << h2_count << "</div></div>"
+         << "<div class=\"muted\">Real /proc RSS | Cache: " << cstats.hits << " | H2: " << h2_count << " (Mux: " << h2_mux_count << ")</div></div>"
          << "<div class=\"card\"><div class=\"card-title\">ASTRA SHIELD PRIVACY</div>"
          << "<div class=\"metric\">" << shield.blocklist_size() << " Rules | " << shield.stats().trackers_blocked << " Blocked</div>"
          << "<div class=\"muted\">Total Cookie Partitioning + TLS 1.3 ALPN h2 + GPC</div></div>"
@@ -177,9 +177,9 @@ std::string build_home_html(const AstraShield& shield, size_t ext_count,
          << "</div>"
          << "<div class=\"media-row\">"
          << "<div class=\"panel\"><div class=\"card-title\">ASTRA3D v2 SMOOTH SHADER ENGINE</div>"
-         << "<astra-3d scene=\"planet\" style=\"height: 245px;\"></astra-3d></div>"
+         << "<astra-3d scene=\"planet\" style=\"height: 216px;\"></astra-3d></div>"
          << "<div class=\"panel\"><div class=\"card-title\">ASTRAMEDIA v4 RDD INTERACTIVE PLAYER</div>"
-         << "<video src=\"examples/astra_demo.mp4\" style=\"height: 245px;\"></video></div>"
+         << "<video src=\"examples/astra_demo.mp4\" style=\"height: 216px;\"></video></div>"
          << "</div>"
          << "</body></html>";
     return html.str();
@@ -615,7 +615,8 @@ std::string BrowserApp::resolve_source_html(const std::string& url,
 
     if (url == "astra://home" || url == "astra://start") {
         return build_home_html(shield_, extensions_.extensions().size(), memory_snapshot(),
-                               cache_.stats(), http_.http2_requests(), downloads_.size());
+                               cache_.stats(), http_.http2_requests(), http_.http2_multiplexed_streams(),
+                               downloads_.size());
     }
     if (url == "astra://downloads") {
         return build_downloads_html(downloads_);
@@ -1335,6 +1336,23 @@ bool BrowserApp::decode_video_via_rdd(const std::string& path, uint32_t frame_id
     return ok;
 }
 
+bool BrowserApp::step_animation_frames(int count, double dt_ms) {
+    Tab* active = find_tab(active_tab_id_);
+    if (!active || !active->live_doc || !active->js_vm) return false;
+    bool ran_any = false;
+    for (int i = 0; i < count; ++i) {
+        if (active->js_vm->pending_raf_count() == 0) break;
+        raf_clock_ms_ += dt_ms;
+        auto rep = active->js_vm->run_animation_frame(raf_clock_ms_, *active->live_doc);
+        for (const auto& l : rep.logs) active->console_logs.push_back(l);
+        if (rep.raf_run > 0) ran_any = true;
+    }
+    if (ran_any) {
+        relayout_live_tab(*active);
+    }
+    return ran_any;
+}
+
 bool BrowserApp::paint_active_tab(Framebuffer& fb) {
     const Tab* active = find_tab(active_tab_id_);
     if (!active) return false;
@@ -1422,6 +1440,15 @@ bool BrowserApp::paint_active_tab(Framebuffer& fb) {
             audio_cache_[path] = card;
             out = std::move(card);
             return true;
+        },
+        [active](const std::string& id, CanvasBlitFrame& out) -> bool {
+            if (!active || !active->js_vm) return false;
+            const CanvasSurface* surf = active->js_vm->find_canvas(id);
+            if (!surf || surf->argb.empty()) return false;
+            out.width = surf->width;
+            out.height = surf->height;
+            out.argb = surf->argb.data();
+            return true;
         });
 
     return true;
@@ -1445,6 +1472,11 @@ bool BrowserApp::render_active_tab(const std::string& out_png_path,
         cbs.on_text = [this](const std::string& t) { type_text(t); };
         cbs.on_backspace = [this]() { backspace(); };
         cbs.on_enter = [this]() { press_enter(); };
+        cbs.on_tick = [this]() {
+            if (step_animation_frames(1)) {
+                time3d_sec_ += 0.03f;
+            }
+        };
         cbs.on_repaint = [this](Framebuffer& f) { paint_active_tab(f); };
         fb.present_x11_interactive("Astra Browser — " + (active ? active->title : "Desktop"), cbs);
     }
