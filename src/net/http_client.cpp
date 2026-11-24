@@ -1,9 +1,11 @@
 #include "net/http_client.hpp"
+#include "net/http2_client.hpp"
 
 #include <algorithm>
 #include <arpa/inet.h>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstring>
 #include <dlfcn.h>
 #include <netdb.h>
@@ -291,6 +293,62 @@ bool HttpClient::decompress_gzip_or_zlib(const uint8_t* data, size_t len, std::s
 HttpClient::HttpClient(AstraShield& shield, HttpCache* cache)
     : shield_(shield), cache_(cache) {}
 
+HttpClient::~HttpClient() {
+    std::lock_guard<std::mutex> lk(pool_mu_);
+    for (auto& c : conn_pool_) close_conn(c);
+    conn_pool_.clear();
+}
+
+void HttpClient::close_conn(PooledConn& conn) {
+    auto& ssl_api = openssl();
+    if (conn.ssl && ssl_api.loaded) {
+        ssl_api.SSL_shutdown(conn.ssl);
+        ssl_api.SSL_free(conn.ssl);
+        conn.ssl = nullptr;
+    }
+    if (conn.ctx && ssl_api.loaded) {
+        ssl_api.SSL_CTX_free(conn.ctx);
+        conn.ctx = nullptr;
+    }
+    if (conn.fd >= 0) {
+        ::close(conn.fd);
+        conn.fd = -1;
+    }
+}
+
+bool HttpClient::take_pooled(const std::string& key, PooledConn& out) {
+    int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count();
+    std::lock_guard<std::mutex> lk(pool_mu_);
+    for (auto it = conn_pool_.begin(); it != conn_pool_.end();) {
+        if (now - it->last_used_sec > 15) {
+            close_conn(*it);
+            it = conn_pool_.erase(it);
+        } else if (it->key == key) {
+            out = std::move(*it);
+            conn_pool_.erase(it);
+            return true;
+        } else {
+            ++it;
+        }
+    }
+    return false;
+}
+
+void HttpClient::return_pooled(PooledConn&& conn) {
+    if (conn.fd < 0) return;
+    conn.last_used_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+    std::lock_guard<std::mutex> lk(pool_mu_);
+    while (conn_pool_.size() >= 8) {
+        close_conn(conn_pool_.front());
+        conn_pool_.erase(conn_pool_.begin());
+    }
+    conn_pool_.push_back(std::move(conn));
+}
+
 HttpResponse HttpClient::get(const std::string& url,
                              const std::string& top_level_site,
                              bool is_top_level_navigation,
@@ -497,12 +555,7 @@ HttpResponse HttpClient::perform_single_request(
 
     bool use_tls = (parsed.scheme == "https");
     uint16_t port = parsed.port ? parsed.port : (use_tls ? 443 : 80);
-
-    int fd = connect_tcp(parsed.host, port);
-    if (fd < 0) {
-        resp.error = "TCP connection failed to " + parsed.host + ":" + std::to_string(port);
-        return resp;
-    }
+    std::string pool_key = parsed.host + ":" + std::to_string(port) + (use_tls ? ":tls" : ":tcp");
 
     std::vector<std::pair<std::string, std::string>> hardened;
     std::string cookies;
@@ -512,129 +565,230 @@ HttpResponse HttpClient::perform_single_request(
         cookies = shield_.cookie_header_for(top_level_site, parsed.origin(), use_tls);
     }
 
-    std::ostringstream req;
     std::string target = parsed.path.empty() ? "/" : parsed.path;
     if (!parsed.query.empty()) target += "?" + parsed.query;
 
-    req << method << " " << target << " HTTP/1.1\r\n";
-    req << "Host: " << parsed.host << "\r\n";
-    req << "Accept: text/html,text/css,image/jpeg,image/png,image/bmp,*/*;q=0.8\r\n";
-    req << "Accept-Encoding: gzip, deflate\r\n";
-    req << "Connection: close\r\n";
+    auto build_http1_req = [&](bool keep_alive) {
+        std::ostringstream req;
+        req << method << " " << target << " HTTP/1.1\r\n";
+        req << "Host: " << parsed.host << "\r\n";
+        req << "Accept: text/html,text/css,image/jpeg,image/png,image/bmp,*/*;q=0.8\r\n";
+        req << "Accept-Encoding: gzip, deflate\r\n";
+        req << "Connection: " << (keep_alive ? "keep-alive" : "close") << "\r\n";
+        for (const auto& [k, v] : hardened) req << k << ": " << v << "\r\n";
+        for (const auto& [k, v] : extra_headers) req << k << ": " << v << "\r\n";
+        if (!cookies.empty()) req << "Cookie: " << cookies << "\r\n";
+        if (!req_body.empty() || method == "POST") {
+            req << "Content-Type: " << (req_content_type.empty() ? "application/octet-stream" : req_content_type) << "\r\n";
+            req << "Content-Length: " << req_body.size() << "\r\n";
+        }
+        req << "\r\n";
+        if (!req_body.empty()) req << req_body;
+        return req.str();
+    };
 
-    for (const auto& [k, v] : hardened) {
-        req << k << ": " << v << "\r\n";
-    }
-    for (const auto& [k, v] : extra_headers) {
-        req << k << ": " << v << "\r\n";
-    }
-    if (!cookies.empty()) {
-        req << "Cookie: " << cookies << "\r\n";
-    }
-    if (!req_body.empty() || method == "POST") {
-        req << "Content-Type: " << (req_content_type.empty() ? "application/octet-stream" : req_content_type) << "\r\n";
-        req << "Content-Length: " << req_body.size() << "\r\n";
-    }
-    req << "\r\n";
-    if (!req_body.empty()) req << req_body;
-    std::string req_str = req.str();
+    // Helper: read an HTTP/1.1 response honoring Content-Length / chunked boundary so keep-alive sockets can be reused!
+    auto read_http1_stream = [&](const std::function<int(char*, size_t)>& rd, std::string& raw, bool& can_reuse) -> bool {
+        raw.clear();
+        can_reuse = false;
+        char buf[8192];
+        size_t hdr_end = std::string::npos;
+        size_t content_len = 0;
+        bool has_cl = false;
+        bool is_chunked = false;
+        bool server_close = false;
 
-    std::string raw_response;
+        for (;;) {
+            int n = rd(buf, sizeof(buf));
+            if (n <= 0) break;
+            raw.append(buf, static_cast<size_t>(n));
+            if (hdr_end == std::string::npos) {
+                hdr_end = raw.find("\r\n\r\n");
+                if (hdr_end != std::string::npos) {
+                    std::string hb = to_lower(raw.substr(0, hdr_end));
+                    size_t clp = hb.find("\r\ncontent-length:");
+                    if (clp != std::string::npos) {
+                        size_t val_start = clp + 17;
+                        size_t val_end = hb.find("\r\n", val_start);
+                        std::string cls = trim(hb.substr(val_start, val_end == std::string::npos ? std::string::npos : val_end - val_start));
+                        content_len = std::strtoul(cls.c_str(), nullptr, 10);
+                        has_cl = true;
+                    }
+                    if (hb.find("transfer-encoding: chunked") != std::string::npos) is_chunked = true;
+                    if (hb.find("connection: close") != std::string::npos) server_close = true;
+                }
+            }
+            if (hdr_end != std::string::npos) {
+                size_t body_got = raw.size() - (hdr_end + 4);
+                if (has_cl && body_got >= content_len) {
+                    raw.resize(hdr_end + 4 + content_len);
+                    can_reuse = !server_close;
+                    return true;
+                }
+                if (is_chunked && raw.find("\r\n0\r\n\r\n", hdr_end) != std::string::npos) {
+                    can_reuse = !server_close;
+                    return true;
+                }
+            }
+            if (raw.size() > 16 * 1024 * 1024) break;
+        }
+        return !raw.empty();
+    };
 
-    if (use_tls) {
-        auto& ssl_api = openssl();
-        if (!ssl_api.loaded) {
-            ::close(fd);
-            resp.error = "TLS unavailable: libssl.so.3 not found";
+    PooledConn conn;
+    bool from_pool = take_pooled(pool_key, conn);
+    if (!from_pool) {
+        conn.key = pool_key;
+        conn.fd = connect_tcp(parsed.host, port);
+        if (conn.fd < 0) {
+            resp.error = "TCP connection failed to " + parsed.host + ":" + std::to_string(port);
             return resp;
         }
-        void* ctx = ssl_api.SSL_CTX_new(ssl_api.TLS_client_method());
-        if (ctx && strict_tls_ && ssl_api.SSL_CTX_set_default_verify_paths && ssl_api.SSL_CTX_set_verify) {
-            ssl_api.SSL_CTX_set_default_verify_paths(ctx);
-            ssl_api.SSL_CTX_set_verify(ctx, OpenSslApi::kSslVerifyPeer, nullptr);
-        }
-        if (ctx && ssl_api.SSL_CTX_set_alpn_protos) {
-            // Wire-format ALPN list: "\x08http/1.1"
-            static const unsigned char kAlpn[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
-            ssl_api.SSL_CTX_set_alpn_protos(ctx, kAlpn, sizeof(kAlpn));
-        }
-
-        void* ssl = ctx ? ssl_api.SSL_new(ctx) : nullptr;
-        if (!ctx || !ssl) {
-            if (ssl) ssl_api.SSL_free(ssl);
-            if (ctx) ssl_api.SSL_CTX_free(ctx);
-            ::close(fd);
-            resp.error = "Failed to initialize OpenSSL context";
-            return resp;
-        }
-
-        ssl_api.SSL_set_fd(ssl, fd);
-        ssl_api.SSL_ctrl(ssl, OpenSslApi::kSslCtrlSetTlsextHostname,
-                         OpenSslApi::kTlsextNametypeHostName,
-                         const_cast<char*>(parsed.host.c_str()));
-        if (strict_tls_ && ssl_api.SSL_set1_host) {
-            ssl_api.SSL_set1_host(ssl, parsed.host.c_str());
-        }
-
-        if (ssl_api.SSL_connect(ssl) != 1) {
-            ssl_api.SSL_free(ssl);
-            ssl_api.SSL_CTX_free(ctx);
-            ::close(fd);
-            resp.error = "TLS handshake or certificate verification failed for " + parsed.host;
-            return resp;
-        }
-
-        if (ssl_api.SSL_get_verify_result) {
-            resp.tls_verified = (ssl_api.SSL_get_verify_result(ssl) == 0);
-        }
-        if (ssl_api.SSL_get_version) {
-            const char* ver = ssl_api.SSL_get_version(ssl);
-            if (ver) resp.tls_version = ver;
-        }
-        if (ssl_api.SSL_get0_alpn_selected) {
-            const unsigned char* proto = nullptr;
-            unsigned int plen = 0;
-            ssl_api.SSL_get0_alpn_selected(ssl, &proto, &plen);
-            if (proto && plen > 0) {
-                resp.alpn_protocol.assign(reinterpret_cast<const char*>(proto), plen);
+        if (use_tls) {
+            auto& ssl_api = openssl();
+            if (!ssl_api.loaded) {
+                close_conn(conn);
+                resp.error = "TLS unavailable: libssl.so.3 not found";
+                return resp;
+            }
+            conn.ctx = ssl_api.SSL_CTX_new(ssl_api.TLS_client_method());
+            if (conn.ctx && strict_tls_ && ssl_api.SSL_CTX_set_default_verify_paths && ssl_api.SSL_CTX_set_verify) {
+                ssl_api.SSL_CTX_set_default_verify_paths(conn.ctx);
+                ssl_api.SSL_CTX_set_verify(conn.ctx, OpenSslApi::kSslVerifyPeer, nullptr);
+            }
+            if (conn.ctx && ssl_api.SSL_CTX_set_alpn_protos) {
+                if (http2_enabled_) {
+                    static const unsigned char kAlpnH2[] = {2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+                    ssl_api.SSL_CTX_set_alpn_protos(conn.ctx, kAlpnH2, sizeof(kAlpnH2));
+                } else {
+                    static const unsigned char kAlpn11[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+                    ssl_api.SSL_CTX_set_alpn_protos(conn.ctx, kAlpn11, sizeof(kAlpn11));
+                }
+            }
+            conn.ssl = conn.ctx ? ssl_api.SSL_new(conn.ctx) : nullptr;
+            if (!conn.ctx || !conn.ssl) {
+                close_conn(conn);
+                resp.error = "Failed to initialize OpenSSL context";
+                return resp;
+            }
+            ssl_api.SSL_set_fd(conn.ssl, conn.fd);
+            ssl_api.SSL_ctrl(conn.ssl, OpenSslApi::kSslCtrlSetTlsextHostname,
+                             OpenSslApi::kTlsextNametypeHostName,
+                             const_cast<char*>(parsed.host.c_str()));
+            if (strict_tls_ && ssl_api.SSL_set1_host) {
+                ssl_api.SSL_set1_host(conn.ssl, parsed.host.c_str());
+            }
+            if (ssl_api.SSL_connect(conn.ssl) != 1) {
+                close_conn(conn);
+                resp.error = "TLS handshake or certificate verification failed for " + parsed.host;
+                return resp;
+            }
+            if (ssl_api.SSL_get_verify_result) conn.tls_verified = (ssl_api.SSL_get_verify_result(conn.ssl) == 0);
+            if (ssl_api.SSL_get_version) {
+                const char* ver = ssl_api.SSL_get_version(conn.ssl);
+                if (ver) conn.tls_version = ver;
+            }
+            if (ssl_api.SSL_get0_alpn_selected) {
+                const unsigned char* proto = nullptr;
+                unsigned int plen = 0;
+                ssl_api.SSL_get0_alpn_selected(conn.ssl, &proto, &plen);
+                if (proto && plen > 0) conn.alpn.assign(reinterpret_cast<const char*>(proto), plen);
             }
         }
-
-        size_t sent = 0;
-        while (sent < req_str.size()) {
-            int n = ssl_api.SSL_write(ssl, req_str.data() + sent, static_cast<int>(req_str.size() - sent));
-            if (n <= 0) break;
-            sent += static_cast<size_t>(n);
-        }
-
-        char buf[8192];
-        for (;;) {
-            int n = ssl_api.SSL_read(ssl, buf, sizeof(buf));
-            if (n <= 0) break;
-            raw_response.append(buf, static_cast<size_t>(n));
-            if (raw_response.size() > 16 * 1024 * 1024) break;
-        }
-
-        ssl_api.SSL_shutdown(ssl);
-        ssl_api.SSL_free(ssl);
-        ssl_api.SSL_CTX_free(ctx);
-        ::close(fd);
     } else {
-        size_t sent = 0;
-        while (sent < req_str.size()) {
-            ssize_t n = ::send(fd, req_str.data() + sent, req_str.size() - sent, MSG_NOSIGNAL);
-            if (n <= 0) break;
-            sent += static_cast<size_t>(n);
-        }
-        char buf[8192];
-        for (;;) {
-            ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-            if (n <= 0) break;
-            raw_response.append(buf, static_cast<size_t>(n));
-            if (raw_response.size() > 16 * 1024 * 1024) break;
-        }
-        ::close(fd);
+        resp.reused_connection = true;
+        keepalive_reuses_.fetch_add(1);
     }
+
+    resp.tls_verified = conn.tls_verified;
+    resp.tls_version = conn.tls_version;
+    resp.alpn_protocol = conn.alpn;
+
+    // Fast path: Native Binary HTTP/2 when server negotiated ALPN "h2"
+    if (use_tls && conn.alpn == "h2") {
+        auto& ssl_api = openssl();
+        std::vector<std::pair<std::string, std::string>> h2_hdrs;
+        for (const auto& kv : hardened) h2_hdrs.push_back(kv);
+        for (const auto& kv : extra_headers) h2_hdrs.push_back(kv);
+        if (!cookies.empty()) h2_hdrs.emplace_back("cookie", cookies);
+        if (!req_body.empty() || method == "POST") {
+            h2_hdrs.emplace_back("content-type", req_content_type.empty() ? "application/octet-stream" : req_content_type);
+            h2_hdrs.emplace_back("content-length", std::to_string(req_body.size()));
+        }
+
+        auto h2 = Http2Client::execute_request(
+            [&](uint8_t* b, size_t l) { return ssl_api.SSL_read(conn.ssl, b, static_cast<int>(l)); },
+            [&](const uint8_t* b, size_t l) { return ssl_api.SSL_write(conn.ssl, b, static_cast<int>(l)); },
+            method, "https", parsed.host, target, h2_hdrs, req_body);
+
+        close_conn(conn);
+        if (!h2.ok) {
+            resp.error = h2.error;
+            return resp;
+        }
+        resp.used_http2 = true;
+        http2_requests_.fetch_add(1);
+        resp.status_code = h2.status_code;
+        resp.headers = std::move(h2.headers);
+        for (const auto& sc : h2.set_cookies) {
+            std::lock_guard<std::mutex> lk(state_mu_);
+            shield_.store_cookie(top_level_site, parsed.origin(), sc);
+        }
+        std::string body_raw = std::move(h2.body);
+        if (resp.headers.count("content-encoding")) {
+            std::string enc = to_lower(resp.headers["content-encoding"]);
+            if (enc.find("gzip") != std::string::npos || enc.find("deflate") != std::string::npos) {
+                std::string inflated;
+                if (decompress_gzip_or_zlib(reinterpret_cast<const uint8_t*>(body_raw.data()),
+                                            body_raw.size(), inflated)) {
+                    body_raw = std::move(inflated);
+                }
+            }
+        }
+        resp.content_type = resp.headers.count("content-type") ? resp.headers["content-type"] : "text/html";
+        resp.body = std::move(body_raw);
+        return resp;
+    }
+
+    // HTTP/1.1 path (with keep-alive socket pooling & automatic stale-socket retry)
+    std::string req_str = build_http1_req(true);
+    std::string raw_response;
+    bool can_reuse = false;
+
+    auto send_and_read = [&]() -> bool {
+        if (use_tls) {
+            auto& ssl_api = openssl();
+            size_t sent = 0;
+            while (sent < req_str.size()) {
+                int n = ssl_api.SSL_write(conn.ssl, req_str.data() + sent, static_cast<int>(req_str.size() - sent));
+                if (n <= 0) return false;
+                sent += static_cast<size_t>(n);
+            }
+            return read_http1_stream(
+                [&](char* b, size_t l) { return ssl_api.SSL_read(conn.ssl, b, static_cast<int>(l)); },
+                raw_response, can_reuse);
+        } else {
+            size_t sent = 0;
+            while (sent < req_str.size()) {
+                ssize_t n = ::send(conn.fd, req_str.data() + sent, req_str.size() - sent, MSG_NOSIGNAL);
+                if (n <= 0) return false;
+                sent += static_cast<size_t>(n);
+            }
+            return read_http1_stream(
+                [&](char* b, size_t l) { return static_cast<int>(::recv(conn.fd, b, l, 0)); },
+                raw_response, can_reuse);
+        }
+    };
+
+    bool io_ok = send_and_read();
+    if (!io_ok && from_pool) {
+        // Stale pooled keep-alive connection: close and retry once fresh
+        close_conn(conn);
+        return perform_single_request(method, parsed, top_level_site, extra_headers, req_body, req_content_type);
+    }
+
+    if (can_reuse) return_pooled(std::move(conn));
+    else close_conn(conn);
 
     size_t hdr_end = raw_response.find("\r\n\r\n");
     if (hdr_end == std::string::npos) {

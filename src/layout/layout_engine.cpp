@@ -68,10 +68,19 @@ void offset_subtree(LayoutFrame* frame, float dx, float dy) {
     }
 }
 
+Rect intersect_rect(const Rect& a, const Rect& b) {
+    float x1 = std::max(a.x, b.x);
+    float y1 = std::max(a.y, b.y);
+    float x2 = std::min(a.x + a.w, b.x + b.w);
+    float y2 = std::min(a.y + a.h, b.y + b.h);
+    return Rect{x1, y1, std::max(0.0f, x2 - x1), std::max(0.0f, y2 - y1)};
+}
+
 LayoutFrame* build_frame_tree(SlabArena& arena,
                               const DomNode* node,
                               const CssStylesheet& sheet,
-                              const ComputedStyle* parent_style) {
+                              const ComputedStyle* parent_style,
+                              float viewport_w) {
     if (!node) return nullptr;
 
     if (node->type == NodeType::Text) {
@@ -80,6 +89,7 @@ LayoutFrame* build_frame_tree(SlabArena& arena,
         if (parent_style) f->style = *parent_style;
         f->style.display = DisplayType::Inline;
         f->style.position = PositionType::Static;
+        f->style.overflow = OverflowMode::Visible;
         f->style.background = Color{0, 0, 0, 0};
         f->style.border_width = 0;
         f->style.padding = {};
@@ -89,7 +99,7 @@ LayoutFrame* build_frame_tree(SlabArena& arena,
         return f;
     }
 
-    ComputedStyle st = StyleEngine::compute_style(node, sheet, parent_style);
+    ComputedStyle st = StyleEngine::compute_style(node, sheet, parent_style, viewport_w);
     if (st.display == DisplayType::None) return nullptr;
 
     // Default styling for interactive <button> if author didn't override
@@ -106,7 +116,7 @@ LayoutFrame* build_frame_tree(SlabArena& arena,
     f->style = st;
 
     for (const DomNode* ch : node->children) {
-        if (LayoutFrame* cf = build_frame_tree(arena, ch, sheet, &f->style)) {
+        if (LayoutFrame* cf = build_frame_tree(arena, ch, sheet, &f->style, viewport_w)) {
             f->children.push_back(cf);
         }
     }
@@ -141,6 +151,12 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
         const std::string& tag = frame->node->tag;
         if (tag == "astra-3d" || tag == "video") {
             float h = (st.height > 0.0f) ? st.height : 260.0f;
+            frame->content_box.h = h;
+            frame->border_box.h = h + pad_y + st.padding.bottom + st.border_width;
+            return;
+        }
+        if (tag == "audio") {
+            float h = (st.height > 0.0f) ? st.height : 76.0f;
             frame->content_box.h = h;
             frame->border_box.h = h + pad_y + st.padding.bottom + st.border_width;
             return;
@@ -246,7 +262,13 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
     }
 
     float measured_h = std::max(0.0f, cur_y - frame->content_box.y);
-    if (st.height > 0.0f) measured_h = std::max(measured_h, st.height);
+    if (st.height > 0.0f) {
+        if (st.overflow == OverflowMode::Hidden) {
+            measured_h = st.height;
+        } else {
+            measured_h = std::max(measured_h, st.height);
+        }
+    }
     frame->content_box.h = measured_h;
     frame->border_box.h = measured_h + pad_y + st.padding.bottom + st.border_width;
 
@@ -297,7 +319,8 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
 }
 
 void emit_display_items(const LayoutFrame* f, DisplayList& dl,
-                        int32_t inherited_z, bool inherited_fixed, float inherited_opacity) {
+                        int32_t inherited_z, bool inherited_fixed, float inherited_opacity,
+                        bool has_clip, const Rect& clip_rect) {
     if (!f) return;
     const ComputedStyle& st = f->style;
 
@@ -308,6 +331,13 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
     bool eff_fixed = inherited_fixed || (st.position == PositionType::Fixed);
     float eff_opacity = inherited_opacity * st.opacity;
     if (eff_opacity <= 0.001f) return;
+
+    auto attach_clip = [&](DisplayItem& it) {
+        if (has_clip) {
+            it.has_clip = true;
+            it.clip_rect = clip_rect;
+        }
+    };
 
     if (st.box_shadow.enabled && f->border_box.w > 0 && f->border_box.h > 0) {
         DisplayItem sh;
@@ -323,6 +353,7 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
         sh.thickness = st.box_shadow.blur;
         sh.z_index = eff_z;
         sh.fixed_viewport = eff_fixed;
+        attach_clip(sh);
         dl.items.push_back(std::move(sh));
     }
 
@@ -334,6 +365,7 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
         item.radius = st.border_radius;
         item.z_index = eff_z;
         item.fixed_viewport = eff_fixed;
+        attach_clip(item);
         dl.items.push_back(std::move(item));
     }
 
@@ -346,7 +378,15 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
         item.thickness = st.border_width;
         item.z_index = eff_z;
         item.fixed_viewport = eff_fixed;
+        attach_clip(item);
         dl.items.push_back(std::move(item));
+    }
+
+    bool child_has_clip = has_clip;
+    Rect child_clip = clip_rect;
+    if (st.overflow == OverflowMode::Hidden) {
+        child_clip = has_clip ? intersect_rect(clip_rect, f->border_box) : f->border_box;
+        child_has_clip = true;
     }
 
     if (f->node && f->node->type == NodeType::Element) {
@@ -354,7 +394,14 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
         if (tag == "a") {
             std::string href = f->node->get_attr("href");
             if (!href.empty()) {
-                dl.hit_regions.push_back(HitRegion{HitRegionKind::Link, f->border_box, eff_z, eff_fixed, href});
+                bool is_dl = false;
+                for (const auto& a : f->node->attrs) {
+                    if (a.name == "download") { is_dl = true; break; }
+                }
+                dl.hit_regions.push_back(HitRegion{
+                    is_dl ? HitRegionKind::Download : HitRegionKind::Link,
+                    f->border_box, eff_z, eff_fixed, href
+                });
             }
         } else if (tag == "button") {
             std::string id = f->node->id();
@@ -368,6 +415,7 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
             item.text = f->node->get_attr("scene");
             if (item.text.empty()) item.text = f->node->get_attr("src");
             if (item.text.empty()) item.text = "planet";
+            attach_clip(item);
             dl.hit_regions.push_back(HitRegion{HitRegionKind::Scene3D, f->content_box, eff_z, eff_fixed, item.text});
             dl.items.push_back(std::move(item));
             return;
@@ -378,7 +426,19 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
             item.z_index = eff_z;
             item.fixed_viewport = eff_fixed;
             item.text = f->node->get_attr("src");
+            attach_clip(item);
             dl.hit_regions.push_back(HitRegion{HitRegionKind::Video, f->content_box, eff_z, eff_fixed, item.text});
+            dl.items.push_back(std::move(item));
+            return;
+        } else if (tag == "audio") {
+            DisplayItem item;
+            item.type = DisplayItemType::EmbedAudio;
+            item.rect = f->content_box;
+            item.z_index = eff_z;
+            item.fixed_viewport = eff_fixed;
+            item.text = f->node->get_attr("src");
+            attach_clip(item);
+            dl.hit_regions.push_back(HitRegion{HitRegionKind::Audio, f->content_box, eff_z, eff_fixed, item.text});
             dl.items.push_back(std::move(item));
             return;
         } else if (tag == "img") {
@@ -388,6 +448,7 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
             item.z_index = eff_z;
             item.fixed_viewport = eff_fixed;
             item.text = f->node->get_attr("src");
+            attach_clip(item);
             dl.items.push_back(std::move(item));
             return;
         } else if (tag == "input" || tag == "textarea") {
@@ -414,6 +475,7 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
                 item.text = ph;
                 item.color_argb = apply_opacity(0xFF64748Bu, eff_opacity);
             }
+            attach_clip(item);
             dl.items.push_back(std::move(item));
             return;
         }
@@ -433,13 +495,17 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
             item.monospace = st.monospace;
             item.fixed_viewport = eff_fixed;
             item.text = line;
+            if (child_has_clip) {
+                item.has_clip = true;
+                item.clip_rect = child_clip;
+            }
             dl.items.push_back(std::move(item));
             ty += lh;
         }
     }
 
     for (const LayoutFrame* ch : f->children) {
-        emit_display_items(ch, dl, eff_z, eff_fixed, eff_opacity);
+        emit_display_items(ch, dl, eff_z, eff_fixed, eff_opacity, child_has_clip, child_clip);
     }
 }
 
@@ -458,8 +524,8 @@ const HitRegion* DisplayList::hit_test(float x, float y, float scroll_y) const {
 
 std::vector<uint8_t> DisplayList::serialize() const {
     std::vector<uint8_t> buf;
-    buf.reserve(64 + items.size() * 52 + hit_regions.size() * 40);
-    write_u32(buf, 0x41534433u); // Magic 'ASD3' (Session 4 format with z-index + fixed_viewport)
+    buf.reserve(64 + items.size() * 68 + hit_regions.size() * 40);
+    write_u32(buf, 0x41534434u); // Magic 'ASD4' (Session 5 format with WebRender per-item clip_rect)
     write_u32(buf, viewport_width);
     write_u32(buf, viewport_height);
     write_f32(buf, content_height);
@@ -477,8 +543,15 @@ std::vector<uint8_t> DisplayList::serialize() const {
         write_f32(buf, it.font_size);
         write_u32(buf, static_cast<uint32_t>(it.z_index));
         uint32_t flags = (it.bold ? 1u : 0u) | (it.monospace ? 2u : 0u) |
-                         (it.focused ? 4u : 0u) | (it.fixed_viewport ? 8u : 0u);
+                         (it.focused ? 4u : 0u) | (it.fixed_viewport ? 8u : 0u) |
+                         (it.has_clip ? 16u : 0u);
         write_u32(buf, flags);
+        if (it.has_clip) {
+            write_f32(buf, it.clip_rect.x);
+            write_f32(buf, it.clip_rect.y);
+            write_f32(buf, it.clip_rect.w);
+            write_f32(buf, it.clip_rect.h);
+        }
         write_str(buf, it.text);
     }
     write_u32(buf, static_cast<uint32_t>(hit_regions.size()));
@@ -498,7 +571,7 @@ std::vector<uint8_t> DisplayList::serialize() const {
 bool DisplayList::deserialize(const std::vector<uint8_t>& blob, DisplayList& out) {
     size_t off = 0;
     uint32_t magic = 0, count = 0;
-    if (!read_u32(blob, off, magic) || magic != 0x41534433u) return false;
+    if (!read_u32(blob, off, magic) || (magic != 0x41534434u && magic != 0x41534433u)) return false;
     if (!read_u32(blob, off, out.viewport_width)) return false;
     if (!read_u32(blob, off, out.viewport_height)) return false;
     if (!read_f32(blob, off, out.content_height)) return false;
@@ -527,6 +600,13 @@ bool DisplayList::deserialize(const std::vector<uint8_t>& blob, DisplayList& out
         it.monospace = (flags & 2u) != 0;
         it.focused = (flags & 4u) != 0;
         it.fixed_viewport = (flags & 8u) != 0;
+        it.has_clip = (flags & 16u) != 0;
+        if (it.has_clip) {
+            if (!read_f32(blob, off, it.clip_rect.x)) return false;
+            if (!read_f32(blob, off, it.clip_rect.y)) return false;
+            if (!read_f32(blob, off, it.clip_rect.w)) return false;
+            if (!read_f32(blob, off, it.clip_rect.h)) return false;
+        }
         if (!read_str(blob, off, it.text)) return false;
         out.items.push_back(std::move(it));
     }
@@ -560,7 +640,7 @@ LayoutFrame* LayoutEngine::build_layout(SlabArena& arena,
                                         float viewport_w,
                                         float viewport_h) {
     const DomNode* body = doc.body();
-    LayoutFrame* root = build_frame_tree(arena, body, sheet, nullptr);
+    LayoutFrame* root = build_frame_tree(arena, body, sheet, nullptr, viewport_w);
     if (!root) return nullptr;
     Rect viewport{0.0f, 0.0f, viewport_w, viewport_h};
     layout_node(root, 0.0f, 0.0f, viewport_w, viewport, viewport);
@@ -581,7 +661,7 @@ DisplayList LayoutEngine::build_display_list(const LayoutFrame* root,
             dl.clear_color_argb = root->style.background.to_argb();
         }
         dl.content_height = root->border_box.h;
-        emit_display_items(root, dl, 0, false, 1.0f);
+        emit_display_items(root, dl, 0, false, 1.0f, false, Rect{});
         // Stable-sort paint layers by z-index (preserving DOM order within equal z-index)
         std::stable_sort(dl.items.begin(), dl.items.end(),
                          [](const DisplayItem& a, const DisplayItem& b) {

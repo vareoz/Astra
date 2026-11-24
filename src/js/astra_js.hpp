@@ -66,6 +66,8 @@ enum class OpCode : uint8_t {
     SetProp,
     Call,
     CallMethod,
+    Await,
+    MakeClosure,
     Return,
     Halt
 };
@@ -80,6 +82,7 @@ struct BytecodeChunk {
     std::vector<Instruction> code;
     std::vector<JsValue> constants;
     std::vector<std::string> names;
+    std::vector<std::string> local_names;
 };
 
 // Mark-and-Sweep GC-managed heap object (Array, Object, Function, Promise)
@@ -103,6 +106,11 @@ struct GcObject {
     std::string fn_name;
     std::vector<std::string> params;
     BytecodeChunk chunk;
+    bool is_async = false;
+    std::shared_ptr<std::unordered_map<std::string, JsValue>> closure_env;
+
+    // DOM classList proxy target
+    DomNode* classlist_node = nullptr;
 
     // Promise fields
     PromiseState promise_state = PromiseState::Pending;
@@ -197,11 +205,13 @@ private:
     JsValue run_chunk(const BytecodeChunk& chunk,
                       std::vector<JsValue>& locals,
                       HtmlDocument& doc,
-                      JsExecutionReport& rep);
+                      JsExecutionReport& rep,
+                      const std::shared_ptr<std::unordered_map<std::string, JsValue>>& closure_env = nullptr);
     JsValue invoke_callable(const JsValue& fn,
                             const std::vector<JsValue>& args,
                             HtmlDocument& doc,
                             JsExecutionReport& rep);
+    void drain_microtasks_only(HtmlDocument& doc, JsExecutionReport& rep);
     void drain_event_loop(HtmlDocument& doc, JsExecutionReport& rep);
 
     std::vector<GcObject*> heap_;

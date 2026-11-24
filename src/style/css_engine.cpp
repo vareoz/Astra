@@ -280,6 +280,12 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
         st.z_index = std::atoi(v.c_str());
     } else if (p == "opacity") {
         st.opacity = std::clamp(std::strtof(v.c_str(), nullptr), 0.0f, 1.0f);
+    } else if (p == "overflow" || p == "overflow-x" || p == "overflow-y") {
+        if (vl == "hidden" || vl == "clip" || vl == "scroll" || vl == "auto") {
+            st.overflow = OverflowMode::Hidden;
+        } else {
+            st.overflow = OverflowMode::Visible;
+        }
     } else if (p == "box-shadow") {
         if (vl == "none") {
             st.box_shadow.enabled = false;
@@ -388,6 +394,10 @@ void apply_ua_defaults(const DomNode* node, ComputedStyle& st) {
 } // namespace
 
 void CssStylesheet::parse(std::string_view css) {
+    parse_block(css, -1.0f, -1.0f);
+}
+
+void CssStylesheet::parse_block(std::string_view css, float min_w, float max_w) {
     size_t pos = 0;
     const size_t n = css.size();
 
@@ -404,7 +414,7 @@ void CssStylesheet::parse(std::string_view css) {
         }
         if (pos >= n) break;
 
-        // Skip @rules like @media/@keyframes cleanly
+        // Parse @media blocks; skip other @rules cleanly
         if (css[pos] == '@') {
             size_t brace = css.find('{', pos);
             size_t semi = css.find(';', pos);
@@ -413,12 +423,36 @@ void CssStylesheet::parse(std::string_view css) {
                 continue;
             }
             if (brace != std::string_view::npos) {
+                std::string header = to_lower(trim(css.substr(pos, brace - pos)));
                 int depth = 1;
+                size_t inner_start = brace + 1;
                 pos = brace + 1;
                 while (pos < n && depth > 0) {
                     if (css[pos] == '{') ++depth;
                     else if (css[pos] == '}') --depth;
                     ++pos;
+                }
+                size_t inner_end = (pos > 0 && depth == 0) ? (pos - 1) : pos;
+                if (header.rfind("@media", 0) == 0 && inner_end > inner_start) {
+                    float q_min = min_w;
+                    float q_max = max_w;
+                    size_t pmax = header.find("max-width");
+                    if (pmax != std::string::npos) {
+                        size_t col = header.find(':', pmax);
+                        if (col != std::string::npos) {
+                            float v = StyleEngine::parse_px(header.substr(col + 1), -1.0f);
+                            if (v > 0.0f) q_max = (q_max < 0.0f) ? v : std::min(q_max, v);
+                        }
+                    }
+                    size_t pmin = header.find("min-width");
+                    if (pmin != std::string::npos) {
+                        size_t col = header.find(':', pmin);
+                        if (col != std::string::npos) {
+                            float v = StyleEngine::parse_px(header.substr(col + 1), -1.0f);
+                            if (v > 0.0f) q_min = (q_min < 0.0f) ? v : std::max(q_min, v);
+                        }
+                    }
+                    parse_block(css.substr(inner_start, inner_end - inner_start), q_min, q_max);
                 }
                 continue;
             }
@@ -435,6 +469,8 @@ void CssStylesheet::parse(std::string_view css) {
 
         CssRule rule;
         rule.source_order = rules_.size();
+        rule.media_min_width = min_w;
+        rule.media_max_width = max_w;
         size_t s = 0;
         while (s < sel_group.size()) {
             size_t comma = sel_group.find(',', s);
@@ -526,7 +562,8 @@ float StyleEngine::parse_px(std::string_view val, float fallback) {
 
 ComputedStyle StyleEngine::compute_style(const DomNode* node,
                                          const CssStylesheet& sheet,
-                                         const ComputedStyle* parent_style) {
+                                         const ComputedStyle* parent_style,
+                                         float viewport_w) {
     ComputedStyle st;
     // Inherit text properties from parent
     if (parent_style) {
@@ -548,6 +585,8 @@ ComputedStyle StyleEngine::compute_style(const DomNode* node,
     };
     std::vector<MatchedRule> matched;
     for (const auto& rule : sheet.rules()) {
+        if (rule.media_min_width >= 0.0f && viewport_w < rule.media_min_width) continue;
+        if (rule.media_max_width >= 0.0f && viewport_w > rule.media_max_width) continue;
         int best_spec = -1;
         for (const auto& sel : rule.selectors) {
             int spec = 0;

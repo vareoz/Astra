@@ -11,6 +11,7 @@
 #include "ipc/ipc_channel.hpp"
 #include "js/astra_js.hpp"
 #include "media/media_engine.hpp"
+#include "net/http2_client.hpp"
 #include "net/http_cache.hpp"
 #include "net/http_client.hpp"
 #include "privacy/shield.hpp"
@@ -43,7 +44,7 @@ void expect(bool cond, const std::string& label) {
 }
 
 int run_full_test_suite() {
-    std::cout << "=== Astra Browser Core v4 — Full Subsystem Verification Suite ===\n\n";
+    std::cout << "=== Astra Browser Core v5 — Full Subsystem Verification Suite ===\n\n";
 
     // 1. SlabArena + OS Reclamation
     {
@@ -480,6 +481,157 @@ int run_full_test_suite() {
                    "AstraMedia v3 probes WAV audio container and decodes bounded PCM s16le waveform with real non-zero RMS");
         }
 
+        // 23. AstraNet v4: Native HTTP/2 (RFC 7540 Framing + RFC 7541 HPACK + Huffman) & Live TLS 1.3 ALPN
+        {
+            Http2Frame hdr_f;
+            hdr_f.type = Http2FrameType::Headers;
+            hdr_f.flags = 0x05;
+            hdr_f.stream_id = 1;
+            hdr_f.payload = {0x88}; // :status 200 (HPACK static index 8)
+            auto packed = Http2Client::pack_frame(hdr_f);
+            Http2Frame unpacked;
+            size_t consumed = 0;
+            bool f_ok = Http2Client::unpack_frame(packed.data(), packed.size(), unpacked, consumed) &&
+                        unpacked.type == Http2FrameType::Headers && unpacked.stream_id == 1;
+            // Huffman decode test: "www.example.com" = f1 e3 c2 e5 f2 3a 6b a0 ab 90 f4 ff (RFC 7541 C.4.1)
+            const uint8_t huff_in[] = {0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff};
+            std::string huff_out;
+            bool huff_ok = HpackCodec::huffman_decode(huff_in, sizeof(huff_in), huff_out);
+            HpackCodec hdec;
+            std::vector<std::pair<std::string, std::string>> hlist;
+            bool hpack_ok = hdec.decode_headers(unpacked.payload.data(), unpacked.payload.size(), hlist) &&
+                            !hlist.empty() && hlist[0].first == ":status" && hlist[0].second == "200";
+            // Live HTTPS test (negotiates h2 or http/1.1 cleanly)
+            AstraShield h2sh;
+            HttpClient h2net(h2sh, nullptr);
+            auto live_r = h2net.get("https://example.com", "example.com", true);
+            auto live_r2 = h2net.get("https://example.com/", "example.com", true);
+            expect(f_ok && huff_ok && huff_out == "www.example.com" && hpack_ok &&
+                   live_r.status_code == 200 && live_r.tls_verified && live_r2.status_code == 200 &&
+                   (h2net.http2_requests() >= 1 || h2net.keepalive_reuses() >= 1),
+                   "AstraNet v4 HTTP/2 RFC 7540 framing + RFC 7541 HPACK/Huffman + live TLS 1.3 ALPN/pool work end-to-end");
+        }
+
+        // 24. AstraJS v5: async/await, Arrow Functions (=>), and Shared Mutable Lexical Closures
+        {
+            SlabArena ja;
+            HtmlDocument jdoc = HtmlDocument::parse(ja, "<html><body><div id=\"out\">init</div></body></html>");
+            AstraJsEngine jvm;
+            std::string js =
+                "const makeCounter = (start) => {\n"
+                "  let n = start;\n"
+                "  return () => { n = n + 1; return n; };\n"
+                "};\n"
+                "const c1 = makeCounter(10);\n"
+                "const c2 = makeCounter(100);\n"
+                "const v1 = c1();\n"
+                "const v2 = c1();\n"
+                "const v3 = c2();\n"
+                "async function compute() {\n"
+                "  const a = await Promise.resolve(v1 + v2);\n"
+                "  const b = await Promise.resolve(v3);\n"
+                "  document.querySelector(\"#out\").textContent = a + \":\" + b + \":\" + c1();\n"
+                "}\n"
+                "compute();\n";
+            auto rep = jvm.execute(js, jdoc);
+            std::string got = jdoc.query_selector("#out")->text_content();
+            expect(rep.ok && got == "23:101:13",
+                   "AstraJS v5 executes async/await, arrow functions (=>), and independent mutable lexical closures");
+        }
+
+        // 25. AstraJS v5 Dynamic DOM: innerHTML fragment parser, classList, setAttribute/removeAttribute
+        {
+            SlabArena da;
+            HtmlDocument ddoc = HtmlDocument::parse(da, "<html><body><div id=\"box\" class=\"card\" data-x=\"1\"></div></body></html>");
+            AstraJsEngine dvm;
+            std::string js =
+                "let b = document.querySelector(\"#box\");\n"
+                "b.classList.add(\"active\");\n"
+                "let hasA = b.classList.contains(\"active\");\n"
+                "b.classList.toggle(\"card\");\n"
+                "b.removeAttribute(\"data-x\");\n"
+                "b.setAttribute(\"data-ok\", \"yes\");\n"
+                "b.innerHTML = \"<span id='child'>Hello <b>Astra5</b></span>\";\n"
+                "let inner = b.innerHTML;\n"
+                "let txt = document.querySelector(\"#child\").textContent;\n"
+                "let summary = hasA + \"|\" + b.className + \"|\" + b.getAttribute(\"data-x\") + \"|\" + b.getAttribute(\"data-ok\") + \"|\" + txt;\n";
+            auto rep = dvm.execute(js, ddoc);
+            std::string sum = dvm.globals().count("summary") ? dvm.globals().at("summary").to_string() : "";
+            std::string in_h = dvm.globals().count("inner") ? dvm.globals().at("inner").to_string() : "";
+            expect(rep.ok && sum == "true|active||yes|Hello Astra5" && in_h.find("<b>Astra5</b>") != std::string::npos,
+                   "AstraJS v5 dynamic DOM supports innerHTML getter/setter, classList, and removeAttribute cleanly");
+        }
+
+        // 26. CSS @media Responsive Queries + WebRender Per-Item overflow:hidden Clipping (ASD4)
+        {
+            SlabArena ma;
+            HtmlDocument mdoc = HtmlDocument::parse(
+                ma,
+                "<html><head><style>"
+                "body { margin: 0; padding: 0; }"
+                ".box { background: #111827; height: 60px; overflow: hidden; }"
+                ".child { background: #ef4444; height: 140px; }"
+                "@media (max-width: 700px) { .box { background: #0284c7; } }"
+                "</style></head><body><div class=\"box\"><div class=\"child\"></div></div></body></html>");
+            CssStylesheet msheet;
+            msheet.parse(mdoc.collect_stylesheets());
+            LayoutFrame* wide_root = LayoutEngine::build_layout(ma, mdoc, msheet, 1280.0f, 600.0f);
+            LayoutFrame* narrow_root = LayoutEngine::build_layout(ma, mdoc, msheet, 600.0f, 600.0f);
+            uint32_t wide_bg = wide_root->children[0]->style.background.to_argb();
+            uint32_t narrow_bg = narrow_root->children[0]->style.background.to_argb();
+            DisplayList dl = LayoutEngine::build_display_list(wide_root, 1280, 600);
+            auto blob = dl.serialize();
+            DisplayList rt;
+            bool rt_ok = DisplayList::deserialize(blob, rt);
+            bool has_clipped_child = false;
+            for (const auto& it : rt.items) {
+                if (it.has_clip && it.rect.h >= 120.0f && it.clip_rect.h <= 62.0f) has_clipped_child = true;
+            }
+            // Verify Framebuffer actually clips pixels outside clip_rect
+            Framebuffer cfb(200, 200);
+            cfb.composite_display_list(rt, 0, 0.0f);
+            // At y=30 (inside 60px clipped box) -> red #ef4444; at y=100 (below 60px) -> clear_color_argb!
+            uint32_t inside_px = cfb.pixels()[30 * 200 + 50];
+            uint32_t below_px = cfb.pixels()[100 * 200 + 50];
+            expect(wide_bg == 0xFF111827u && narrow_bg == 0xFF0284C7u && rt_ok &&
+                   has_clipped_child && inside_px == 0xFFEF4444u && below_px == rt.clear_color_argb,
+                   "CSS @media queries adapt to viewport width and WebRender ASD4 overflow:hidden clips pixels strictly");
+        }
+
+        // 27. Native Download Manager + FIPS 180-4 SHA-256 + astra://downloads Ledger
+        {
+            std::error_code ec;
+            std::filesystem::remove_all("/tmp/astra_downloads_test", ec);
+            std::string sha_abc = BrowserApp::compute_sha256_hex("abc");
+            std::string data_file = "astra/examples/astra_data.json";
+            if (!std::ifstream(data_file)) data_file = "examples/astra_data.json";
+            auto rec = app.download_url("file://" + data_file, "/tmp/astra_downloads_test");
+            uint32_t dtab = app.new_tab("astra://downloads");
+            const Tab* dt = app.active_tab();
+            bool has_sha_in_page = dt && dt->raw_html.find(rec.sha256_hex) != std::string::npos;
+            expect(sha_abc == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" &&
+                   rec.ok && rec.bytes > 20 && std::filesystem::exists(rec.saved_path) &&
+                   dtab > 0 && has_sha_in_page,
+                   "Native Download Manager saves files with exact FIPS 180-4 SHA-256 checksum and renders astra://downloads");
+        }
+
+        // 28. AstraMedia v4: PCM Waveform Peak Analyzer + Dynamic Linux ALSA Audio Probe
+        {
+            std::string wav = "astra/examples/astra_chime.wav";
+            if (!std::ifstream(wav)) wav = "examples/astra_chime.wav";
+            DecodedAudioBuffer abuf;
+            bool dec = MediaEngine::decode_audio_pcm(wav, 1.0, abuf);
+            auto peaks = MediaEngine::compute_waveform_peaks(abuf, 40);
+            float max_peak = 0.0f;
+            for (float p : peaks) max_peak = std::max(max_peak, p);
+            auto alsa_rep = MediaEngine::play_audio_alsa(abuf);
+            bool safe_status = (alsa_rep.status == "played" ||
+                                alsa_rep.status == "headless_no_soundcard" ||
+                                alsa_rep.status == "alsa_not_installed");
+            expect(dec && peaks.size() == 40 && max_peak > 0.25f && safe_status,
+                   "AstraMedia v4 computes 40-bar PCM waveform peaks and probes Linux ALSA output via dlopen safely");
+        }
+
         app.stop_workers();
     }
 
@@ -488,7 +640,7 @@ int run_full_test_suite() {
 }
 
 int run_stress_test(int tab_count, uint64_t ceiling_mb) {
-    std::cout << "=== Astra v4 Multi-Tab Stress Test (" << tab_count << " tabs, ceiling " << ceiling_mb << " MB) ===\n";
+    std::cout << "=== Astra v5 Multi-Tab Stress Test (" << tab_count << " tabs, ceiling " << ceiling_mb << " MB) ===\n";
     BrowserApp app(ceiling_mb * 1024ULL * 1024ULL);
     app.start_workers();
 
@@ -547,10 +699,11 @@ int run_stress_test(int tab_count, uint64_t ceiling_mb) {
 
 void print_help() {
     std::cout
-        << "Astra Browser Core v4 (Native C++20 Multi-Process Engine)\n"
+        << "Astra Browser Core v5 (Native C++20 Multi-Process Engine)\n"
         << "Usage:\n"
-        << "  astra --test                                Run full Session 4 subsystem suite (27 tests)\n"
+        << "  astra --test                                Run full Session 5 subsystem suite (33 tests)\n"
         << "  astra --url <URL> [--out <file.png>]        Load URL & render PNG\n"
+        << "        [--download <URL>]                    Download URL to /tmp/astra_downloads/ with SHA-256\n"
         << "        [--ext <extension_dir>]               Load Manifest V3 WebExtension (repeatable)\n"
         << "        [--scroll <px>] [--click <x,y>]       Simulate APZ scroll or mouse click before render\n"
         << "        [--type <text>] [--enter]             Type into Omnibox or focused <input> and press Enter\n"
@@ -570,6 +723,7 @@ int main(int argc, char** argv) {
 
     std::string mode_url, out_png;
     std::vector<std::string> ext_dirs;
+    std::vector<std::string> download_urls;
     std::vector<std::pair<std::string, std::string>> cli_actions;
     bool run_tests = false, open_gui = false, run_repl = false, wireframe = false;
     int stress_tabs = 0;
@@ -585,6 +739,7 @@ int main(int argc, char** argv) {
         else if (arg == "--wireframe") wireframe = true;
         else if (arg == "--url" && i + 1 < argc) mode_url = argv[++i];
         else if (arg == "--out" && i + 1 < argc) out_png = argv[++i];
+        else if (arg == "--download" && i + 1 < argc) download_urls.emplace_back(argv[++i]);
         else if (arg == "--ext" && i + 1 < argc) ext_dirs.emplace_back(argv[++i]);
         else if (arg == "--click" && i + 1 < argc) cli_actions.emplace_back("click", argv[++i]);
         else if (arg == "--type" && i + 1 < argc) cli_actions.emplace_back("type", argv[++i]);
@@ -615,6 +770,17 @@ int main(int argc, char** argv) {
             std::cout << "[AstraExt] Loaded extension from " << ext_dir << "\n";
         } else {
             std::cerr << "[AstraExt] Failed to load extension: " << err << "\n";
+        }
+    }
+
+    for (const auto& dl_u : download_urls) {
+        auto rec = app.download_url(dl_u);
+        if (rec.ok) {
+            std::cout << "[AstraDL] Saved:  " << rec.saved_path << " (" << rec.bytes << " B, "
+                      << rec.protocol << ", " << std::fixed << std::setprecision(1) << rec.elapsed_ms << " ms)\n"
+                      << "          SHA256: " << rec.sha256_hex << "\n";
+        } else {
+            std::cerr << "[AstraDL] Failed: " << dl_u << " -> " << rec.error << "\n";
         }
     }
 
@@ -651,6 +817,7 @@ int main(int argc, char** argv) {
 
         std::cout << "[Astra] Loaded:       " << nav.final_url << "\n"
                   << "        Title:        " << nav.title << "\n"
+                  << "        Protocol:     " << (nav.protocol.empty() ? "local" : nav.protocol) << "\n"
                   << "        TLS Verified: " << (nav.tls_verified ? "YES (OS CA Store)" : "Local/N-A") << "\n"
                   << "        Cache Hit:    " << (nav.from_cache ? "YES" : "NO") << "\n"
                   << "        Ext CSS:      " << nav.external_css_loaded << " stylesheet(s)\n"
@@ -675,7 +842,7 @@ int main(int argc, char** argv) {
     }
 
     if (run_repl) {
-        std::cout << "Astra v4 Interactive Shell (open <url>, back, forward, reload, close <id>, tabs, switch <id>, scroll <px>, click <x> <y>, type <text>, enter, mem, shield, cache, render <file.png>, quit)\n";
+        std::cout << "Astra v5 Interactive Shell (open <url>, download <url>, downloads, back, forward, reload, close <id>, tabs, switch <id>, scroll <px>, click <x> <y>, type <text>, enter, mem, shield, cache, render <file.png>, quit)\n";
         app.new_tab("astra://home");
         std::string line;
         while (std::cout << "astra> " && std::getline(std::cin, line)) {
@@ -687,6 +854,15 @@ int main(int argc, char** argv) {
                 std::string u; iss >> u;
                 uint32_t id = app.new_tab(u);
                 std::cout << "Opened tab #" << id << " -> " << u << "\n";
+            } else if (cmd == "download") {
+                std::string u; iss >> u;
+                auto rec = app.download_url(u);
+                if (rec.ok) std::cout << "Saved " << rec.saved_path << " (" << rec.bytes << " B) SHA256=" << rec.sha256_hex << "\n";
+                else std::cout << "Download failed: " << rec.error << "\n";
+            } else if (cmd == "downloads") {
+                for (const auto& d : app.downloads()) {
+                    std::cout << "  " << d.filename << " [" << d.protocol << "] " << d.bytes << " B sha256:" << d.sha256_hex.substr(0, 16) << "...\n";
+                }
             } else if (cmd == "back") {
                 std::cout << (app.go_back() ? "Back OK.\n" : "No previous page.\n");
             } else if (cmd == "forward") {

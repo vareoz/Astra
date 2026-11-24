@@ -67,11 +67,24 @@ struct NavigationResult {
     bool rendered_via_ipc = false;
     bool tls_verified = false;
     bool from_cache = false;
+    std::string protocol;
+};
+
+struct DownloadRecord {
+    std::string url;
+    std::string filename;
+    std::string saved_path;
+    size_t bytes = 0;
+    std::string sha256_hex;
+    std::string protocol;
+    double elapsed_ms = 0.0;
+    bool ok = false;
+    std::string error;
 };
 
 struct ClickResult {
     bool handled = false;
-    std::string action; // "switch_tab", "new_tab", "close_tab", "focus_omnibox", "back", "forward", "reload", "navigate", "focus_input", "js_click", "orbit_3d", "seek_video", "step_video"
+    std::string action; // "switch_tab", "new_tab", "close_tab", "focus_omnibox", "back", "forward", "reload", "navigate", "download", "focus_input", "js_click", "orbit_3d", "seek_video", "step_video", "play_audio"
     std::string detail;
 };
 
@@ -123,6 +136,9 @@ public:
 
     bool decode_video_via_rdd(const std::string& path, uint32_t frame_idx, DecodedVideoFrame& out);
     bool load_image_subresource(const std::string& base_url, const std::string& src, DecodedImage& out);
+    DownloadRecord download_url(const std::string& url, const std::string& dest_dir = "/tmp/astra_downloads");
+    const std::vector<DownloadRecord>& downloads() const { return downloads_; }
+    static std::string compute_sha256_hex(std::string_view data);
 
     MemorySnapshot memory_snapshot() const;
     const AstraShield& shield() const { return shield_; }
@@ -140,11 +156,13 @@ public:
 private:
     Tab* find_tab(uint32_t id);
     const Tab* find_tab(uint32_t id) const;
-    void relayout_live_tab(Tab& tab);
+    void relayout_live_tab(Tab& tab, float vw = 1280.0f, float vh = 636.0f);
+    void persist_downloads_ledger() const;
     std::string resolve_source_html(const std::string& url,
                                     std::string& final_url,
                                     bool& tls_verified_out,
                                     bool& from_cache_out,
+                                    std::string& protocol_out,
                                     std::string& error_out);
     std::string fetch_external_stylesheets(const HtmlDocument& doc,
                                            const std::string& base_url,
@@ -176,7 +194,9 @@ private:
     WorkerProcess media_worker_;
 
     std::vector<Tab> tabs_;
+    std::vector<DownloadRecord> downloads_;
     std::unordered_map<std::string, DecodedImage> image_cache_;
+    std::unordered_map<std::string, AudioBlitCard> audio_cache_;
     uint32_t next_tab_id_ = 1;
     uint32_t active_tab_id_ = 0;
     uint64_t tick_counter_ = 0;

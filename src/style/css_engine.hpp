@@ -57,6 +57,11 @@ enum class PositionType : uint8_t {
     Fixed
 };
 
+enum class OverflowMode : uint8_t {
+    Visible,
+    Hidden
+};
+
 struct BoxShadow {
     bool enabled = false;
     float offset_x = 0.0f;
@@ -76,6 +81,7 @@ struct ComputedStyle {
     DisplayType display = DisplayType::Block;
     FlexDirection flex_direction = FlexDirection::Row;
     PositionType position = PositionType::Static;
+    OverflowMode overflow = OverflowMode::Visible;
     std::vector<GridTrack> grid_columns;
     float gap = 0.0f;
     float width = -1.0f;   // < 0 means auto
@@ -113,6 +119,8 @@ struct CssRule {
     std::vector<std::string> selectors;
     std::vector<CssDeclaration> declarations;
     size_t source_order = 0;
+    float media_min_width = -1.0f;
+    float media_max_width = -1.0f;
 };
 
 class CssStylesheet {
@@ -121,6 +129,7 @@ public:
     const std::vector<CssRule>& rules() const { return rules_; }
 
 private:
+    void parse_block(std::string_view css, float min_w, float max_w);
     std::vector<CssRule> rules_;
 };
 
@@ -131,7 +140,8 @@ public:
 
     static ComputedStyle compute_style(const DomNode* node,
                                        const CssStylesheet& sheet,
-                                       const ComputedStyle* parent_style);
+                                       const ComputedStyle* parent_style,
+                                       float viewport_w = 1280.0f);
 };
 
 } // namespace astra

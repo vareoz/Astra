@@ -9,6 +9,7 @@ SRCS := \
 	src/ipc/ipc_channel.cpp \
 	src/privacy/shield.cpp \
 	src/net/http_cache.cpp \
+	src/net/http2_client.cpp \
 	src/net/http_client.cpp \
 	src/dom/html_parser.cpp \
 	src/style/css_engine.cpp \

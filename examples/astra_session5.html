@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Astra Browser v5 — Showcase Nativo (Sesión 5)</title>
+  <style>
+    body {
+      background: #0b0f19;
+      color: #e2e8f0;
+      padding: 16px 24px;
+    }
+    .hero {
+      background: #111827;
+      border: 1px solid #1e293b;
+      border-radius: 12px;
+      padding: 14px 20px;
+      margin-bottom: 14px;
+      box-shadow: 0 6px 16px rgba(0, 0, 0, 0.45);
+    }
+    .kicker {
+      color: #38bdf8;
+      font-size: 11px;
+      font-weight: bold;
+      font-family: monospace;
+      margin-bottom: 4px;
+    }
+    .mode-badge {
+      background: #92400e;
+      color: #fef3c7;
+      border: 1px solid #f59e0b;
+      border-radius: 8px;
+      padding: 5px 12px;
+      font-size: 12px;
+      font-family: monospace;
+      font-weight: bold;
+      margin-top: 8px;
+      width: 540px;
+    }
+    @media (min-width: 1000px) {
+      .mode-badge {
+        background: #0c4a6e;
+        color: #7dd3fc;
+        border: 1px solid #38bdf8;
+      }
+    }
+    .grid-top {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+    .card {
+      background: #131c2e;
+      border: 1px solid #24324a;
+      border-radius: 10px;
+      padding: 14px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+    }
+    .card-title {
+      color: #7dd3fc;
+      font-size: 11px;
+      font-weight: bold;
+      font-family: monospace;
+      margin-bottom: 6px;
+    }
+    .active-glow {
+      border: 1px solid #10b981;
+      background: #0f2922;
+    }
+    .clip-box {
+      background: #0f172a;
+      border: 1px solid #38bdf8;
+      border-radius: 8px;
+      padding: 8px;
+      height: 46px;
+      overflow: hidden;
+    }
+    .clip-inner {
+      background: #1e293b;
+      border-radius: 6px;
+      padding: 7px 10px;
+      color: #e2e8f0;
+      font-size: 12px;
+    }
+    .clip-overflow-warning {
+      background: #dc2626;
+      color: #ffffff;
+      padding: 10px;
+      margin-top: 8px;
+      height: 60px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: bold;
+    }
+    .media-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+    .dl-link {
+      color: #34d399;
+      font-size: 12px;
+      font-family: monospace;
+    }
+  </style>
+</head>
+<body>
+  <div class="hero">
+    <div class="kicker">ASTRA BROWSER v5 | HTTP/2 + HPACK | ASYNC/AWAIT + CLOSURES | @MEDIA + ASD4 CLIPPING | ALSA AUDIO</div>
+    <h1>Astra v5 — Motor Nativo C++20 (Sesión 5)</h1>
+    <div id="mq-badge" class="mode-badge">@media (min-width: 1000px) ACTIVO — Modo Escritorio 1280px</div>
+  </div>
+
+  <div class="grid-top">
+    <div id="js-card" class="card">
+      <div class="card-title">ASTRAJS v5: ASYNC/AWAIT + CLOSURES + INNERHTML</div>
+      <div id="js-slot"><p>Cargando motor async...</p></div>
+      <p style="margin-top: 6px;">
+        <a class="dl-link" href="astra_data.json" download>Descargar astra_data.json (SHA-256 Nativo)</a>
+      </p>
+    </div>
+
+    <div class="card">
+      <div class="card-title">WEBRENDER ASD4: OVERFLOW: HIDDEN PIXEL CLIPPING</div>
+      <div class="clip-box">
+        <div class="clip-inner">Contenido visible dentro de caja de 46px con overflow: hidden.</div>
+        <div class="clip-overflow-warning">BLOQUE ROJO RECORTADO ESTRICTAMENTE POR WEBRENDER ASD4!</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="media-row">
+    <div class="card">
+      <div class="card-title">ASTRAMEDIA v4: REPRODUCTOR DE AUDIO + WAVEFORM PCM + ALSA</div>
+      <audio src="astra_chime.wav" style="height: 150px;"></audio>
+    </div>
+    <div class="card">
+      <div class="card-title">ASTRA3D v2: ESCENA PLANETARIA NATIVA (SIN TERCEROS)</div>
+      <astra-3d scene="planet" style="height: 150px;"></astra-3d>
+    </div>
+  </div>
+
+  <script>
+    const makeCounter = (start) => {
+      let n = start;
+      return () => {
+        n = n + 1;
+        return n;
+      };
+    };
+
+    const nextTick = makeCounter(10);
+    const a = nextTick();
+    const b = nextTick();
+
+    async function hydrate() {
+      const payload = await Promise.resolve(a + b);
+      const card = document.querySelector("#js-card");
+      card.classList.add("active-glow");
+      const slot = document.querySelector("#js-slot");
+      slot.innerHTML = "<p>Closures lexicos: " + a + " y " + b + " | await Promise: " + payload + "</p><p>classList.contains(active-glow): " + card.classList.contains("active-glow") + "</p>";
+    }
+
+    hydrate();
+  </script>
+</body>
+</html>

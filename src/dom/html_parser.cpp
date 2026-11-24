@@ -125,6 +125,13 @@ void DomNode::set_attr(std::string_view name, std::string_view value) {
     attrs.push_back(DomAttr{std::move(low), std::string(value)});
 }
 
+void DomNode::remove_attr(std::string_view name) {
+    std::string low = to_lower(name);
+    attrs.erase(std::remove_if(attrs.begin(), attrs.end(),
+                               [&](const DomAttr& a) { return a.name == low; }),
+                attrs.end());
+}
+
 bool DomNode::has_class(std::string_view cls) const {
     std::string classes = get_attr("class");
     if (classes.empty()) return false;
@@ -138,6 +145,43 @@ bool DomNode::has_class(std::string_view cls) const {
         }
     }
     return false;
+}
+
+void DomNode::add_class(std::string_view cls) {
+    if (cls.empty() || has_class(cls)) return;
+    std::string cur = get_attr("class");
+    if (!cur.empty()) cur.push_back(' ');
+    cur.append(cls);
+    set_attr("class", cur);
+}
+
+void DomNode::remove_class(std::string_view cls) {
+    std::string cur = get_attr("class");
+    if (cur.empty()) return;
+    std::string rebuilt;
+    size_t pos = 0;
+    while (pos < cur.size()) {
+        while (pos < cur.size() && std::isspace(static_cast<unsigned char>(cur[pos]))) ++pos;
+        size_t start = pos;
+        while (pos < cur.size() && !std::isspace(static_cast<unsigned char>(cur[pos]))) ++pos;
+        if (pos > start) {
+            std::string_view tok(cur.data() + start, pos - start);
+            if (tok != cls) {
+                if (!rebuilt.empty()) rebuilt.push_back(' ');
+                rebuilt.append(tok);
+            }
+        }
+    }
+    set_attr("class", rebuilt);
+}
+
+bool DomNode::toggle_class(std::string_view cls) {
+    if (has_class(cls)) {
+        remove_class(cls);
+        return false;
+    }
+    add_class(cls);
+    return true;
 }
 
 std::string DomNode::text_content() const {
@@ -156,6 +200,52 @@ void DomNode::set_text_content(SlabArena& arena, std::string_view new_text) {
     t->text = std::string(new_text);
     t->parent = this;
     children.push_back(t);
+}
+
+namespace {
+void serialize_node_html(const DomNode* n, std::string& out) {
+    if (!n) return;
+    if (n->type == NodeType::Text) {
+        out += n->text;
+        return;
+    }
+    if (n->type == NodeType::Element) {
+        out.push_back('<');
+        out += n->tag;
+        for (const auto& a : n->attrs) {
+            out.push_back(' ');
+            out += a.name;
+            out += "=\"";
+            out += a.value;
+            out.push_back('"');
+        }
+        out.push_back('>');
+        if (!is_void_tag(n->tag)) {
+            for (const DomNode* ch : n->children) serialize_node_html(ch, out);
+            out += "</";
+            out += n->tag;
+            out.push_back('>');
+        }
+    }
+}
+} // namespace
+
+std::string DomNode::inner_html() const {
+    std::string out;
+    for (const DomNode* ch : children) serialize_node_html(ch, out);
+    return out;
+}
+
+void DomNode::set_inner_html(SlabArena& arena, std::string_view html) {
+    children.clear();
+    if (html.empty()) return;
+    HtmlDocument frag = HtmlDocument::parse(arena, html);
+    DomNode* src_root = frag.root();
+    if (!src_root) return;
+    for (DomNode* ch : src_root->children) {
+        ch->parent = this;
+        children.push_back(ch);
+    }
 }
 
 HtmlDocument::HtmlDocument(SlabArena& arena) : arena_(arena) {

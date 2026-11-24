@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <dlfcn.h>
 #include <fstream>
 #include <sstream>
 #include <sys/wait.h>
@@ -491,6 +492,131 @@ bool MediaEngine::decode_audio_pcm(const std::string& path,
     out_audio.duration_sec = static_cast<double>(sample_count) / static_cast<double>(ch * sr);
     out_audio.valid = true;
     return true;
+}
+
+namespace {
+
+struct AlsaApi {
+    void* lib = nullptr;
+    bool loaded = false;
+
+    using snd_pcm_open_fn = int (*)(void**, const char*, int, int);
+    using snd_pcm_set_params_fn = int (*)(void*, int, int, unsigned int, unsigned int, int, unsigned int);
+    using snd_pcm_writei_fn = long (*)(void*, const void*, unsigned long);
+    using snd_pcm_prepare_fn = int (*)(void*);
+    using snd_pcm_drain_fn = int (*)(void*);
+    using snd_pcm_close_fn = int (*)(void*);
+
+    snd_pcm_open_fn snd_pcm_open = nullptr;
+    snd_pcm_set_params_fn snd_pcm_set_params = nullptr;
+    snd_pcm_writei_fn snd_pcm_writei = nullptr;
+    snd_pcm_prepare_fn snd_pcm_prepare = nullptr;
+    snd_pcm_drain_fn snd_pcm_drain = nullptr;
+    snd_pcm_close_fn snd_pcm_close = nullptr;
+
+    static void silent_err(const char*, int, const char*, int, const char*, ...) {}
+
+    AlsaApi() {
+        lib = dlopen("libasound.so.2", RTLD_LAZY);
+        if (!lib) lib = dlopen("libasound.so", RTLD_LAZY);
+        if (!lib) return;
+        using err_cb_t = void (*)(const char*, int, const char*, int, const char*, ...);
+        using set_err_fn = int (*)(err_cb_t);
+        auto set_err = reinterpret_cast<set_err_fn>(dlsym(lib, "snd_lib_error_set_handler"));
+        if (set_err) set_err(&AlsaApi::silent_err);
+        snd_pcm_open = reinterpret_cast<snd_pcm_open_fn>(dlsym(lib, "snd_pcm_open"));
+        snd_pcm_set_params = reinterpret_cast<snd_pcm_set_params_fn>(dlsym(lib, "snd_pcm_set_params"));
+        snd_pcm_writei = reinterpret_cast<snd_pcm_writei_fn>(dlsym(lib, "snd_pcm_writei"));
+        snd_pcm_prepare = reinterpret_cast<snd_pcm_prepare_fn>(dlsym(lib, "snd_pcm_prepare"));
+        snd_pcm_drain = reinterpret_cast<snd_pcm_drain_fn>(dlsym(lib, "snd_pcm_drain"));
+        snd_pcm_close = reinterpret_cast<snd_pcm_close_fn>(dlsym(lib, "snd_pcm_close"));
+        loaded = snd_pcm_open && snd_pcm_set_params && snd_pcm_writei &&
+                 snd_pcm_prepare && snd_pcm_drain && snd_pcm_close;
+    }
+};
+
+AlsaApi& alsa_api() {
+    static AlsaApi api;
+    return api;
+}
+
+} // namespace
+
+std::vector<float> MediaEngine::compute_waveform_peaks(const DecodedAudioBuffer& audio, size_t buckets) {
+    std::vector<float> peaks(buckets, 0.08f);
+    if (!audio.valid || audio.pcm_s16.empty() || buckets == 0) return peaks;
+    size_t total = audio.pcm_s16.size();
+    size_t step = std::max<size_t>(1, total / buckets);
+    float max_p = 0.01f;
+    for (size_t b = 0; b < buckets; ++b) {
+        size_t s0 = b * step;
+        size_t s1 = std::min(total, s0 + step);
+        float pk = 0.0f;
+        for (size_t i = s0; i < s1; ++i) {
+            float v = std::fabs(static_cast<float>(audio.pcm_s16[i]) / 32768.0f);
+            if (v > pk) pk = v;
+        }
+        peaks[b] = pk;
+        if (pk > max_p) max_p = pk;
+    }
+    for (float& p : peaks) {
+        p = std::clamp(0.12f + 0.88f * (p / max_p), 0.10f, 1.0f);
+    }
+    return peaks;
+}
+
+bool MediaEngine::alsa_available() {
+    return alsa_api().loaded;
+}
+
+AudioPlaybackReport MediaEngine::play_audio_alsa(const DecodedAudioBuffer& audio) {
+    AudioPlaybackReport rep;
+    auto& api = alsa_api();
+    rep.alsa_library_loaded = api.loaded;
+    if (!api.loaded) {
+        rep.status = "alsa_not_installed";
+        return rep;
+    }
+    if (!audio.valid || audio.pcm_s16.empty()) {
+        rep.status = "invalid_audio_buffer";
+        return rep;
+    }
+
+    void* pcm = nullptr;
+    // SND_PCM_STREAM_PLAYBACK = 0, SND_PCM_NONBLOCK = 1
+    if (api.snd_pcm_open(&pcm, "default", 0, 0) < 0 || !pcm) {
+        rep.status = "headless_no_soundcard";
+        return rep;
+    }
+    rep.device_opened = true;
+
+    // SND_PCM_FORMAT_S16_LE = 2, SND_PCM_ACCESS_RW_INTERLEAVED = 3
+    unsigned int ch = std::max<uint16_t>(1, audio.channels);
+    unsigned int sr = std::max<uint32_t>(8000, audio.sample_rate);
+    if (api.snd_pcm_set_params(pcm, 2, 3, ch, sr, 1, 100000) < 0) {
+        api.snd_pcm_close(pcm);
+        rep.status = "alsa_params_rejected";
+        return rep;
+    }
+
+    size_t total_frames = audio.pcm_s16.size() / ch;
+    size_t offset = 0;
+    while (offset < total_frames) {
+        unsigned long chunk = static_cast<unsigned long>(std::min<size_t>(2048, total_frames - offset));
+        long written = api.snd_pcm_writei(pcm, audio.pcm_s16.data() + offset * ch, chunk);
+        if (written < 0) {
+            api.snd_pcm_prepare(pcm);
+            break;
+        }
+        offset += static_cast<size_t>(written);
+    }
+    api.snd_pcm_drain(pcm);
+    api.snd_pcm_close(pcm);
+
+    rep.frames_written = offset;
+    rep.played = (offset > 0);
+    rep.status = rep.played ? "played" : "write_failed";
+    return rep;
 }
 
 } // namespace astra

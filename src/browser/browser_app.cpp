@@ -67,10 +67,86 @@ std::string normalize_omnibox_url(std::string raw) {
     return "https://" + raw;
 }
 
-std::string build_home_html(const AstraShield& shield, size_t ext_count,
-                            const MemorySnapshot& mem, const CacheStats& cstats) {
+std::string escape_html_text(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        if (c == '&') out += "&amp;";
+        else if (c == '<') out += "&lt;";
+        else if (c == '>') out += "&gt;";
+        else if (c == '"') out += "&quot;";
+        else out.push_back(c);
+    }
+    return out;
+}
+
+std::string json_escape_str(std::string_view s) {
+    std::string out;
+    out.reserve(s.size() + 4);
+    for (char c : s) {
+        if (c == '\\') out += "\\\\";
+        else if (c == '"') out += "\\\"";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else out.push_back(c);
+    }
+    return out;
+}
+
+std::string build_downloads_html(const std::vector<DownloadRecord>& downloads) {
+    size_t total_bytes = 0;
+    for (const auto& d : downloads) {
+        if (d.ok) total_bytes += d.bytes;
+    }
     std::ostringstream html;
-    html << "<!doctype html><html><head><title>Astra Browser v4 — Native Core</title>"
+    html << "<!doctype html><html><head><title>Astra Downloads — Native Manager</title>"
+         << "<style>"
+         << "body { background: #0b0f19; color: #e2e8f0; padding: 20px 28px; }"
+         << ".hero { background: #111827; border: 1px solid #1e293b; border-radius: 12px; padding: 16px 22px; margin-bottom: 16px; box-shadow: 0 6px 16px rgba(0,0,0,0.4); }"
+         << ".kicker { color: #38bdf8; font-size: 12px; font-weight: bold; font-family: monospace; margin-bottom: 6px; }"
+         << ".summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 16px; }"
+         << ".stat { background: #131c2e; border: 1px solid #24324a; border-radius: 10px; padding: 12px 16px; }"
+         << ".stat-lbl { color: #7dd3fc; font-size: 11px; font-weight: bold; font-family: monospace; margin-bottom: 4px; }"
+         << ".stat-val { color: #f8fafc; font-size: 20px; font-weight: bold; }"
+         << ".dl-card { background: #111827; border: 1px solid #1e293b; border-radius: 10px; padding: 14px 18px; margin-bottom: 12px; }"
+         << ".dl-name { color: #f8fafc; font-size: 16px; font-weight: bold; margin-bottom: 4px; }"
+         << ".dl-meta { color: #94a3b8; font-size: 12px; font-family: monospace; margin-bottom: 4px; }"
+         << ".dl-hash { color: #34d399; font-size: 11px; font-family: monospace; }"
+         << "</style></head><body>"
+         << "<div class=\"hero\">"
+         << "<div class=\"kicker\">ASTRA DOWNLOADS MANAGER | SHA-256 VERIFIED | HTTP/2 + TLS 1.3 + ASTRASHIELD</div>"
+         << "<h1>Native Downloads Ledger</h1>"
+         << "<p>Every file downloaded through Astra is filtered by AstraShield + MV3 DNR, written to /tmp/astra_downloads/, and checksummed with native FIPS 180-4 SHA-256.</p>"
+         << "</div>"
+         << "<div class=\"summary\">"
+         << "<div class=\"stat\"><div class=\"stat-lbl\">TOTAL FILES</div><div class=\"stat-val\">" << downloads.size() << "</div></div>"
+         << "<div class=\"stat\"><div class=\"stat-lbl\">TOTAL SAVED</div><div class=\"stat-val\">" << total_bytes << " B</div></div>"
+         << "<div class=\"stat\"><div class=\"stat-lbl\">INTEGRITY</div><div class=\"stat-val\">SHA-256</div></div>"
+         << "</div>";
+    if (downloads.empty()) {
+        html << "<div class=\"dl-card\"><div class=\"dl-name\">No downloads yet</div>"
+             << "<div class=\"dl-meta\">Click any &lt;a download&gt; link or run: astra --download &lt;url&gt;</div></div>";
+    } else {
+        for (auto it = downloads.rbegin(); it != downloads.rend(); ++it) {
+            const auto& d = *it;
+            html << "<div class=\"dl-card\">"
+                 << "<div class=\"dl-name\">" << escape_html_text(d.filename)
+                 << " [" << escape_html_text(d.protocol.empty() ? "http/1.1" : d.protocol) << "]</div>"
+                 << "<div class=\"dl-meta\">Path: " << escape_html_text(d.saved_path)
+                 << " | Size: " << d.bytes << " B | Time: " << std::fixed << std::setprecision(1) << d.elapsed_ms << " ms</div>"
+                 << "<div class=\"dl-hash\">SHA-256: " << escape_html_text(d.sha256_hex) << "</div>"
+                 << "</div>";
+        }
+    }
+    html << "</body></html>";
+    return html.str();
+}
+
+std::string build_home_html(const AstraShield& shield, size_t ext_count,
+                            const MemorySnapshot& mem, const CacheStats& cstats,
+                            size_t h2_count, size_t dl_count) {
+    std::ostringstream html;
+    html << "<!doctype html><html><head><title>Astra Browser v5 — Native Core</title>"
          << "<style>"
          << "body { background: #0b0f19; color: #e2e8f0; padding: 18px 26px; }"
          << ".hero { background: #111827; border: 1px solid #1e293b; border-radius: 12px; padding: 16px 22px; margin-bottom: 14px; box-shadow: 0 6px 16px rgba(0,0,0,0.45); }"
@@ -84,25 +160,25 @@ std::string build_home_html(const AstraShield& shield, size_t ext_count,
          << ".panel { background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.35); }"
          << "</style></head><body>"
          << "<div class=\"hero\">"
-         << "<div class=\"kicker\">ASTRA v4 NATIVE C++20 | CHROME v4 OMNIBOX | CSS POSITION+Z-INDEX | PROMISES | PARALLEL NET | MEDIA SCRUBBER</div>"
-         << "<h1 id=\"headline\">Astra Desktop Browser — Session 4</h1>"
-         << "<p>Multi-process e10s engine (Main + Content + RDD Media) with interactive Omnibox/History/Tabs, TrueType UTF-8 fonts, JPEG+PNG decoders, CSS Grid + absolute/fixed + z-index + box-shadow, AstraJS v4 Promises & persistent localStorage, parallel TLS 1.3 subresources, and interactive Astra3D/AstraMedia v3.</p>"
+         << "<div class=\"kicker\">ASTRA v5 NATIVE C++20 | HTTP/2 + HPACK | ASYNC/AWAIT + CLOSURES | @MEDIA + CLIPPING | ALSA AUDIO</div>"
+         << "<h1 id=\"headline\">Astra Desktop Browser — Session 5</h1>"
+         << "<p>Multi-process e10s engine (Main + Content + RDD Media) with native HTTP/2 (RFC 7540 + HPACK/Huffman), keep-alive pool, AstraJS v5 async/await + lexical closures + innerHTML/classList, CSS @media + WebRender overflow:hidden clipping (ASD4), ALSA audio waveform player, and SHA-256 Downloads Manager.</p>"
          << "</div>"
          << "<div class=\"grid\">"
          << "<div class=\"card\"><div class=\"card-title\">MEMORY GOVERNOR</div>"
          << "<div class=\"metric\">" << (mem.total_rss_bytes / (1024 * 1024)) << " / " << (mem.ceiling_bytes / (1024 * 1024)) << " MB</div>"
-         << "<div class=\"muted\">Real Linux /proc RSS + Cache Hits: " << cstats.hits << "</div></div>"
+         << "<div class=\"muted\">Real Linux /proc RSS | Cache Hits: " << cstats.hits << " | H2: " << h2_count << "</div></div>"
          << "<div class=\"card\"><div class=\"card-title\">ASTRA SHIELD PRIVACY</div>"
          << "<div class=\"metric\">" << shield.blocklist_size() << " Rules | " << shield.stats().trackers_blocked << " Blocked</div>"
-         << "<div class=\"muted\">Total Cookie Partitioning + TLS 1.3 ALPN + GPC</div></div>"
-         << "<div class=\"card\"><div class=\"card-title\">WEBEXTENSIONS MV3</div>"
-         << "<div class=\"metric\">" << ext_count << " Active</div>"
-         << "<div class=\"muted\">Multi-Ext DNR + chrome.storage + AstraJS v4</div></div>"
+         << "<div class=\"muted\">Total Cookie Partitioning + TLS 1.3 ALPN h2 + GPC</div></div>"
+         << "<div class=\"card\"><div class=\"card-title\">EXTENSIONS &amp; DOWNLOADS</div>"
+         << "<div class=\"metric\">" << ext_count << " Ext | " << dl_count << " Downloads</div>"
+         << "<div class=\"muted\"><a href=\"astra://downloads\">Open astra://downloads</a> | MV3 DNR</div></div>"
          << "</div>"
          << "<div class=\"media-row\">"
          << "<div class=\"panel\"><div class=\"card-title\">ASTRA3D v2 SMOOTH SHADER ENGINE</div>"
          << "<astra-3d scene=\"planet\" style=\"height: 245px;\"></astra-3d></div>"
-         << "<div class=\"panel\"><div class=\"card-title\">ASTRAMEDIA v3 RDD INTERACTIVE PLAYER</div>"
+         << "<div class=\"panel\"><div class=\"card-title\">ASTRAMEDIA v4 RDD INTERACTIVE PLAYER</div>"
          << "<video src=\"examples/astra_demo.mp4\" style=\"height: 245px;\"></video></div>"
          << "</div>"
          << "</body></html>";
@@ -110,6 +186,154 @@ std::string build_home_html(const AstraShield& shield, size_t ext_count,
 }
 
 } // namespace
+
+std::string BrowserApp::compute_sha256_hex(std::string_view data) {
+    static constexpr uint32_t kK[64] = {
+        0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+        0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u, 0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+        0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu, 0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+        0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u, 0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+        0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u, 0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+        0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u, 0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+        0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u, 0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+        0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u, 0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u
+    };
+    auto rotr = [](uint32_t x, uint32_t n) -> uint32_t { return (x >> n) | (x << (32u - n)); };
+
+    uint32_t h[8] = {
+        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
+    };
+
+    std::vector<uint8_t> msg(data.begin(), data.end());
+    uint64_t bit_len = static_cast<uint64_t>(msg.size()) * 8ULL;
+    msg.push_back(0x80u);
+    while ((msg.size() % 64) != 56) msg.push_back(0x00u);
+    for (int i = 7; i >= 0; --i) {
+        msg.push_back(static_cast<uint8_t>((bit_len >> (i * 8)) & 0xFFu));
+    }
+
+    for (size_t off = 0; off < msg.size(); off += 64) {
+        uint32_t w[64];
+        for (int i = 0; i < 16; ++i) {
+            w[i] = (static_cast<uint32_t>(msg[off + i * 4]) << 24) |
+                   (static_cast<uint32_t>(msg[off + i * 4 + 1]) << 16) |
+                   (static_cast<uint32_t>(msg[off + i * 4 + 2]) << 8) |
+                   static_cast<uint32_t>(msg[off + i * 4 + 3]);
+        }
+        for (int i = 16; i < 64; ++i) {
+            uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3];
+        uint32_t e = h[4], f = h[5], g = h[6], hh = h[7];
+        for (int i = 0; i < 64; ++i) {
+            uint32_t S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            uint32_t ch = (e & f) ^ ((~e) & g);
+            uint32_t temp1 = hh + S1 + ch + kK[i] + w[i];
+            uint32_t S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            uint32_t temp2 = S0 + maj;
+            hh = g; g = f; f = e; e = d + temp1;
+            d = c; c = b; b = a; a = temp1 + temp2;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+        h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+    }
+
+    std::ostringstream hex;
+    hex << std::hex << std::setfill('0');
+    for (int i = 0; i < 8; ++i) hex << std::setw(8) << h[i];
+    return hex.str();
+}
+
+void BrowserApp::persist_downloads_ledger() const {
+    std::error_code ec;
+    std::filesystem::create_directories("/tmp/astra_downloads", ec);
+    std::ofstream f("/tmp/astra_downloads/ledger.json", std::ios::trunc);
+    if (!f) return;
+    f << "[\n";
+    for (size_t i = 0; i < downloads_.size(); ++i) {
+        const auto& d = downloads_[i];
+        f << "  {\"filename\":\"" << json_escape_str(d.filename)
+          << "\",\"url\":\"" << json_escape_str(d.url)
+          << "\",\"saved_path\":\"" << json_escape_str(d.saved_path)
+          << "\",\"bytes\":" << d.bytes
+          << ",\"protocol\":\"" << json_escape_str(d.protocol)
+          << "\",\"sha256\":\"" << d.sha256_hex << "\"}"
+          << (i + 1 < downloads_.size() ? "," : "") << "\n";
+    }
+    f << "]\n";
+}
+
+DownloadRecord BrowserApp::download_url(const std::string& url, const std::string& dest_dir) {
+    auto t0 = std::chrono::steady_clock::now();
+    DownloadRecord rec;
+    rec.url = url;
+
+    std::string payload;
+    if (url.rfind("file://", 0) == 0) {
+        std::string src_path = url.substr(7);
+        if (!read_local_file(src_path, payload)) {
+            rec.error = "Cannot read local file: " + src_path;
+            return rec;
+        }
+        rec.protocol = "file";
+    } else if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
+        HttpResponse resp = http_.get(url, "", false);
+        if (resp.blocked_by_privacy || resp.blocked_by_extension) {
+            rec.error = resp.error;
+            return rec;
+        }
+        if (resp.status_code < 200 || resp.status_code >= 400) {
+            rec.error = resp.error.empty() ? ("HTTP " + std::to_string(resp.status_code)) : resp.error;
+            return rec;
+        }
+        payload = std::move(resp.body);
+        rec.protocol = !resp.alpn_protocol.empty() ? resp.alpn_protocol : "http/1.1";
+    } else {
+        rec.error = "Unsupported download scheme";
+        return rec;
+    }
+
+    // Derive clean filename
+    std::string clean_url = url;
+    size_t qpos = clean_url.find('?');
+    if (qpos != std::string::npos) clean_url.resize(qpos);
+    size_t slash = clean_url.rfind('/');
+    std::string fname = (slash != std::string::npos && slash + 1 < clean_url.size())
+                            ? clean_url.substr(slash + 1)
+                            : "astra_download.bin";
+    for (char& c : fname) {
+        if (c == '/' || c == '\\' || c == ':' || c == '\0') c = '_';
+    }
+    if (fname.empty() || fname == "." || fname == "..") fname = "astra_download.bin";
+
+    std::error_code ec;
+    std::filesystem::create_directories(dest_dir, ec);
+    std::string out_path = dest_dir + "/" + fname;
+
+    std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        rec.error = "Cannot write download file: " + out_path;
+        return rec;
+    }
+    out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    out.close();
+
+    auto t1 = std::chrono::steady_clock::now();
+    rec.filename = fname;
+    rec.saved_path = out_path;
+    rec.bytes = payload.size();
+    rec.sha256_hex = compute_sha256_hex(payload);
+    rec.elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    rec.ok = true;
+
+    downloads_.push_back(rec);
+    persist_downloads_ledger();
+    return rec;
+}
 
 BrowserApp::BrowserApp(uint64_t ram_ceiling_bytes)
     : cache_("/tmp/astra_http_cache", 32ULL * 1024 * 1024),
@@ -382,13 +606,19 @@ std::string BrowserApp::resolve_source_html(const std::string& url,
                                             std::string& final_url,
                                             bool& tls_verified_out,
                                             bool& from_cache_out,
+                                            std::string& protocol_out,
                                             std::string& error_out) {
     final_url = url;
     tls_verified_out = false;
     from_cache_out = false;
+    protocol_out = "astra";
 
     if (url == "astra://home" || url == "astra://start") {
-        return build_home_html(shield_, extensions_.extensions().size(), memory_snapshot(), cache_.stats());
+        return build_home_html(shield_, extensions_.extensions().size(), memory_snapshot(),
+                               cache_.stats(), http_.http2_requests(), downloads_.size());
+    }
+    if (url == "astra://downloads") {
+        return build_downloads_html(downloads_);
     }
     if (url == "astra://3d") {
         return "<!doctype html><html><head><title>Astra3D Studio</title>"
@@ -400,6 +630,7 @@ std::string BrowserApp::resolve_source_html(const std::string& url,
                "</div></body></html>";
     }
     if (url.rfind("file://", 0) == 0) {
+        protocol_out = "file";
         std::string path = url.substr(7);
         if (ends_with(path, ".pdf")) {
             ParsedDocument doc = DocViewer::parse_pdf_file(path);
@@ -419,6 +650,10 @@ std::string BrowserApp::resolve_source_html(const std::string& url,
             return "<!doctype html><html><head><title>AstraMedia Player: " + path + "</title></head><body>"
                    "<h1>AstraMedia Native Video Player</h1><video src=\"" + path + "\" style=\"height:460px;\"></video></body></html>";
         }
+        if (ends_with(path, ".wav")) {
+            return "<!doctype html><html><head><title>AstraMedia Audio: " + path + "</title></head><body>"
+                   "<h1>AstraMedia v4 Native Audio Player</h1><audio src=\"" + path + "\"></audio></body></html>";
+        }
         std::string text;
         if (!read_local_file(path, text)) { error_out = "Cannot open local file: " + path; return {}; }
         return text;
@@ -428,6 +663,7 @@ std::string BrowserApp::resolve_source_html(const std::string& url,
     final_url = resp.final_url.empty() ? url : resp.final_url;
     tls_verified_out = resp.tls_verified;
     from_cache_out = resp.from_cache;
+    protocol_out = !resp.alpn_protocol.empty() ? resp.alpn_protocol : "http/1.1";
 
     if (resp.blocked_by_privacy || resp.blocked_by_extension) {
         error_out = resp.error;
@@ -578,13 +814,13 @@ bool BrowserApp::render_html_via_content_ipc(const std::string& html,
     return DisplayList::deserialize(blob, out_dl);
 }
 
-void BrowserApp::relayout_live_tab(Tab& tab) {
+void BrowserApp::relayout_live_tab(Tab& tab, float vw, float vh) {
     if (!tab.live_arena || !tab.live_doc) return;
     CssStylesheet sheet;
     sheet.parse(tab.live_doc->collect_stylesheets());
     if (!tab.extra_css.empty()) sheet.parse(tab.extra_css);
-    LayoutFrame* root = LayoutEngine::build_layout(*tab.live_arena, *tab.live_doc, sheet, 1280.0f, 636.0f);
-    tab.cached_display_list = LayoutEngine::build_display_list(root, 1280, 636);
+    LayoutFrame* root = LayoutEngine::build_layout(*tab.live_arena, *tab.live_doc, sheet, vw, vh);
+    tab.cached_display_list = LayoutEngine::build_display_list(root, static_cast<uint32_t>(vw), static_cast<uint32_t>(vh));
     tab.arena_bytes = tab.live_arena->bytes_used();
 }
 
@@ -599,9 +835,9 @@ NavigationResult BrowserApp::navigate(uint32_t tab_id, const std::string& url, b
         return res;
     }
 
-    std::string final_url, err;
+    std::string final_url, err, proto;
     bool tls_ok = false, cached_hit = false;
-    std::string html = resolve_source_html(url, final_url, tls_ok, cached_hit, err);
+    std::string html = resolve_source_html(url, final_url, tls_ok, cached_hit, proto, err);
     if (html.empty()) {
         res.error = err;
         return res;
@@ -708,6 +944,7 @@ NavigationResult BrowserApp::navigate(uint32_t tab_id, const std::string& url, b
     res.external_css_loaded = ext_css_count;
     res.tls_verified = tls_ok;
     res.from_cache = cached_hit;
+    res.protocol = proto;
     res.elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     return res;
 }
@@ -890,6 +1127,27 @@ ClickResult BrowserApp::click_at(int x, int y) {
         out.handled = true;
         out.action = "navigate";
         out.detail = next_url;
+    } else if (hit->kind == HitRegionKind::Download) {
+        std::string dl_url = HttpClient::resolve_relative_url(active->url, hit->target);
+        DownloadRecord rec = download_url(dl_url);
+        out.handled = rec.ok;
+        out.action = "download";
+        out.detail = rec.ok ? (rec.saved_path + " sha256:" + rec.sha256_hex.substr(0, 12)) : rec.error;
+    } else if (hit->kind == HitRegionKind::Audio) {
+        std::string path = hit->target;
+        std::string resolved = HttpClient::resolve_relative_url(active->url, hit->target);
+        if (resolved.rfind("file://", 0) == 0 && std::ifstream(resolved.substr(7))) {
+            path = resolved.substr(7);
+        } else if (!std::ifstream(path) && std::ifstream("astra/" + path)) {
+            path = "astra/" + path;
+        }
+        DecodedAudioBuffer abuf;
+        if (MediaEngine::decode_audio_pcm(path, 2.0, abuf)) {
+            auto rep = MediaEngine::play_audio_alsa(abuf);
+            out.handled = true;
+            out.action = "play_audio";
+            out.detail = rep.status + " (" + std::to_string(abuf.sample_rate) + " Hz)";
+        }
     } else if (hit->kind == HitRegionKind::Input && active->live_doc) {
         for (DomNode* inp : active->live_doc->query_selector_all("input")) {
             inp->set_attr("data-astra-focused", "0");
@@ -1132,7 +1390,39 @@ bool BrowserApp::paint_active_tab(Framebuffer& fb) {
         [this, base_url](const std::string& src, DecodedImage& out) -> bool {
             return load_image_subresource(base_url, src, out);
         },
-        cam3d_, time3d_sec_);
+        cam3d_, time3d_sec_,
+        [this, base_url](const std::string& src, AudioBlitCard& out) -> bool {
+            std::string path = src;
+            std::string resolved = HttpClient::resolve_relative_url(base_url, src);
+            if (resolved.rfind("file://", 0) == 0 && std::ifstream(resolved.substr(7))) {
+                path = resolved.substr(7);
+            } else if (!std::ifstream(path) && std::ifstream("astra/" + path)) {
+                path = "astra/" + path;
+            }
+            auto it = audio_cache_.find(path);
+            if (it != audio_cache_.end()) {
+                out = it->second;
+                return out.valid;
+            }
+            DecodedAudioBuffer abuf;
+            if (!MediaEngine::decode_audio_pcm(path, 2.0, abuf) || !abuf.valid) return false;
+            AudioBlitCard card;
+            card.valid = true;
+            size_t sl = path.rfind('/');
+            card.label = (sl != std::string::npos) ? path.substr(sl + 1) : path;
+            double rms_db = (abuf.rms_level > 1e-6) ? (20.0 * std::log10(abuf.rms_level)) : -60.0;
+            std::ostringstream meta;
+            meta << abuf.sample_rate << " Hz | " << abuf.channels << "ch | "
+                 << std::fixed << std::setprecision(1) << abuf.duration_sec << "s | RMS "
+                 << std::setprecision(1) << rms_db << " dB | "
+                 << (MediaEngine::alsa_available() ? "ALSA Ready" : "PCM Decoded");
+            card.meta = meta.str();
+            card.waveform_peaks = MediaEngine::compute_waveform_peaks(abuf, 40);
+            if (audio_cache_.size() > 16) audio_cache_.clear();
+            audio_cache_[path] = card;
+            out = std::move(card);
+            return true;
+        });
 
     return true;
 }

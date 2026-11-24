@@ -34,7 +34,8 @@ enum class DisplayItemType : uint32_t {
     EmbedVideo = 5,
     DrawImage = 6,
     DrawInput = 7,
-    DropShadow = 8
+    DropShadow = 8,
+    EmbedAudio = 9
 };
 
 struct DisplayItem {
@@ -49,6 +50,8 @@ struct DisplayItem {
     bool monospace = false;
     bool focused = false;
     bool fixed_viewport = false;
+    bool has_clip = false;
+    Rect clip_rect;
     std::string text;
 };
 
@@ -57,7 +60,9 @@ enum class HitRegionKind : uint32_t {
     Button = 2,
     Scene3D = 3,
     Video = 4,
-    Input = 5
+    Input = 5,
+    Audio = 6,
+    Download = 7
 };
 
 struct HitRegion {
@@ -65,7 +70,7 @@ struct HitRegion {
     Rect rect;
     int32_t z_index = 0;
     bool fixed_viewport = false;
-    std::string target; // href for Link, id/selector for Button/Input, src for Video/3D
+    std::string target; // href for Link/Download, id/selector for Button/Input, src for Video/Audio/3D
 };
 
 struct DisplayList {

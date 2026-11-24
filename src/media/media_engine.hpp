@@ -73,9 +73,18 @@ private:
     double current_pts_sec_ = 0.0;
 };
 
-// AstraMedia v3: Firefox RDD-inspired isolated media container parser,
+struct AudioPlaybackReport {
+    bool alsa_library_loaded = false;
+    bool device_opened = false;
+    bool played = false;
+    size_t frames_written = 0;
+    std::string status; // "played", "headless_no_soundcard", "alsa_not_installed"
+};
+
+// AstraMedia v4: Firefox RDD-inspired isolated media container parser,
 // native BT.709 YUV420p -> ARGB32 converter, real multi-frame video decoder,
-// and bounded PCM audio decoder (WAV native + MP4/AAC via isolated RDD pipe).
+// bounded PCM audio decoder (WAV native + MP4/AAC via isolated RDD pipe),
+// waveform peak analyzer, and native Linux ALSA playback (dlopen libasound.so.2).
 class MediaEngine {
 public:
     static VideoContainerInfo probe_container(const std::string& path);
@@ -100,6 +109,10 @@ public:
     static bool decode_audio_pcm(const std::string& path,
                                  double max_seconds,
                                  DecodedAudioBuffer& out_audio);
+
+    static std::vector<float> compute_waveform_peaks(const DecodedAudioBuffer& audio, size_t buckets = 48);
+    static bool alsa_available();
+    static AudioPlaybackReport play_audio_alsa(const DecodedAudioBuffer& audio);
 };
 
 } // namespace astra

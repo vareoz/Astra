@@ -149,12 +149,25 @@ bool inside_rounded(int x, int y, int w, int h, int r) {
 Framebuffer::Framebuffer(int width, int height)
     : width_(width), height_(height), pixels_(static_cast<size_t>(width * height), 0xFF0D1118u) {}
 
+void Framebuffer::set_clip_rect(int x, int y, int w, int h) {
+    has_clip_ = true;
+    clip_x0_ = std::max(0, x);
+    clip_y0_ = std::max(0, y);
+    clip_x1_ = std::min(width_, x + std::max(0, w));
+    clip_y1_ = std::min(height_, y + std::max(0, h));
+}
+
+void Framebuffer::clear_clip_rect() {
+    has_clip_ = false;
+}
+
 void Framebuffer::clear(uint32_t argb) {
     std::fill(pixels_.begin(), pixels_.end(), argb);
 }
 
 void Framebuffer::blend_pixel(int x, int y, uint32_t argb) {
     if (x < 0 || y < 0 || x >= width_ || y >= height_) return;
+    if (has_clip_ && (x < clip_x0_ || x >= clip_x1_ || y < clip_y0_ || y >= clip_y1_)) return;
     uint32_t a = (argb >> 24) & 0xFFu;
     if (a == 0) return;
     uint32_t& dst = pixels_[static_cast<size_t>(y * width_ + x)];
@@ -383,7 +396,9 @@ void Framebuffer::composite_display_list(const DisplayList& dl,
                                          const VideoProvider& video_provider,
                                          const ImageProvider& image_provider,
                                          const Camera3D& cam3d,
-                                         float time3d_sec) {
+                                         float time3d_sec,
+                                         const AudioProvider& audio_provider) {
+    clear_clip_rect();
     fill_rect(0, y_offset, width_, height_ - y_offset, dl.clear_color_argb);
 
     for (const auto& item : dl.items) {
@@ -394,6 +409,17 @@ void Framebuffer::composite_display_list(const DisplayList& dl,
         int ih = static_cast<int>(std::round(item.rect.h));
 
         if (iy >= height_ || iy + ih <= y_offset) continue;
+
+        if (item.has_clip) {
+            int clx = static_cast<int>(std::round(item.clip_rect.x));
+            float cl_eff_y = item.fixed_viewport ? item.clip_rect.y : (item.clip_rect.y - scroll_y);
+            int cly = std::max(y_offset, static_cast<int>(std::round(cl_eff_y)) + y_offset);
+            int clb = std::min(height_, static_cast<int>(std::round(cl_eff_y + item.clip_rect.h)) + y_offset);
+            int clw = static_cast<int>(std::round(item.clip_rect.w));
+            set_clip_rect(clx, cly, clw, std::max(0, clb - cly));
+        } else {
+            set_clip_rect(0, y_offset, width_, height_ - y_offset);
+        }
 
         switch (item.type) {
             case DisplayItemType::DropShadow: {
@@ -528,8 +554,58 @@ void Framebuffer::composite_display_list(const DisplayList& dl,
                 }
                 break;
             }
+            case DisplayItemType::EmbedAudio: {
+                int cx = std::max(0, ix);
+                int cy = std::max(y_offset, iy);
+                int cw = std::min(width_ - cx, iw);
+                int ch = std::min(height_ - cy, ih);
+                if (cw > 60 && ch > 44) {
+                    fill_rounded_rect(cx, cy, cw, ch, 10, 0xFF0B1324u);
+                    stroke_rounded_rect(cx, cy, cw, ch, 10, 1, 0xFF38BDF8u);
+
+                    AudioBlitCard card;
+                    bool has_audio = audio_provider && audio_provider(item.text, card) && card.valid;
+                    std::string title = has_audio ? card.label : ("AstraAudio: " + item.text);
+                    std::string meta = has_audio ? card.meta : "PCM s16le | ALSA Ready";
+
+                    // Top band: title; Bottom band: metadata
+                    draw_text(cx + 16, cy + 10, title, 0xFFE2E8F0u, 12.0f, true, true);
+                    draw_text(cx + 16, cy + ch - 20, meta, 0xFF7DD3FCu, 10.5f, false, true);
+
+                    // Middle band: Play button + PCM waveform bars (zero overlap with header/footer)
+                    int mid_top = cy + 30;
+                    int mid_bot = cy + ch - 26;
+                    int mid_h = std::max(14, mid_bot - mid_top);
+                    int mid_center = mid_top + mid_h / 2;
+
+                    int btn_sz = std::min(34, mid_h);
+                    fill_rounded_rect(cx + 16, mid_center - btn_sz / 2, btn_sz, btn_sz, 8, 0xFF0284C7u);
+                    draw_text(cx + 16 + btn_sz / 2 - 4, mid_center - 7, ">", 0xFFFFFFFFu, 13.0f, true, true);
+
+                    int wave_x = cx + 16 + btn_sz + 14;
+                    int wave_w = std::max(40, (cx + cw - 16) - wave_x);
+                    int wave_h = std::max(12, mid_h - 6);
+                    const std::vector<float>& peaks = card.waveform_peaks;
+                    size_t nb = std::min<size_t>(peaks.empty() ? 32 : peaks.size(),
+                                                 static_cast<size_t>(std::max(12, wave_w / 7)));
+                    int step_x = std::max(4, wave_w / static_cast<int>(std::max<size_t>(1, nb)));
+                    int bar_w = std::max(2, step_x - 3);
+                    for (size_t b = 0; b < nb; ++b) {
+                        float raw = peaks.empty() ? (0.35f + 0.45f * std::sin(static_cast<float>(b) * 0.55f))
+                                                  : peaks[(b * peaks.size()) / nb];
+                        float env = 0.72f + 0.28f * std::sin(static_cast<float>(b) * 0.42f);
+                        float amp = std::clamp(raw * env, 0.16f, 1.0f);
+                        int bh = std::max(4, static_cast<int>(amp * static_cast<float>(wave_h)));
+                        int bx = wave_x + static_cast<int>(b) * step_x;
+                        uint32_t col = (b % 3 == 0) ? 0xFF38BDF8u : 0xFF34D399u;
+                        fill_rounded_rect(bx, mid_center - bh / 2, bar_w, bh, 2, col);
+                    }
+                }
+                break;
+            }
         }
     }
+    clear_clip_rect();
 
     // Draw APZ-style scrollbar thumb if content overflows viewport
     float view_h = static_cast<float>(height_ - y_offset);

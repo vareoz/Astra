@@ -38,6 +38,13 @@ struct VideoBlitFrame {
     bool has_audio = false;
 };
 
+struct AudioBlitCard {
+    bool valid = false;
+    std::string label;
+    std::string meta;
+    std::vector<float> waveform_peaks;
+};
+
 class Framebuffer;
 
 struct InteractiveCallbacks {
@@ -49,10 +56,11 @@ struct InteractiveCallbacks {
     std::function<void(Framebuffer& fb)> on_repaint;
 };
 
-// Astra Compositor v4: ARGB32 software compositor with Anti-Aliased TrueType (AstraFont),
-// z-index layering, position:fixed viewport pinning, soft DropShadow, interactive Chrome v4,
-// APZ scroll_y, native PNG/JPEG/BMP/PPM <img> blitting, interactive <input>, smooth Astra3D,
-// interactive <video> scrubber bar, zero-dep PNG encoder, and interactive X11 window.
+// Astra Compositor v5: ARGB32 software compositor with Anti-Aliased TrueType (AstraFont),
+// WebRender-style per-item overflow:hidden pixel clipping, z-index layering, position:fixed pinning,
+// soft DropShadow, interactive Chrome v4, APZ scroll_y, native PNG/JPEG/BMP/PPM <img> blitting,
+// interactive <input>, smooth Astra3D, interactive <video> scrubber + <audio> waveform card,
+// zero-dep PNG encoder, and interactive X11 window.
 class Framebuffer {
 public:
     static constexpr int kChromeHeight = 84;
@@ -63,6 +71,9 @@ public:
     int height() const { return height_; }
     uint32_t* pixels() { return pixels_.data(); }
     const uint32_t* pixels() const { return pixels_.data(); }
+
+    void set_clip_rect(int x, int y, int w, int h);
+    void clear_clip_rect();
 
     void clear(uint32_t argb);
     void blend_pixel(int x, int y, uint32_t argb);
@@ -78,6 +89,7 @@ public:
 
     using VideoProvider = std::function<bool(const std::string& src, VideoBlitFrame& out)>;
     using ImageProvider = std::function<bool(const std::string& src, DecodedImage& out)>;
+    using AudioProvider = std::function<bool(const std::string& src, AudioBlitCard& out)>;
 
     void composite_display_list(const DisplayList& dl,
                                 int y_offset,
@@ -85,7 +97,8 @@ public:
                                 const VideoProvider& video_provider = nullptr,
                                 const ImageProvider& image_provider = nullptr,
                                 const Camera3D& cam3d = Camera3D{},
-                                float time3d_sec = 0.72f);
+                                float time3d_sec = 0.72f,
+                                const AudioProvider& audio_provider = nullptr);
 
     bool save_png(const std::string& path) const;
 
@@ -96,6 +109,11 @@ public:
 private:
     int width_;
     int height_;
+    bool has_clip_ = false;
+    int clip_x0_ = 0;
+    int clip_y0_ = 0;
+    int clip_x1_ = 0;
+    int clip_y1_ = 0;
     std::vector<uint32_t> pixels_;
 };
 

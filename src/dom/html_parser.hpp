@@ -30,10 +30,16 @@ struct DomNode {
 
     std::string get_attr(std::string_view name) const;
     void set_attr(std::string_view name, std::string_view value);
+    void remove_attr(std::string_view name);
     bool has_class(std::string_view cls) const;
+    void add_class(std::string_view cls);
+    void remove_class(std::string_view cls);
+    bool toggle_class(std::string_view cls);
     std::string id() const { return get_attr("id"); }
     std::string text_content() const;
     void set_text_content(SlabArena& arena, std::string_view new_text);
+    std::string inner_html() const;
+    void set_inner_html(SlabArena& arena, std::string_view html);
 };
 
 class HtmlDocument {
