@@ -721,6 +721,10 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
                     float tw = FontEngine::instance().measure_text(
                         flow_children[i]->node->text_content(), cs.font_size, cs.bold, cs.monospace);
                     item_w[i] = std::min(inner_w, tw + extra + cs.margin.left + cs.margin.right + 16.0f);
+                } else if (cs.flex_grow > 0.0f) {
+                    // Un ítem elástico parte de cero: su tamaño sale del
+                    // reparto del espacio libre, no de un valor arbitrario.
+                    item_w[i] = 0.0f;
                 } else {
                     item_w[i] = std::min(inner_w, 160.0f);
                 }
@@ -742,6 +746,24 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
                 }
                 size_t row_cnt = idx - row_start;
                 float free_sp = std::max(0.0f, inner_w - row_used);
+
+                // CSS Flexbox §9.7: antes de alinear la fila, los ítems con
+                // `flex-grow` se reparten el espacio libre que quede en ella.
+                // Sin esto, una barra con un bloque fijo y otro elástico
+                // dejaba ambos pegados a la izquierda.
+                if (free_sp > 0.5f) {
+                    float sum_grow = 0.0f;
+                    for (size_t j = row_start; j < idx; ++j) sum_grow += flow_children[j]->style.flex_grow;
+                    if (sum_grow > 0.0f) {
+                        for (size_t j = row_start; j < idx; ++j) {
+                            const float g = flow_children[j]->style.flex_grow;
+                            if (g > 0.0f) item_w[j] += free_sp * (g / sum_grow);
+                        }
+                        row_used += free_sp;
+                        free_sp = 0.0f;
+                    }
+                }
+
                 float start_x = frame->content_box.x;
                 float gap_x = st.gap;
                 if (st.justify_content == JustifyContent::Center) start_x += free_sp * 0.5f;
@@ -1044,6 +1066,21 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
                             iw = measure_inline_w(ich, avail_line_w);
                         }
                         layout_node(ich, line_x, cur_y, iw, next_cb, viewport);
+
+                        // CSS Text §4.1.1: el espacio que queda al PRINCIPIO de
+                        // una línea se elimina. Conservarlo (necesario entre
+                        // cajas) dejaba una sangría de unos pocos píxeles en
+                        // cada renglón que empezaba con un nodo de texto.
+                        if (line_x <= avail_x + 0.5f && !ich->wrapped_lines.empty() &&
+                            !ich->wrapped_lines.front().empty() &&
+                            ich->wrapped_lines.front().front() == ' ') {
+                            const float space_w = FontEngine::instance().measure_text(
+                                " ", ich->style.font_size, ich->style.bold, ich->style.monospace);
+                            ich->wrapped_lines.front().erase(ich->wrapped_lines.front().begin());
+                            ich->border_box.w = std::max(0.0f, ich->border_box.w - space_w);
+                            ich->content_box.w = std::max(0.0f, ich->content_box.w - space_w);
+                        }
+
                         float ih = ich->border_box.h + ich->style.margin.top + ich->style.margin.bottom;
                         line_h = std::max(line_h, ih);
                         line_items.push_back(ich);

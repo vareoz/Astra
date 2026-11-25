@@ -2834,6 +2834,77 @@ int run_full_test_suite() {
                    "blocks), and flex-grow / flex shorthand distribute the container's free space");
         }
 
+        // ---------------------------------------------------------------------
+        // 72. flex-grow con flex-wrap, y sin espacio al inicio de línea
+        // ---------------------------------------------------------------------
+        {
+            // (a) La rama multi-fila de flexbox ignoraba `flex-grow`: un ítem
+            // sin ancho explícito recibía 160px fijos, así que una barra con
+            // un bloque fijo y otro elástico dejaba los dos pegados a la
+            // izquierda en lugar de ocupar todo el contenedor.
+            SlabArena wa;
+            HtmlDocument wdoc = HtmlDocument::parse(wa,
+                "<html><head><style>"
+                "body { margin: 0; padding: 0; }"
+                ".bar { display: flex; flex-wrap: wrap; width: 800px; }"
+                ".fixed { width: 120px; height: 20px; }"
+                ".elastic { flex-grow: 1; height: 20px; }"
+                "</style></head><body><div class=\"bar\">"
+                "<div class=\"fixed\"></div><div class=\"elastic\"></div>"
+                "</div></body></html>");
+            CssStylesheet wsheet;
+            wsheet.parse(wdoc.collect_stylesheets());
+            LayoutFrame* wroot = LayoutEngine::build_layout(wa, wdoc, wsheet, 1000.0f, 400.0f);
+            const LayoutFrame* bar = (wroot && !wroot->children.empty()) ? wroot->children[0] : nullptr;
+            bool wrap_grow_ok = false;
+            if (bar && bar->children.size() == 2) {
+                const LayoutFrame* fixed = bar->children[0];
+                const LayoutFrame* elastic = bar->children[1];
+                wrap_grow_ok = std::abs(fixed->border_box.w - 120.0f) < 1.5f &&
+                               // el elástico se lleva 800 - 120, no los 160 fijos de antes
+                               std::abs(elastic->border_box.w - 680.0f) < 2.0f &&
+                               elastic->border_box.x > fixed->border_box.x;
+            }
+
+            // (b) El espacio que queda al PRINCIPIO de una línea se elimina
+            // (CSS Text §4.1.1). Conservarlo —necesario entre cajas— dejaba
+            // una sangría en cada renglón que empezaba con un nodo de texto.
+            SlabArena ia;
+            HtmlDocument idoc = HtmlDocument::parse(ia,
+                "<html><body><p><a href=\"#\">enlace</a> texto que continua y "
+                "se parte en varias lineas porque el parrafo es estrecho de mas</p></body></html>");
+            CssStylesheet isheet;
+            LayoutFrame* iroot = LayoutEngine::build_layout(ia, idoc, isheet, 260.0f, 400.0f, true);
+
+            bool no_indent = true;
+            float min_x = 1e9f;
+            std::function<void(const LayoutFrame*)> scan = [&](const LayoutFrame* f) {
+                if (!f) return;
+                if (f->children.empty() && f->node && f->node->type == NodeType::Text) {
+                    min_x = std::min(min_x, f->border_box.x);
+                    // Ninguna línea renderizada debe empezar por espacio.
+                    for (const auto& ln : f->wrapped_lines) {
+                        if (!ln.empty() && ln.front() == ' ' && f->border_box.x <= min_x + 0.5f) {
+                            no_indent = false;
+                        }
+                    }
+                }
+                for (const LayoutFrame* c : f->children) scan(c);
+            };
+            scan(iroot);
+
+            if (!(wrap_grow_ok && no_indent)) {
+                std::cerr << "    [diag72] wrap_grow=" << wrap_grow_ok << " no_indent=" << no_indent << "\n";
+                if (bar) for (const LayoutFrame* c : bar->children)
+                    std::cerr << "      item x=" << c->border_box.x << " w=" << c->border_box.w
+                              << " grow=" << c->style.flex_grow << "\n";
+            }
+
+            expect(wrap_grow_ok && no_indent,
+                   "flex-grow distributes free space in the multi-row flex path too, and a space left at the "
+                   "start of a line is dropped so wrapped lines are not indented");
+        }
+
         app.stop_workers();
     }
 
