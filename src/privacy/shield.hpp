@@ -35,6 +35,12 @@ struct ParsedUrl {
 
 ParsedUrl parse_url(std::string_view raw);
 
+enum class SameSiteMode {
+    Lax,
+    Strict,
+    None
+};
+
 struct CookieEntry {
     std::string name;
     std::string value;
@@ -42,6 +48,7 @@ struct CookieEntry {
     std::string path = "/";
     bool secure = false;
     bool http_only = false;
+    SameSiteMode same_site = SameSiteMode::Lax;
 };
 
 struct PrivacyDecision {
@@ -103,7 +110,8 @@ public:
 
     std::string cookie_header_for(std::string_view top_level_site,
                                   std::string_view request_origin,
-                                  bool is_https) const;
+                                  bool is_https,
+                                  bool is_top_level_get = true) const;
 
     // Deterministic per-partition canvas fingerprint noise seed.
     uint64_t canvas_noise_seed(std::string_view top_level_site) const;

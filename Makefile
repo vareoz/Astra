@@ -7,7 +7,9 @@ SRCS := \
 	src/core/json.cpp \
 	src/core/memory_governor.cpp \
 	src/ipc/ipc_channel.cpp \
+	src/ipc/sandbox.cpp \
 	src/privacy/shield.cpp \
+	src/privacy/security_policy.cpp \
 	src/net/http_cache.cpp \
 	src/net/http2_client.cpp \
 	src/net/http_client.cpp \
@@ -19,6 +21,7 @@ SRCS := \
 	src/ext/extension_runtime.cpp \
 	src/gfx/font_engine.cpp \
 	src/gfx/image_decoder.cpp \
+	src/gfx/svg_engine.cpp \
 	src/gfx/rasterizer.cpp \
 	src/gfx/astra3d.cpp \
 	src/docs/doc_viewer.cpp \

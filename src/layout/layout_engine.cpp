@@ -76,11 +76,50 @@ Rect intersect_rect(const Rect& a, const Rect& b) {
     return Rect{x1, y1, std::max(0.0f, x2 - x1), std::max(0.0f, y2 - y1)};
 }
 
+std::string resolve_media_src(const DomNode* node) {
+    if (!node) return {};
+    std::string direct = node->get_attr("src");
+    if (!direct.empty()) return direct;
+    std::string fallback;
+    for (const DomNode* ch : node->children) {
+        if (ch && ch->type == NodeType::Element && ch->tag == "source") {
+            std::string s = ch->get_attr("src");
+            if (s.empty()) continue;
+            if (fallback.empty()) fallback = s;
+            std::string t = ch->get_attr("type");
+            if (t.find("mp4") != std::string::npos || t.find("webm") != std::string::npos ||
+                t.find("mpegurl") != std::string::npos || t.find("wav") != std::string::npos ||
+                t.find("mpeg") != std::string::npos) {
+                return s;
+            }
+        }
+    }
+    return fallback;
+}
+
+std::string resolve_img_src(const DomNode* node) {
+    if (!node) return {};
+    std::string s = node->get_attr("src");
+    if (!s.empty() && s != "about:blank") return s;
+    s = node->get_attr("data-src");
+    if (!s.empty()) return s;
+    std::string ss = node->get_attr("srcset");
+    if (!ss.empty()) {
+        size_t i = 0;
+        while (i < ss.size() && std::isspace(static_cast<unsigned char>(ss[i]))) ++i;
+        size_t st = i;
+        while (i < ss.size() && !std::isspace(static_cast<unsigned char>(ss[i])) && ss[i] != ',') ++i;
+        if (i > st) return ss.substr(st, i - st);
+    }
+    return {};
+}
+
 LayoutFrame* build_frame_tree(SlabArena& arena,
                               const DomNode* node,
                               const CssStylesheet& sheet,
                               const ComputedStyle* parent_style,
-                              float viewport_w) {
+                              float viewport_w,
+                              bool light_web_default) {
     if (!node) return nullptr;
 
     if (node->type == NodeType::Text) {
@@ -91,34 +130,156 @@ LayoutFrame* build_frame_tree(SlabArena& arena,
         f->style.position = PositionType::Static;
         f->style.overflow = OverflowMode::Visible;
         f->style.background = Color{0, 0, 0, 0};
+        f->style.background_gradient.enabled = false;
         f->style.border_width = 0;
+        f->style.border_left_width = 0;
         f->style.padding = {};
         f->style.margin = {};
+        f->style.width = 0;
+        f->style.height = 0;
+        f->style.translate_x = 0;
+        f->style.translate_y = 0;
         f->style.box_shadow.enabled = false;
         f->style.opacity = 1.0f;
+        f->style.float_mode = FloatMode::None;
+        f->style.clear_mode = ClearMode::None;
+        f->style.width_pct = -1.0f;
+        f->style.width_calc.clear();
+        f->style.has_content = false;
+        f->style.content_text.clear();
         return f;
     }
 
-    ComputedStyle st = StyleEngine::compute_style(node, sheet, parent_style, viewport_w);
+    ComputedStyle st = StyleEngine::compute_style(node, sheet, parent_style, viewport_w, light_web_default);
     if (st.display == DisplayType::None) return nullptr;
 
     // Default styling for interactive <button> if author didn't override
     if (node->tag == "button" && st.background.a == 0) {
-        st.background = Color{2, 132, 199, 255};
-        st.color = Color{255, 255, 255, 255};
-        st.padding = {8, 16, 8, 16};
-        st.border_radius = 6.0f;
-        st.bold = true;
+        if (light_web_default) {
+            st.background = Color{241, 245, 249, 255};
+            st.color = Color{15, 23, 42, 255};
+            st.border_width = 1.0f;
+            st.border_color = Color{203, 213, 225, 255};
+            st.padding = {5, 10, 5, 10};
+            st.border_radius = 4.0f;
+        } else {
+            st.background = Color{2, 132, 199, 255};
+            st.color = Color{255, 255, 255, 255};
+            st.padding = {8, 16, 8, 16};
+            st.border_radius = 6.0f;
+            st.bold = true;
+        }
     }
 
     LayoutFrame* f = arena.create<LayoutFrame>();
     f->node = node;
     f->style = st;
 
+    if (node->tag == "svg") return f;
+
+    // <iframe> embedded document support (srcdoc OR pre-fetched remote HTML via data-astra-iframe-doc)
+    if (node->tag == "iframe") {
+        std::string srcdoc = node->get_attr("srcdoc");
+        if (srcdoc.empty()) srcdoc = node->get_attr("data-astra-iframe-doc");
+        if (!srcdoc.empty()) {
+            static thread_local int iframe_depth = 0;
+            if (iframe_depth < 2) {
+                ++iframe_depth;
+                HtmlDocument subdoc = HtmlDocument::parse(arena, srcdoc);
+                CssStylesheet subsheet;
+                subsheet.parse(subdoc.collect_stylesheets());
+                const DomNode* subbody = subdoc.body() ? subdoc.body() : subdoc.root();
+                if (subbody) {
+                    if (LayoutFrame* subf = build_frame_tree(arena, subbody, subsheet, &f->style, viewport_w, light_web_default)) {
+                        f->children.push_back(subf);
+                    }
+                }
+                --iframe_depth;
+            }
+        } else {
+            std::string src = node->get_attr("src");
+            DomNode* label = arena.create<DomNode>();
+            label->type = NodeType::Text;
+            if (src.find("youtube.com/embed/") != std::string::npos ||
+                src.find("youtu.be/") != std::string::npos ||
+                src.find("player.vimeo.com/") != std::string::npos) {
+                label->text = "[Embedded Video Player] " + src;
+            } else {
+                label->text = src.empty() ? "[iframe]" : ("[iframe: " + src + "]");
+            }
+            LayoutFrame* lf = arena.create<LayoutFrame>();
+            lf->node = label;
+            lf->style = f->style;
+            lf->style.display = DisplayType::Inline;
+            lf->style.background = Color{0, 0, 0, 0};
+            lf->style.border_width = 0;
+            lf->style.padding = {};
+            lf->style.margin = {};
+            lf->style.color = light_web_default ? Color{71, 85, 105, 255} : Color{148, 163, 184, 255};
+            lf->style.monospace = true;
+            lf->style.font_size = 12.0f;
+            lf->style.float_mode = FloatMode::None;
+            lf->style.clear_mode = ClearMode::None;
+            lf->style.width_pct = -1.0f;
+            lf->style.width_calc.clear();
+            lf->style.has_content = false;
+            lf->style.content_text.clear();
+            f->children.push_back(lf);
+        }
+        return f;
+    }
+
+    auto make_pseudo_frame = [&](const ComputedStyle& pst) -> LayoutFrame* {
+        LayoutFrame* pf = arena.create<LayoutFrame>();
+        DomNode* pnode = arena.create<DomNode>();
+        pnode->type = NodeType::Element;
+        pnode->tag = "span";
+        DomNode* tnode = arena.create<DomNode>();
+        tnode->type = NodeType::Text;
+        tnode->text = pst.content_text;
+        pnode->children.push_back(tnode);
+        pf->node = pnode;
+        pf->style = pst;
+
+        LayoutFrame* tf = arena.create<LayoutFrame>();
+        tf->node = tnode;
+        tf->style = pst;
+        tf->style.display = DisplayType::Inline;
+        tf->style.background = Color{0, 0, 0, 0};
+        tf->style.background_gradient.enabled = false;
+        tf->style.border_width = 0;
+        tf->style.border_left_width = 0;
+        tf->style.padding = {};
+        tf->style.margin = {};
+        tf->style.width = 0;
+        tf->style.height = 0;
+        tf->style.translate_x = 0;
+        tf->style.translate_y = 0;
+        tf->style.box_shadow.enabled = false;
+        tf->style.float_mode = FloatMode::None;
+        tf->style.clear_mode = ClearMode::None;
+        tf->style.width_pct = -1.0f;
+        tf->style.width_calc.clear();
+        tf->style.has_content = false;
+        tf->style.content_text.clear();
+        pf->children.push_back(tf);
+        return pf;
+    };
+
+    ComputedStyle before_st;
+    if (StyleEngine::compute_pseudo_style(node, sheet, "::before", f->style, before_st, viewport_w)) {
+        f->children.push_back(make_pseudo_frame(before_st));
+    }
+
     for (const DomNode* ch : node->children) {
-        if (LayoutFrame* cf = build_frame_tree(arena, ch, sheet, &f->style, viewport_w)) {
+        if (LayoutFrame* cf = build_frame_tree(arena, ch, sheet, &f->style, viewport_w, light_web_default)) {
             f->children.push_back(cf);
         }
+    }
+
+    ComputedStyle after_st;
+    if (StyleEngine::compute_pseudo_style(node, sheet, "::after", f->style, after_st, viewport_w)) {
+        f->children.push_back(make_pseudo_frame(after_st));
     }
     return f;
 }
@@ -137,10 +298,16 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
     float max_avail = std::max(40.0f, avail_w - st.margin.left - st.margin.right);
 
     float box_w = max_avail;
-    if (st.width > 0.0f) {
+    float resolved_width = st.width;
+    if (!st.width_calc.empty()) {
+        resolved_width = StyleEngine::eval_calc(st.width_calc, max_avail, viewport.w, -1.0f);
+    } else if (st.width_pct >= 0.0f) {
+        resolved_width = max_avail * st.width_pct * 0.01f;
+    }
+    if (resolved_width > 0.0f) {
         float target_border_w = (st.box_sizing == BoxSizing::BorderBox)
-                                    ? st.width
-                                    : (st.width + horiz_extra);
+                                    ? resolved_width
+                                    : (resolved_width + horiz_extra);
         box_w = std::min(target_border_w, max_avail);
     }
     if (st.max_width > 0.0f) {
@@ -191,12 +358,31 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
         if (tag == "img") {
             float aw = static_cast<float>(std::atoi(frame->node->get_attr("width").c_str()));
             float ah = static_cast<float>(std::atoi(frame->node->get_attr("height").c_str()));
-            float w = (st.width > 0.0f) ? st.width : (aw > 0.0f ? aw : std::min(inner_w, 280.0f));
-            float h = (st.height > 0.0f) ? st.height : (ah > 0.0f ? ah : 160.0f);
+            float w = (st.width > 0.0f) ? st.width : (aw > 0.0f ? aw : (ah > 0.0f ? ah : std::min(inner_w, 220.0f)));
+            float h = (st.height > 0.0f) ? st.height : (ah > 0.0f ? ah : (aw > 0.0f ? std::min(aw, 220.0f) : 140.0f));
             frame->content_box.w = std::min(w, inner_w);
             frame->content_box.h = h;
             frame->border_box.w = frame->content_box.w + horiz_extra;
             frame->border_box.h = h + vert_extra;
+            return;
+        }
+        if (tag == "svg") {
+            float aw = static_cast<float>(std::atoi(frame->node->get_attr("width").c_str()));
+            float ah = static_cast<float>(std::atoi(frame->node->get_attr("height").c_str()));
+            float w = (st.width > 0.0f) ? st.width : (aw > 0.0f ? aw : 24.0f);
+            float h = (st.height > 0.0f) ? st.height : (ah > 0.0f ? ah : 24.0f);
+            frame->content_box.w = std::min(w, inner_w);
+            frame->content_box.h = h;
+            frame->border_box.w = frame->content_box.w + horiz_extra;
+            frame->border_box.h = h + vert_extra;
+            return;
+        }
+        if (tag == "br") {
+            float lh = line_height_for_size(st.font_size);
+            frame->content_box.w = 0.0f;
+            frame->content_box.h = lh * 0.5f;
+            frame->border_box.w = 0.0f;
+            frame->border_box.h = lh * 0.5f;
             return;
         }
         if (tag == "input" || tag == "textarea") {
@@ -231,7 +417,97 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
     Rect next_cb = (st.position != PositionType::Static) ? frame->border_box : containing_block;
     float cur_y = frame->content_box.y;
 
-    if (st.display == DisplayType::Grid && !flow_children.empty()) {
+    if (st.display == DisplayType::Table && !flow_children.empty()) {
+        // Collect all <tr> rows (flattening <thead>/<tbody>/<tfoot> wrappers)
+        std::vector<LayoutFrame*> rows;
+        std::function<void(LayoutFrame*)> collect_rows = [&](LayoutFrame* n) {
+            if (!n) return;
+            if (n->style.display == DisplayType::TableRow || (n->node && n->node->tag == "tr")) {
+                rows.push_back(n);
+                return;
+            }
+            for (LayoutFrame* c : n->children) collect_rows(c);
+        };
+        for (LayoutFrame* ch : flow_children) collect_rows(ch);
+
+        // Determine column count and preferred column widths (clamped against hostile colspan)
+        size_t ncols = 0;
+        for (LayoutFrame* r : rows) {
+            size_t cols_in_row = 0;
+            for (LayoutFrame* cell : r->children) {
+                int span = cell->node ? std::clamp(std::atoi(cell->node->get_attr("colspan").c_str()), 1, 64) : 1;
+                cols_in_row += static_cast<size_t>(span);
+            }
+            ncols = std::max(ncols, cols_in_row);
+        }
+        ncols = std::min<size_t>(ncols, 64);
+        if (ncols > 0) {
+            std::vector<float> col_pref(ncols, 60.0f);
+            for (LayoutFrame* r : rows) {
+                size_t ci = 0;
+                for (LayoutFrame* cell : r->children) {
+                    int span = cell->node ? std::clamp(std::atoi(cell->node->get_attr("colspan").c_str()), 1, 64) : 1;
+                    if (span == 1 && ci < ncols) {
+                        const ComputedStyle& cs = cell->style;
+                        float extra = cs.padding.left + cs.padding.right + cs.border_width * 2.0f;
+                        if (cs.width > 0.0f) {
+                            col_pref[ci] = std::max(col_pref[ci], cs.width + extra);
+                        } else if (cell->node) {
+                            float tw = FontEngine::instance().measure_text(
+                                cell->node->text_content(), cs.font_size, cs.bold, cs.monospace);
+                            col_pref[ci] = std::max(col_pref[ci], std::min(inner_w * 0.6f, tw + extra + 14.0f));
+                        }
+                    }
+                    ci += static_cast<size_t>(span);
+                }
+            }
+            float sum_pref = 0.0f;
+            for (float w : col_pref) sum_pref += w;
+            std::vector<float> col_w(ncols, inner_w / static_cast<float>(ncols));
+            if (sum_pref > 1.0f) {
+                for (size_t c = 0; c < ncols; ++c) {
+                    col_w[c] = std::max(40.0f, inner_w * (col_pref[c] / sum_pref));
+                }
+            }
+            std::vector<float> col_x(ncols, frame->content_box.x);
+            float cx = frame->content_box.x;
+            for (size_t c = 0; c < ncols; ++c) {
+                col_x[c] = cx;
+                cx += col_w[c];
+            }
+
+            for (LayoutFrame* r : rows) {
+                r->border_box.x = frame->content_box.x;
+                r->border_box.y = cur_y;
+                r->border_box.w = inner_w;
+                r->content_box = r->border_box;
+                size_t ci = 0;
+                float row_h = 28.0f;
+                for (LayoutFrame* cell : r->children) {
+                    if (ci >= ncols) break;
+                    int span = cell->node ? std::clamp(std::atoi(cell->node->get_attr("colspan").c_str()), 1, 64) : 1;
+                    float cw = 0.0f;
+                    for (int s = 0; s < span && (ci + static_cast<size_t>(s)) < ncols; ++s) {
+                        cw += col_w[ci + static_cast<size_t>(s)];
+                    }
+                    layout_node(cell, col_x[ci], cur_y, cw, next_cb, viewport);
+                    row_h = std::max(row_h, cell->border_box.h);
+                    ci += static_cast<size_t>(span);
+                }
+                // Equalize all cells in the row to uniform row_h
+                for (LayoutFrame* cell : r->children) {
+                    float dh = row_h - cell->border_box.h;
+                    if (dh > 0.0f) {
+                        cell->border_box.h = row_h;
+                        cell->content_box.h += dh;
+                    }
+                }
+                r->border_box.h = row_h;
+                r->content_box.h = row_h;
+                cur_y += row_h;
+            }
+        }
+    } else if (st.display == DisplayType::Grid && !flow_children.empty()) {
         std::vector<GridTrack> cols = st.grid_columns;
         if (cols.empty()) cols = {GridTrack{1.0f, true}, GridTrack{1.0f, true}};
         size_t ncols = cols.size();
@@ -266,11 +542,91 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
             if (idx < flow_children.size()) cur_y += st.gap;
         }
     } else if (st.display == DisplayType::Flex && st.flex_direction == FlexDirection::Row && !flow_children.empty()) {
+        auto intrinsic_html_w = [](const LayoutFrame* f) -> float {
+            if (!f || !f->node || f->node->type != NodeType::Element) return 0.0f;
+            if (f->node->tag == "svg" || f->node->tag == "img" || f->node->tag == "canvas") {
+                std::string wa = f->node->get_attr("width");
+                if (!wa.empty()) {
+                    float wv = std::strtof(wa.c_str(), nullptr);
+                    if (wv > 0.0f) return wv;
+                }
+            }
+            return 0.0f;
+        };
+
+        if (st.flex_wrap) {
+            // Multi-row flex-wrap layout
+            std::vector<float> item_w(flow_children.size(), 0.0f);
+            for (size_t i = 0; i < flow_children.size(); ++i) {
+                const ComputedStyle& cs = flow_children[i]->style;
+                float extra = cs.padding.left + cs.padding.right + cs.border_width * 2.0f;
+                float attr_w = intrinsic_html_w(flow_children[i]);
+                if (cs.width > 0.0f) {
+                    float bw = (cs.box_sizing == BoxSizing::BorderBox) ? cs.width : (cs.width + extra);
+                    item_w[i] = std::min(inner_w, bw + cs.margin.left + cs.margin.right);
+                } else if (attr_w > 0.0f) {
+                    item_w[i] = std::min(inner_w, attr_w + extra + cs.margin.left + cs.margin.right);
+                } else if (flow_children[i]->children.empty() &&
+                           flow_children[i]->node && !flow_children[i]->node->text_content().empty()) {
+                    float tw = FontEngine::instance().measure_text(
+                        flow_children[i]->node->text_content(), cs.font_size, cs.bold, cs.monospace);
+                    item_w[i] = std::min(inner_w, tw + extra + cs.margin.left + cs.margin.right + 16.0f);
+                } else {
+                    item_w[i] = std::min(inner_w, 160.0f);
+                }
+            }
+
+            size_t idx = 0;
+            bool first_row = true;
+            while (idx < flow_children.size()) {
+                if (!first_row) cur_y += st.gap;
+                first_row = false;
+
+                size_t row_start = idx;
+                float row_used = 0.0f;
+                while (idx < flow_children.size()) {
+                    float add = item_w[idx] + (idx > row_start ? st.gap : 0.0f);
+                    if (idx > row_start && row_used + add > inner_w + 0.5f) break;
+                    row_used += add;
+                    ++idx;
+                }
+                size_t row_cnt = idx - row_start;
+                float free_sp = std::max(0.0f, inner_w - row_used);
+                float start_x = frame->content_box.x;
+                float gap_x = st.gap;
+                if (st.justify_content == JustifyContent::Center) start_x += free_sp * 0.5f;
+                else if (st.justify_content == JustifyContent::FlexEnd) start_x += free_sp;
+                else if (st.justify_content == JustifyContent::SpaceBetween && row_cnt > 1) {
+                    gap_x = st.gap + free_sp / static_cast<float>(row_cnt - 1);
+                }
+
+                float cur_x = start_x;
+                float row_h = 0.0f;
+                for (size_t j = row_start; j < idx; ++j) {
+                    LayoutFrame* ch = flow_children[j];
+                    layout_node(ch, cur_x, cur_y, item_w[j], next_cb, viewport);
+                    float ch_h = ch->border_box.h + ch->style.margin.top + ch->style.margin.bottom;
+                    row_h = std::max(row_h, ch_h);
+                    cur_x += item_w[j] + gap_x;
+                }
+                if (st.align_items == AlignItems::Center || st.align_items == AlignItems::FlexEnd) {
+                    for (size_t j = row_start; j < idx; ++j) {
+                        LayoutFrame* ch = flow_children[j];
+                        float ch_h = ch->border_box.h + ch->style.margin.top + ch->style.margin.bottom;
+                        float diff = std::max(0.0f, row_h - ch_h);
+                        if (diff > 0.5f) {
+                            offset_subtree(ch, 0.0f, (st.align_items == AlignItems::Center) ? (diff * 0.5f) : diff);
+                        }
+                    }
+                }
+                cur_y += row_h;
+            }
+        } else {
         size_t count = flow_children.size();
         float total_gap = st.gap * static_cast<float>(count > 0 ? count - 1 : 0);
         bool has_explicit_w = false;
         for (LayoutFrame* ch : flow_children) {
-            if (ch->style.width > 0.0f) { has_explicit_w = true; break; }
+            if (ch->style.width > 0.0f || intrinsic_html_w(ch) > 0.0f) { has_explicit_w = true; break; }
         }
         bool custom_justify = (st.justify_content != JustifyContent::FlexStart) || has_explicit_w;
         float max_h = 0.0f;
@@ -292,9 +648,13 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
             for (size_t i = 0; i < count; ++i) {
                 const ComputedStyle& cs = flow_children[i]->style;
                 float extra = cs.padding.left + cs.padding.right + cs.border_width * 2.0f;
+                float attr_w = intrinsic_html_w(flow_children[i]);
                 if (cs.width > 0.0f) {
                     float bw = (cs.box_sizing == BoxSizing::BorderBox) ? cs.width : (cs.width + extra);
                     child_w[i] = bw + cs.margin.left + cs.margin.right;
+                    used_w += child_w[i];
+                } else if (attr_w > 0.0f) {
+                    child_w[i] = attr_w + extra + cs.margin.left + cs.margin.right;
                     used_w += child_w[i];
                 } else if (st.justify_content != JustifyContent::FlexStart &&
                            flow_children[i]->children.empty() &&
@@ -367,14 +727,166 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
             }
         }
         cur_y += max_h;
-    } else {
+        }
+    } else if (st.display == DisplayType::Flex && st.flex_direction == FlexDirection::Column) {
         bool first = true;
         for (LayoutFrame* ch : flow_children) {
-            if (!first && st.display == DisplayType::Flex) cur_y += st.gap;
+            if (!first) cur_y += st.gap;
             first = false;
             layout_node(ch, frame->content_box.x, cur_y, inner_w, next_cb, viewport);
             cur_y = ch->border_box.y + ch->border_box.h + ch->style.margin.bottom;
         }
+    } else {
+        // Standard Block Formatting Context with Float/Clear + Real Inline Formatting Context (IFC)
+        float left_float_w = 0.0f;
+        float left_float_end_y = cur_y;
+        float right_float_w = 0.0f;
+        float right_float_end_y = cur_y;
+
+        auto measure_inline_w = [&](const LayoutFrame* ch, float avail) -> float {
+            const ComputedStyle& cs = ch->style;
+            float extra = cs.padding.left + cs.padding.right + cs.border_width * 2.0f;
+            float rw = cs.width;
+            if (!cs.width_calc.empty()) rw = StyleEngine::eval_calc(cs.width_calc, avail, viewport.w, -1.0f);
+            else if (cs.width_pct >= 0.0f) rw = avail * cs.width_pct * 0.01f;
+            if (rw > 0.0f) {
+                float bw = (cs.box_sizing == BoxSizing::BorderBox) ? rw : (rw + extra);
+                return std::min(avail, bw + cs.margin.left + cs.margin.right);
+            }
+            if (ch->node && ch->node->type == NodeType::Element) {
+                if (ch->node->tag == "img" || ch->node->tag == "svg") {
+                    float aw = static_cast<float>(std::atoi(ch->node->get_attr("width").c_str()));
+                    float ah = static_cast<float>(std::atoi(ch->node->get_attr("height").c_str()));
+                    float iw = (aw > 0.0f) ? aw : (ah > 0.0f ? ah : (ch->node->tag == "svg" ? 24.0f : 180.0f));
+                    return std::min(avail, iw + extra + cs.margin.left + cs.margin.right);
+                }
+            }
+            std::string txt = ch->node ? ch->node->text_content() : "";
+            if (txt.empty()) {
+                return std::min(avail, std::max(8.0f, extra + cs.margin.left + cs.margin.right));
+            }
+            float tw = FontEngine::instance().measure_text(txt, cs.font_size, cs.bold, cs.monospace);
+            float pad_fudge = (cs.display == DisplayType::InlineBlock) ? 8.0f : 2.0f;
+            return std::min(avail, tw + extra + cs.margin.left + cs.margin.right + pad_fudge);
+        };
+
+        auto is_inline_flow = [](const LayoutFrame* ch) -> bool {
+            if (!ch || ch->style.float_mode != FloatMode::None) return false;
+            if (ch->node && ch->node->type == NodeType::Element && ch->node->tag == "br") return false;
+            return ch->style.display == DisplayType::InlineBlock ||
+                   ch->style.display == DisplayType::Inline;
+        };
+
+        size_t i = 0;
+        while (i < flow_children.size()) {
+            LayoutFrame* ch = flow_children[i];
+            const ComputedStyle& cs = ch->style;
+
+            // Expire floats we have scrolled past
+            if (cur_y >= left_float_end_y) left_float_w = 0.0f;
+            if (cur_y >= right_float_end_y) right_float_w = 0.0f;
+
+            // Handle CSS clear: left | right | both
+            if (cs.clear_mode == ClearMode::Left || cs.clear_mode == ClearMode::Both) {
+                if (cur_y < left_float_end_y) cur_y = left_float_end_y;
+                left_float_w = 0.0f;
+            }
+            if (cs.clear_mode == ClearMode::Right || cs.clear_mode == ClearMode::Both) {
+                if (cur_y < right_float_end_y) cur_y = right_float_end_y;
+                right_float_w = 0.0f;
+            }
+
+            // Handle CSS float: left | right
+            if (cs.float_mode == FloatMode::Left || cs.float_mode == FloatMode::Right) {
+                float fw = measure_inline_w(ch, inner_w);
+                float fx = (cs.float_mode == FloatMode::Left)
+                               ? (frame->content_box.x + left_float_w)
+                               : (frame->content_box.x + inner_w - right_float_w - fw);
+                layout_node(ch, fx, cur_y, fw, next_cb, viewport);
+                float end_y = ch->border_box.y + ch->border_box.h + cs.margin.bottom;
+                float used_w = ch->border_box.w + cs.margin.left + cs.margin.right;
+                if (cs.float_mode == FloatMode::Left) {
+                    left_float_w += used_w;
+                    left_float_end_y = std::max(left_float_end_y, end_y);
+                } else {
+                    right_float_w += used_w;
+                    right_float_end_y = std::max(right_float_end_y, end_y);
+                }
+                ++i;
+                continue;
+            }
+
+            // Compute horizontal span excluding active floats at cur_y
+            float avail_x = frame->content_box.x + (cur_y < left_float_end_y ? left_float_w : 0.0f);
+            float excl_r = (cur_y < right_float_end_y ? right_float_w : 0.0f);
+            float avail_line_w = std::max(60.0f, inner_w - (avail_x - frame->content_box.x) - excl_r);
+
+            // Real Inline Formatting Context (IFC): lay out consecutive inline / inline-block / inline-img runs horizontally with wrapping
+            if (is_inline_flow(ch)) {
+                size_t run_end = i;
+                bool run_has_inline_block = false;
+                while (run_end < flow_children.size() && is_inline_flow(flow_children[run_end])) {
+                    if (flow_children[run_end]->style.display == DisplayType::InlineBlock) {
+                        run_has_inline_block = true;
+                    }
+                    ++run_end;
+                }
+                if (run_end - i > 1 || run_has_inline_block) {
+                    float line_x = avail_x;
+                    float line_right = avail_x + avail_line_w;
+                    float line_h = 0.0f;
+                    std::vector<LayoutFrame*> line_items;
+
+                    auto flush_line_align = [&]() {
+                        if (line_items.size() > 1 && line_h > 0.0f) {
+                            for (LayoutFrame* li : line_items) {
+                                float ih = li->border_box.h + li->style.margin.top + li->style.margin.bottom;
+                                float diff = line_h - ih;
+                                if (diff > 2.0f) {
+                                    offset_subtree(li, 0.0f, diff * 0.5f);
+                                }
+                            }
+                        }
+                        line_items.clear();
+                    };
+
+                    while (i < run_end) {
+                        LayoutFrame* ich = flow_children[i];
+                        float iw = measure_inline_w(ich, avail_line_w);
+                        if (line_x > avail_x && line_x + iw > line_right + 0.5f) {
+                            flush_line_align();
+                            cur_y += line_h + 2.0f;
+                            line_h = 0.0f;
+                            avail_x = frame->content_box.x + (cur_y < left_float_end_y ? left_float_w : 0.0f);
+                            excl_r = (cur_y < right_float_end_y ? right_float_w : 0.0f);
+                            avail_line_w = std::max(60.0f, inner_w - (avail_x - frame->content_box.x) - excl_r);
+                            line_x = avail_x;
+                            line_right = avail_x + avail_line_w;
+                            iw = measure_inline_w(ich, avail_line_w);
+                        }
+                        layout_node(ich, line_x, cur_y, iw, next_cb, viewport);
+                        float ih = ich->border_box.h + ich->style.margin.top + ich->style.margin.bottom;
+                        line_h = std::max(line_h, ih);
+                        line_items.push_back(ich);
+                        float inline_gap = (ich->style.display == DisplayType::InlineBlock) ? 4.0f : 3.0f;
+                        line_x += ich->border_box.w + ich->style.margin.left + ich->style.margin.right + inline_gap;
+                        ++i;
+                    }
+                    flush_line_align();
+                    cur_y += line_h;
+                    continue;
+                }
+            }
+
+            // Regular block child (or single inline text child filling available width)
+            bool explicit_w = (cs.width > 0.0f || cs.width_pct >= 0.0f || !cs.width_calc.empty());
+            float block_avail_w = explicit_w ? inner_w : avail_line_w;
+            layout_node(ch, avail_x, cur_y, block_avail_w, next_cb, viewport);
+            cur_y = ch->border_box.y + ch->border_box.h + cs.margin.bottom;
+            ++i;
+        }
+        // Ensure container clears internal floats
+        cur_y = std::max(cur_y, std::max(left_float_end_y, right_float_end_y));
     }
 
     float measured_h = std::max(0.0f, cur_y - frame->content_box.y);
@@ -434,6 +946,9 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
         float dx = st.has_left ? st.left : (st.has_right ? -st.right : 0.0f);
         float dy = st.has_top ? st.top : (st.has_bottom ? -st.bottom : 0.0f);
         offset_subtree(frame, dx, dy);
+    }
+    if (st.translate_x != 0.0f || st.translate_y != 0.0f) {
+        offset_subtree(frame, st.translate_x, st.translate_y);
     }
 }
 
@@ -512,6 +1027,17 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
         attach_clip(item);
         dl.items.push_back(std::move(item));
     }
+    if (st.border_left_width > 0.0f && st.border_left_color.a > 0 && f->border_box.h > 0) {
+        DisplayItem bl;
+        bl.type = DisplayItemType::FillRect;
+        bl.rect = Rect{f->border_box.x, f->border_box.y, st.border_left_width, f->border_box.h};
+        bl.color_argb = apply_opacity(st.border_left_color.to_argb(), eff_opacity);
+        bl.radius = std::min(st.border_radius, st.border_left_width * 0.5f);
+        bl.z_index = eff_z;
+        bl.fixed_viewport = eff_fixed;
+        attach_clip(bl);
+        dl.items.push_back(std::move(bl));
+    }
 
     bool child_has_clip = has_clip;
     Rect child_clip = clip_rect;
@@ -556,7 +1082,7 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
             item.rect = f->content_box;
             item.z_index = eff_z;
             item.fixed_viewport = eff_fixed;
-            item.text = f->node->get_attr("src");
+            item.text = resolve_media_src(f->node);
             attach_clip(item);
             dl.hit_regions.push_back(HitRegion{HitRegionKind::Video, f->content_box, eff_z, eff_fixed, item.text});
             dl.items.push_back(std::move(item));
@@ -567,7 +1093,7 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
             item.rect = f->content_box;
             item.z_index = eff_z;
             item.fixed_viewport = eff_fixed;
-            item.text = f->node->get_attr("src");
+            item.text = resolve_media_src(f->node);
             attach_clip(item);
             dl.hit_regions.push_back(HitRegion{HitRegionKind::Audio, f->content_box, eff_z, eff_fixed, item.text});
             dl.items.push_back(std::move(item));
@@ -584,13 +1110,28 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
             attach_clip(item);
             dl.items.push_back(std::move(item));
             return;
+        } else if (tag == "svg") {
+            DisplayItem item;
+            item.type = DisplayItemType::EmbedSvg;
+            item.rect = f->content_box;
+            item.z_index = eff_z;
+            item.fixed_viewport = eff_fixed;
+            std::string xml = "<svg";
+            for (const auto& a : f->node->attrs) {
+                xml += " " + a.name + "=\"" + a.value + "\"";
+            }
+            xml += ">" + f->node->inner_html() + "</svg>";
+            item.text = std::move(xml);
+            attach_clip(item);
+            dl.items.push_back(std::move(item));
+            return;
         } else if (tag == "img") {
             DisplayItem item;
             item.type = DisplayItemType::DrawImage;
             item.rect = f->content_box;
             item.z_index = eff_z;
             item.fixed_viewport = eff_fixed;
-            item.text = f->node->get_attr("src");
+            item.text = resolve_img_src(f->node);
             attach_clip(item);
             dl.items.push_back(std::move(item));
             return;
@@ -607,10 +1148,14 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
             item.z_index = eff_z;
             item.fixed_viewport = eff_fixed;
             item.focused = (f->node->get_attr("data-astra-focused") == "1");
+            item.color2_argb = apply_opacity(st.background.to_argb(), eff_opacity);
             std::string val = f->node->get_attr("value");
             std::string ph = f->node->get_attr("placeholder");
             std::string input_type = f->node->get_attr("type");
-            if (!val.empty()) {
+            if (input_type == "checkbox" || input_type == "radio") {
+                item.text = f->node->has_attr("checked") ? "x" : "";
+                item.color_argb = apply_opacity(st.color.to_argb(), eff_opacity);
+            } else if (!val.empty()) {
                 if (input_type == "password") item.text.assign(val.size(), '*');
                 else item.text = val;
                 item.color_argb = apply_opacity(st.color.to_argb(), eff_opacity);
@@ -796,12 +1341,13 @@ LayoutFrame* LayoutEngine::build_layout(SlabArena& arena,
                                         const HtmlDocument& doc,
                                         const CssStylesheet& sheet,
                                         float viewport_w,
-                                        float viewport_h) {
+                                        float viewport_h,
+                                        bool light_web_default) {
     const DomNode* body = doc.body();
     ComputedStyle root_seed;
     root_seed.css_vars = StyleEngine::collect_root_vars(sheet, viewport_w);
     const ComputedStyle* seed_ptr = root_seed.css_vars.empty() ? nullptr : &root_seed;
-    LayoutFrame* root = build_frame_tree(arena, body, sheet, seed_ptr, viewport_w);
+    LayoutFrame* root = build_frame_tree(arena, body, sheet, seed_ptr, viewport_w, light_web_default);
     if (!root) return nullptr;
     Rect viewport{0.0f, 0.0f, viewport_w, viewport_h};
     layout_node(root, 0.0f, 0.0f, viewport_w, viewport, viewport);

@@ -59,6 +59,13 @@ public:
                      bool is_top_level_navigation = true,
                      int max_redirects = 5);
 
+    HttpResponse request(const std::string& method,
+                         const std::string& url,
+                         const std::string& body = "",
+                         const std::vector<std::pair<std::string, std::string>>& extra_headers = {},
+                         const std::string& content_type = "application/json",
+                         const std::string& top_level_site = "");
+
     HttpResponse post(const std::string& url,
                       const std::string& body,
                       const std::string& content_type = "application/json",
@@ -74,6 +81,8 @@ public:
     size_t keepalive_reuses() const { return keepalive_reuses_.load(); }
 
     static bool decompress_gzip_or_zlib(const uint8_t* data, size_t len, std::string& out);
+    static bool decompress_brotli(const uint8_t* data, size_t len, std::string& out);
+    static bool brotli_available();
     static bool tls_available();
     static std::string resolve_relative_url(const std::string& base_url, const std::string& rel);
 

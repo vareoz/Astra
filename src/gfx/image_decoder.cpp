@@ -1,9 +1,11 @@
 #include "gfx/image_decoder.hpp"
+#include "gfx/svg_engine.hpp"
 #include "net/http_client.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <dlfcn.h>
 #include <fstream>
 #include <sstream>
 
@@ -67,11 +69,37 @@ DecodedImage ImageDecoder::decode_bytes(const uint8_t* data, size_t len) {
     if (data[0] == 0xFF && data[1] == 0xD8) {
         return decode_jpeg(data, len);
     }
+    if (len >= 13 && (std::memcmp(data, "GIF87a", 6) == 0 || std::memcmp(data, "GIF89a", 6) == 0)) {
+        return decode_gif(data, len);
+    }
+    if (len >= 16 && std::memcmp(data, "RIFF", 4) == 0 && std::memcmp(data + 8, "WEBP", 4) == 0) {
+        return decode_webp(data, len);
+    }
     if (data[0] == 'B' && data[1] == 'M' && len >= 54) {
         return decode_bmp(data, len);
     }
     if (data[0] == 'P' && data[1] == '6') {
         return decode_ppm(data, len);
+    }
+    // AstraImage v4: Native SVG-in-<img> vector decoding
+    size_t skip = 0;
+    if (len >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF) skip = 3; // UTF-8 BOM
+    while (skip < len && (data[skip] == ' ' || data[skip] == '\t' || data[skip] == '\r' || data[skip] == '\n')) ++skip;
+    if (skip < len && data[skip] == '<') {
+        std::string_view sv(reinterpret_cast<const char*>(data + skip), len - skip);
+        std::string_view head = sv.substr(0, std::min<size_t>(sv.size(), 512));
+        if (head.find("<svg") != std::string_view::npos || head.find("<SVG") != std::string_view::npos) {
+            SvgSurface surf = SvgEngine::render_svg(sv, 0, 0);
+            if (surf.valid && surf.width > 0 && surf.height > 0) {
+                DecodedImage img;
+                img.valid = true;
+                img.format = "SVG";
+                img.width = surf.width;
+                img.height = surf.height;
+                img.argb = std::move(surf.argb);
+                return img;
+            }
+        }
     }
     DecodedImage img;
     img.error = "Unsupported image signature";
@@ -649,6 +677,274 @@ DecodedImage ImageDecoder::decode_jpeg(const uint8_t* data, size_t len) {
     }
 
     out.valid = true;
+    return out;
+}
+
+DecodedImage ImageDecoder::decode_gif(const uint8_t* data, size_t len) {
+    DecodedImage out;
+    out.format = "GIF";
+    if (!data || len < 14) { out.error = "Truncated GIF header"; return out; }
+
+    int canvas_w = read_le16(data + 6);
+    int canvas_h = read_le16(data + 8);
+    if (canvas_w <= 0 || canvas_h <= 0 || canvas_w > 4096 || canvas_h > 4096) {
+        out.error = "Invalid GIF dimensions";
+        return out;
+    }
+    uint8_t packed = data[10];
+    bool has_gct = (packed & 0x80u) != 0;
+    size_t gct_entries = has_gct ? (size_t(1) << ((packed & 0x07u) + 1)) : 0;
+    size_t pos = 13;
+    std::vector<uint32_t> gct;
+    if (has_gct) {
+        if (pos + gct_entries * 3 > len) { out.error = "Truncated GIF GCT"; return out; }
+        gct.resize(gct_entries);
+        for (size_t i = 0; i < gct_entries; ++i) {
+            gct[i] = 0xFF000000u |
+                     (static_cast<uint32_t>(data[pos + i * 3]) << 16) |
+                     (static_cast<uint32_t>(data[pos + i * 3 + 1]) << 8) |
+                     static_cast<uint32_t>(data[pos + i * 3 + 2]);
+        }
+        pos += gct_entries * 3;
+    }
+
+    out.width = canvas_w;
+    out.height = canvas_h;
+    out.argb.assign(static_cast<size_t>(canvas_w) * static_cast<size_t>(canvas_h), 0x00000000u);
+
+    bool has_trans = false;
+    uint8_t trans_idx = 0;
+
+    while (pos < len) {
+        uint8_t intro = data[pos++];
+        if (intro == 0x3Bu) break; // Trailer
+        if (intro == 0x21u) { // Extension block
+            if (pos >= len) break;
+            uint8_t label = data[pos++];
+            if (label == 0xF9u && pos + 5 <= len && data[pos] == 4) {
+                uint8_t gce_flags = data[pos + 1];
+                has_trans = (gce_flags & 0x01u) != 0;
+                trans_idx = data[pos + 4];
+            }
+            // Skip sub-blocks
+            while (pos < len) {
+                uint8_t sz = data[pos++];
+                if (sz == 0) break;
+                if (pos + sz > len) { pos = len; break; }
+                pos += sz;
+            }
+            continue;
+        }
+        if (intro != 0x2Cu) continue; // Wait for Image Descriptor
+        if (pos + 9 > len) { out.error = "Truncated GIF image descriptor"; return out; }
+
+        int left = read_le16(data + pos);
+        int top = read_le16(data + pos + 2);
+        int iw = read_le16(data + pos + 4);
+        int ih = read_le16(data + pos + 6);
+        uint8_t ipacked = data[pos + 8];
+        pos += 9;
+
+        bool has_lct = (ipacked & 0x80u) != 0;
+        bool interlaced = (ipacked & 0x40u) != 0;
+        std::vector<uint32_t> lct;
+        if (has_lct) {
+            size_t lct_entries = size_t(1) << ((ipacked & 0x07u) + 1);
+            if (pos + lct_entries * 3 > len) { out.error = "Truncated GIF LCT"; return out; }
+            lct.resize(lct_entries);
+            for (size_t i = 0; i < lct_entries; ++i) {
+                lct[i] = 0xFF000000u |
+                         (static_cast<uint32_t>(data[pos + i * 3]) << 16) |
+                         (static_cast<uint32_t>(data[pos + i * 3 + 1]) << 8) |
+                         static_cast<uint32_t>(data[pos + i * 3 + 2]);
+            }
+            pos += lct_entries * 3;
+        }
+        const auto& palette = has_lct ? lct : gct;
+        if (palette.empty() || pos >= len) { out.error = "Missing GIF color table"; return out; }
+
+        uint8_t min_code_size = data[pos++];
+        if (min_code_size < 2 || min_code_size > 11) { out.error = "Invalid GIF LZW code size"; return out; }
+
+        // Gather LZW sub-blocks
+        std::vector<uint8_t> lzw_bytes;
+        while (pos < len) {
+            uint8_t sz = data[pos++];
+            if (sz == 0) break;
+            if (pos + sz > len) { out.error = "Truncated GIF LZW stream"; return out; }
+            lzw_bytes.insert(lzw_bytes.end(), data + pos, data + pos + sz);
+            pos += sz;
+        }
+
+        // Pure-C++20 GIF LZW Decompressor (max 4096 table entries)
+        const int clear_code = 1 << min_code_size;
+        const int eoi_code = clear_code + 1;
+        int code_size = min_code_size + 1;
+        int next_code = eoi_code + 1;
+
+        std::vector<int> prefix(4096, -1);
+        std::vector<uint8_t> suffix(4096, 0);
+        for (int i = 0; i < clear_code; ++i) suffix[i] = static_cast<uint8_t>(i);
+
+        size_t bit_pos = 0;
+        const size_t total_bits = lzw_bytes.size() * 8;
+        auto read_code = [&](int width_bits) -> int {
+            if (bit_pos + static_cast<size_t>(width_bits) > total_bits) return eoi_code;
+            int val = 0;
+            for (int b = 0; b < width_bits; ++b) {
+                size_t bp = bit_pos + static_cast<size_t>(b);
+                if ((lzw_bytes[bp >> 3] >> (bp & 7)) & 1u) val |= (1 << b);
+            }
+            bit_pos += static_cast<size_t>(width_bits);
+            return val;
+        };
+
+        std::vector<uint8_t> indices;
+        const size_t max_pixels = static_cast<size_t>(iw) * static_cast<size_t>(ih);
+        indices.reserve(std::min<size_t>(max_pixels, 1024 * 1024));
+        std::vector<uint8_t> stack;
+        stack.reserve(4096);
+
+        int prev_code = -1;
+        uint8_t first_char = 0;
+        while (indices.size() < max_pixels) {
+            int code = read_code(code_size);
+            if (code == eoi_code) break;
+            if (code == clear_code) {
+                code_size = min_code_size + 1;
+                next_code = eoi_code + 1;
+                prev_code = -1;
+                continue;
+            }
+            int in_code = code;
+            stack.clear();
+            if (code >= next_code) {
+                if (prev_code < 0 || code > next_code) break; // Corrupt stream guard
+                stack.push_back(first_char);
+                code = prev_code;
+            }
+            int guard = 0;
+            while (code >= clear_code && guard < 4096) {
+                stack.push_back(suffix[code]);
+                code = prefix[code];
+                if (code < 0 || code >= 4096) break;
+                ++guard;
+            }
+            if (code < 0 || code >= clear_code) break;
+            first_char = static_cast<uint8_t>(code);
+            stack.push_back(first_char);
+            for (auto it = stack.rbegin(); it != stack.rend() && indices.size() < max_pixels; ++it) {
+                indices.push_back(*it);
+            }
+            if (prev_code >= 0 && next_code < 4096) {
+                prefix[next_code] = prev_code;
+                suffix[next_code] = first_char;
+                ++next_code;
+                if (next_code == (1 << code_size) && code_size < 12) ++code_size;
+            }
+            prev_code = in_code;
+        }
+
+        // Map decoded indices onto canvas (handling optional interlacing & transparency)
+        static const int kPassStart[4] = {0, 4, 2, 1};
+        static const int kPassStep[4] = {8, 8, 4, 2};
+        size_t src_i = 0;
+        auto write_row = [&](int ry) {
+            int gy = top + ry;
+            for (int rx = 0; rx < iw && src_i < indices.size(); ++rx, ++src_i) {
+                int gx = left + rx;
+                if (gy < 0 || gy >= canvas_h || gx < 0 || gx >= canvas_w) continue;
+                uint8_t idx = indices[src_i];
+                if (has_trans && idx == trans_idx) continue;
+                if (idx < palette.size()) {
+                    out.argb[static_cast<size_t>(gy * canvas_w + gx)] = palette[idx];
+                }
+            }
+        };
+        if (interlaced) {
+            for (int p = 0; p < 4; ++p) {
+                for (int ry = kPassStart[p]; ry < ih; ry += kPassStep[p]) write_row(ry);
+            }
+        } else {
+            for (int ry = 0; ry < ih; ++ry) write_row(ry);
+        }
+
+        out.valid = !indices.empty();
+        break; // First frame decoded
+    }
+    return out;
+}
+
+DecodedImage ImageDecoder::decode_webp(const uint8_t* data, size_t len) {
+    DecodedImage out;
+    out.format = "WEBP";
+    if (!data || len < 20) { out.error = "Truncated WebP buffer"; return out; }
+
+    // Runtime dlopen("libwebp.so.7" / "libwebp.so.6") for full VP8/VP8L/VP8X decoding with zero compile deps
+    using DecodeRGBAFn = uint8_t* (*)(const uint8_t*, size_t, int*, int*);
+    using WebPFreeFn = void (*)(void*);
+    static void* webp_lib = nullptr;
+    static DecodeRGBAFn fn_decode = nullptr;
+    static WebPFreeFn fn_free = nullptr;
+    static bool tried_dl = false;
+    if (!tried_dl) {
+        tried_dl = true;
+        webp_lib = dlopen("libwebp.so.7", RTLD_LAZY);
+        if (!webp_lib) webp_lib = dlopen("libwebp.so.6", RTLD_LAZY);
+        if (!webp_lib) webp_lib = dlopen("libwebp.so", RTLD_LAZY);
+        if (webp_lib) {
+            fn_decode = reinterpret_cast<DecodeRGBAFn>(dlsym(webp_lib, "WebPDecodeRGBA"));
+            fn_free = reinterpret_cast<WebPFreeFn>(dlsym(webp_lib, "WebPFree"));
+        }
+    }
+    if (fn_decode) {
+        int w = 0, h = 0;
+        uint8_t* rgba = fn_decode(data, len, &w, &h);
+        if (rgba && w > 0 && h > 0 && w <= 4096 && h <= 4096) {
+            out.width = w;
+            out.height = h;
+            out.argb.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
+            for (size_t i = 0; i < out.argb.size(); ++i) {
+                uint8_t r = rgba[i * 4 + 0];
+                uint8_t g = rgba[i * 4 + 1];
+                uint8_t b = rgba[i * 4 + 2];
+                uint8_t a = rgba[i * 4 + 3];
+                out.argb[i] = (static_cast<uint32_t>(a) << 24) |
+                              (static_cast<uint32_t>(r) << 16) |
+                              (static_cast<uint32_t>(g) << 8) | b;
+            }
+            if (fn_free) fn_free(rgba);
+            else std::free(rgba);
+            out.valid = true;
+            return out;
+        }
+        if (rgba) {
+            if (fn_free) fn_free(rgba);
+            else std::free(rgba);
+        }
+    }
+
+    // Pure-C++20 fallback: probe VP8X / VP8L / VP8 chunk dimensions cleanly
+    int w = 0, h = 0;
+    if (len >= 30 && std::memcmp(data + 12, "VP8X", 4) == 0) {
+        w = 1 + (data[24] | (data[25] << 8) | (data[26] << 16));
+        h = 1 + (data[27] | (data[28] << 8) | (data[29] << 16));
+    } else if (len >= 25 && std::memcmp(data + 12, "VP8L", 4) == 0 && data[20] == 0x2Fu) {
+        uint32_t bits = read_le32(data + 21);
+        w = static_cast<int>((bits & 0x3FFFu) + 1);
+        h = static_cast<int>(((bits >> 14) & 0x3FFFu) + 1);
+    } else if (len >= 30 && std::memcmp(data + 12, "VP8 ", 4) == 0 &&
+               data[23] == 0x9Du && data[24] == 0x01u && data[25] == 0x2Au) {
+        w = read_le16(data + 26) & 0x3FFFu;
+        h = read_le16(data + 28) & 0x3FFFu;
+    }
+    if (w > 0 && h > 0 && w <= 4096 && h <= 4096) {
+        out.width = w;
+        out.height = h;
+        out.error = "libwebp not installed on host (container header parsed: " + std::to_string(w) + "x" + std::to_string(h) + ")";
+    } else {
+        out.error = "Invalid WebP bitstream";
+    }
     return out;
 }
 

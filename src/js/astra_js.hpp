@@ -60,10 +60,14 @@ enum class OpCode : uint8_t {
     Le,
     Gt,
     Ge,
+    InstanceOf,
     Jump,
     JumpIfFalse,
     MakeArray,
+    ArrayPush,
     MakeObject,
+    MakeRegExp,
+    InheritClass,
     GetProp,
     SetProp,
     Call,
@@ -130,9 +134,9 @@ struct CanvasSurface {
     static uint32_t parse_css_color(std::string_view s, uint32_t fallback);
 };
 
-// Mark-and-Sweep GC-managed heap object (Array, Map, Function, Class, Promise, Canvas2D, StyleProxy, WebSocket)
+// Mark-and-Sweep GC-managed heap object (Array, Map, Function, Class, Promise, Canvas2D, StyleProxy, WebSocket, RegExp, Date, JsMap, JsSet)
 struct GcObject {
-    enum class Type { Array, Map, Function, Class, Promise, Canvas2D, StyleProxy, WebSocket };
+    enum class Type { Array, Map, Function, Class, Promise, Canvas2D, StyleProxy, WebSocket, RegExp, Date, JsMap, JsSet };
     enum class PromiseState : uint8_t { Pending, Fulfilled, Rejected };
     struct PromiseReaction {
         GcObject* next = nullptr;
@@ -147,6 +151,8 @@ struct GcObject {
     std::vector<JsValue> elements;
     std::unordered_map<std::string, JsValue> props;
     GcObject* proto_class = nullptr;
+    GcObject* proto_obj = nullptr;      // Real [[Prototype]] chain link
+    GcObject* fn_prototype = nullptr;   // Constructor .prototype object
 
     // Function / Class fields
     std::string fn_name;
@@ -154,6 +160,13 @@ struct GcObject {
     BytecodeChunk chunk;
     bool is_async = false;
     std::shared_ptr<std::unordered_map<std::string, JsValue>> closure_env;
+
+    // RegExp / Date / ES6 Map / ES6 Set native storage
+    std::string regex_pattern;
+    std::string regex_flags;
+    int64_t date_ms = 0;
+    std::vector<std::pair<JsValue, JsValue>> map_entries;
+    std::vector<JsValue> set_entries;
 
     // DOM proxies & native bindings
     DomNode* classlist_node = nullptr;
@@ -206,7 +219,10 @@ public:
     using StorageSetFn = std::function<void(const std::string&, const std::string&)>;
     using FetchFn = std::function<JsFetchResult(const std::string& url,
                                                 const std::string& method,
-                                                const std::string& body)>;
+                                                const std::string& body,
+                                                const std::vector<std::pair<std::string, std::string>>& headers)>;
+
+    using HistoryFn = std::function<void(const std::string& new_url, bool replace)>;
 
     AstraJsEngine() = default;
     ~AstraJsEngine();
@@ -216,6 +232,8 @@ public:
 
     void bind_storage(StorageGetFn getter, StorageSetFn setter);
     void bind_fetch(FetchFn fetcher);
+    void bind_history(HistoryFn on_history, std::string initial_url);
+    const std::string& current_url() const { return current_url_; }
     JsExecutionReport execute(std::string_view code, HtmlDocument& doc);
 
     // Dispatch a real DOM event (e.g. "click", "input", "submit") to registered JS bytecode handlers
@@ -293,10 +311,15 @@ private:
     // DOM event listeners: (node_ptr, event_name) -> callbacks
     std::map<std::pair<DomNode*, std::string>, std::vector<JsValue>> listeners_;
     std::unordered_map<std::string, std::string> local_storage_;
+    std::unordered_map<std::string, std::string> session_storage_;
+    std::string current_url_ = "about:blank";
+    std::vector<std::pair<std::string, JsValue>> history_entries_;
+    int history_index_ = -1;
 
     StorageGetFn storage_get_;
     StorageSetFn storage_set_;
     FetchFn fetch_fn_;
+    HistoryFn history_fn_;
 };
 
 } // namespace astra

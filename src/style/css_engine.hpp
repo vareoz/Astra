@@ -36,9 +36,26 @@ struct Color {
 enum class DisplayType : uint8_t {
     Block,
     Inline,
+    InlineBlock,
     Flex,
     Grid,
+    Table,
+    TableRow,
+    TableCell,
     None
+};
+
+enum class FloatMode : uint8_t {
+    None,
+    Left,
+    Right
+};
+
+enum class ClearMode : uint8_t {
+    None,
+    Left,
+    Right,
+    Both
 };
 
 enum class FlexDirection : uint8_t {
@@ -113,15 +130,20 @@ struct EdgeSizes {
 struct ComputedStyle {
     DisplayType display = DisplayType::Block;
     FlexDirection flex_direction = FlexDirection::Row;
+    bool flex_wrap = false;
     JustifyContent justify_content = JustifyContent::FlexStart;
     AlignItems align_items = AlignItems::Stretch;
     TextAlign text_align = TextAlign::Left;
     PositionType position = PositionType::Static;
+    FloatMode float_mode = FloatMode::None;
+    ClearMode clear_mode = ClearMode::None;
     OverflowMode overflow = OverflowMode::Visible;
     BoxSizing box_sizing = BoxSizing::ContentBox;
     std::vector<GridTrack> grid_columns;
     float gap = 0.0f;
     float width = -1.0f;      // < 0 means auto
+    float width_pct = -1.0f;  // >= 0 means percentage of containing width
+    std::string width_calc;   // non-empty means calc(...) expression resolved against containing width
     float height = -1.0f;     // < 0 means auto
     float min_width = -1.0f;
     float max_width = -1.0f;
@@ -133,6 +155,8 @@ struct ComputedStyle {
     float left = 0.0f;
     float right = 0.0f;
     float bottom = 0.0f;
+    float translate_x = 0.0f;
+    float translate_y = 0.0f;
     int z_index = 0;
     float opacity = 1.0f;
     EdgeSizes margin;
@@ -140,6 +164,8 @@ struct ComputedStyle {
     float border_width = 0.0f;
     float border_radius = 0.0f;
     Color border_color{0, 0, 0, 0};
+    float border_left_width = 0.0f;
+    Color border_left_color{0, 0, 0, 0};
     Color background{0, 0, 0, 0};
     LinearGradient background_gradient;
     Color color{230, 234, 240, 255};
@@ -148,6 +174,8 @@ struct ComputedStyle {
     bool bold = false;
     bool monospace = false;
     float line_height = 1.48f;
+    bool has_content = false;
+    std::string content_text;
     std::unordered_map<std::string, std::string> css_vars;
 };
 
@@ -178,6 +206,7 @@ class StyleEngine {
 public:
     static Color parse_color(std::string_view val, Color fallback);
     static float parse_px(std::string_view val, float fallback = 0.0f);
+    static float eval_calc(std::string_view val, float ref_px, float viewport_w = 1280.0f, float fallback = 0.0f);
     static std::string resolve_var_expr(std::string_view val,
                                         const std::unordered_map<std::string, std::string>& vars,
                                         int depth = 0);
@@ -187,7 +216,15 @@ public:
     static ComputedStyle compute_style(const DomNode* node,
                                        const CssStylesheet& sheet,
                                        const ComputedStyle* parent_style,
-                                       float viewport_w = 1280.0f);
+                                       float viewport_w = 1280.0f,
+                                       bool light_web_default = false);
+
+    static bool compute_pseudo_style(const DomNode* node,
+                                     const CssStylesheet& sheet,
+                                     std::string_view pseudo_name, // "::before" or "::after"
+                                     const ComputedStyle& element_style,
+                                     ComputedStyle& out_style,
+                                     float viewport_w = 1280.0f);
 };
 
 } // namespace astra

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <sstream>
 #include <unordered_map>
@@ -59,8 +60,37 @@ std::vector<CssDeclaration> parse_declarations(std::string_view block) {
     return decls;
 }
 
-bool match_compound_selector(const DomNode* node, std::string_view part, int& specificity) {
-    if (!node || node->type != NodeType::Element || part.empty()) return false;
+bool match_selector(const DomNode* node, std::string_view selector, int& specificity, int depth = 0);
+
+std::vector<std::string> split_top_level_commas(std::string_view s) {
+    std::vector<std::string> out;
+    int pdepth = 0;
+    int bdepth = 0;
+    char quote = 0;
+    size_t seg = 0;
+    for (size_t i = 0; i <= s.size(); ++i) {
+        if (i < s.size()) {
+            char c = s[i];
+            if (quote) {
+                if (c == quote && (i == 0 || s[i - 1] != '\\')) quote = 0;
+            } else if (c == '"' || c == '\'') {
+                quote = c;
+            } else if (c == '(') ++pdepth;
+            else if (c == ')' && pdepth > 0) --pdepth;
+            else if (c == '[') ++bdepth;
+            else if (c == ']' && bdepth > 0) --bdepth;
+        }
+        if (i == s.size() || (s[i] == ',' && pdepth == 0 && bdepth == 0 && !quote)) {
+            std::string tok = trim(s.substr(seg, i - seg));
+            if (!tok.empty()) out.push_back(std::move(tok));
+            seg = i + 1;
+        }
+    }
+    return out;
+}
+
+bool match_compound_selector(const DomNode* node, std::string_view part, int& specificity, int depth = 0) {
+    if (!node || node->type != NodeType::Element || part.empty() || depth > 6) return false;
     if (part == "*") return true;
     if (to_lower(part) == ":root") {
         if (node->tag == "html" || node->tag == "body") {
@@ -70,93 +100,356 @@ bool match_compound_selector(const DomNode* node, std::string_view part, int& sp
         return false;
     }
 
+    struct AttrCond {
+        std::string name;
+        std::string op; // "", "=", "~=", "|=", "^=", "$=", "*="
+        std::string value;
+        bool icase = false;
+    };
+
     std::string tag;
     std::string id;
     std::vector<std::string> classes;
-    bool has_root_pseudo = false;
+    std::vector<std::string> pseudos;
+    std::vector<AttrCond> attrs;
 
     size_t i = 0;
     while (i < part.size()) {
         if (part[i] == '#') {
             ++i;
-            size_t st = i;
-            while (i < part.size() && part[i] != '.' && part[i] != '#' && part[i] != ':') ++i;
-            id = std::string(part.substr(st, i - st));
+            std::string tok;
+            while (i < part.size() && part[i] != '.' && part[i] != '#' && part[i] != ':' && part[i] != '[') {
+                if (part[i] == '\\' && i + 1 < part.size()) ++i;
+                tok.push_back(part[i++]);
+            }
+            id = std::move(tok);
         } else if (part[i] == '.') {
             ++i;
+            std::string tok;
+            while (i < part.size() && part[i] != '.' && part[i] != '#' && part[i] != ':' && part[i] != '[') {
+                if (part[i] == '\\' && i + 1 < part.size()) ++i;
+                tok.push_back(part[i++]);
+            }
+            if (!tok.empty()) classes.push_back(std::move(tok));
+        } else if (part[i] == '[') {
+            ++i;
             size_t st = i;
-            while (i < part.size() && part[i] != '.' && part[i] != '#' && part[i] != ':') ++i;
-            classes.emplace_back(part.substr(st, i - st));
+            char q = 0;
+            while (i < part.size()) {
+                if (q) {
+                    if (part[i] == q && (i == st || part[i - 1] != '\\')) q = 0;
+                } else if (part[i] == '"' || part[i] == '\'') {
+                    q = part[i];
+                } else if (part[i] == ']') {
+                    break;
+                }
+                ++i;
+            }
+            std::string inside = trim(part.substr(st, i - st));
+            if (i < part.size() && part[i] == ']') ++i;
+            if (!inside.empty()) {
+                AttrCond ac;
+                size_t eq = inside.find('=');
+                if (eq == std::string::npos) {
+                    ac.name = to_lower(trim(inside));
+                } else {
+                    size_t op_start = eq;
+                    if (eq > 0 && (inside[eq - 1] == '~' || inside[eq - 1] == '|' ||
+                                   inside[eq - 1] == '^' || inside[eq - 1] == '$' || inside[eq - 1] == '*')) {
+                        op_start = eq - 1;
+                    }
+                    ac.name = to_lower(trim(inside.substr(0, op_start)));
+                    ac.op = inside.substr(op_start, eq - op_start + 1);
+                    std::string val = trim(inside.substr(eq + 1));
+                    if (val.size() >= 2 && (val.back() == 'i' || val.back() == 'I') &&
+                        std::isspace(static_cast<unsigned char>(val[val.size() - 2]))) {
+                        ac.icase = true;
+                        val = trim(val.substr(0, val.size() - 1));
+                    }
+                    if (val.size() >= 2 && ((val.front() == '"' && val.back() == '"') ||
+                                            (val.front() == '\'' && val.back() == '\''))) {
+                        val = val.substr(1, val.size() - 2);
+                    }
+                    ac.value = std::move(val);
+                }
+                if (!ac.name.empty()) attrs.push_back(std::move(ac));
+            }
         } else if (part[i] == ':') {
             size_t st = i;
-            while (i < part.size() && part[i] != '.' && part[i] != '#') ++i;
-            std::string pseudo = to_lower(part.substr(st, i - st));
-            if (pseudo == ":root") has_root_pseudo = true;
+            ++i;
+            if (i < part.size() && part[i] == ':') ++i; // ::before / ::after
+            int pdepth = 0;
+            while (i < part.size()) {
+                char c = part[i];
+                if (c == '(') ++pdepth;
+                else if (c == ')') { if (pdepth > 0) --pdepth; }
+                else if (pdepth == 0 && (c == '.' || c == '#' || c == ':' || c == '[')) break;
+                ++i;
+            }
+            pseudos.emplace_back(part.substr(st, i - st));
+        } else if (part[i] == '*') {
+            ++i;
         } else {
             size_t st = i;
-            while (i < part.size() && part[i] != '.' && part[i] != '#' && part[i] != ':') ++i;
+            while (i < part.size() && part[i] != '.' && part[i] != '#' && part[i] != ':' && part[i] != '[') ++i;
             tag = to_lower(part.substr(st, i - st));
         }
     }
 
-    if (has_root_pseudo && node->tag != "html" && node->tag != "body") return false;
-    if (!tag.empty() && node->tag != tag) return false;
+    if (!tag.empty() && tag != "*" && node->tag != tag) return false;
     if (!id.empty() && node->id() != id) return false;
     for (const auto& c : classes) {
         if (!node->has_class(c)) return false;
     }
 
+    for (const auto& ac : attrs) {
+        if (!node->has_attr(ac.name)) return false;
+        if (ac.op.empty()) continue;
+        std::string actual = node->get_attr(ac.name);
+        std::string target = ac.value;
+        if (ac.icase) {
+            actual = to_lower(actual);
+            target = to_lower(target);
+        }
+        if (ac.op == "=") {
+            if (actual != target) return false;
+        } else if (ac.op == "~=") {
+            auto toks = split_ws(actual);
+            if (std::find(toks.begin(), toks.end(), target) == toks.end()) return false;
+        } else if (ac.op == "|=") {
+            if (actual != target && actual.rfind(target + "-", 0) != 0) return false;
+        } else if (ac.op == "^=") {
+            if (target.empty() || actual.rfind(target, 0) != 0) return false;
+        } else if (ac.op == "$=") {
+            if (target.empty() || actual.size() < target.size() ||
+                actual.compare(actual.size() - target.size(), target.size(), target) != 0) return false;
+        } else if (ac.op == "*=") {
+            if (target.empty() || actual.find(target) == std::string::npos) return false;
+        }
+    }
+
+    auto match_nth_expr = [](int idx_1based, const std::string& raw_expr) -> bool {
+        std::string e;
+        for (char c : raw_expr) {
+            if (!std::isspace(static_cast<unsigned char>(c))) e.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        }
+        if (e == "odd") return (idx_1based % 2) == 1;
+        if (e == "even") return (idx_1based % 2) == 0;
+        size_t npos = e.find('n');
+        if (npos == std::string::npos) {
+            return idx_1based == std::atoi(e.c_str());
+        }
+        int a = 1;
+        if (npos == 0) a = 1;
+        else if (npos == 1 && e[0] == '+') a = 1;
+        else if (npos == 1 && e[0] == '-') a = -1;
+        else a = std::atoi(e.substr(0, npos).c_str());
+        int b = (npos + 1 < e.size()) ? std::atoi(e.substr(npos + 1).c_str()) : 0;
+        if (a == 0) return idx_1based == b;
+        int diff = idx_1based - b;
+        if (a > 0) return diff >= 0 && (diff % a) == 0;
+        return diff <= 0 && (diff % (-a)) == 0;
+    };
+
+    int pseudo_spec = 0;
+    for (const auto& raw_ps : pseudos) {
+        std::string ps = to_lower(raw_ps);
+        if (ps == "::before" || ps == "::after" || ps == ":before" || ps == ":after" ||
+            ps.rfind("::", 0) == 0) {
+            return false; // Pseudo-elements never match normal element pass
+        } else if (ps == ":root") {
+            if (node->tag != "html" && node->tag != "body") return false;
+            pseudo_spec += 10;
+        } else if (ps == ":first-child") {
+            if (!node->parent) return false;
+            const DomNode* first_el = nullptr;
+            for (const DomNode* sib : node->parent->children) {
+                if (sib->type == NodeType::Element) { first_el = sib; break; }
+            }
+            if (first_el != node) return false;
+            pseudo_spec += 10;
+        } else if (ps == ":last-child") {
+            if (!node->parent) return false;
+            const DomNode* last_el = nullptr;
+            for (const DomNode* sib : node->parent->children) {
+                if (sib->type == NodeType::Element) last_el = sib;
+            }
+            if (last_el != node) return false;
+            pseudo_spec += 10;
+        } else if (ps == ":first-of-type") {
+            if (!node->parent) return false;
+            const DomNode* first_el = nullptr;
+            for (const DomNode* sib : node->parent->children) {
+                if (sib->type == NodeType::Element && sib->tag == node->tag) { first_el = sib; break; }
+            }
+            if (first_el != node) return false;
+            pseudo_spec += 10;
+        } else if (ps == ":last-of-type") {
+            if (!node->parent) return false;
+            const DomNode* last_el = nullptr;
+            for (const DomNode* sib : node->parent->children) {
+                if (sib->type == NodeType::Element && sib->tag == node->tag) last_el = sib;
+            }
+            if (last_el != node) return false;
+            pseudo_spec += 10;
+        } else if (ps.rfind(":nth-child(", 0) == 0 && ps.back() == ')') {
+            if (!node->parent) return false;
+            int pos = 0;
+            bool found = false;
+            for (const DomNode* sib : node->parent->children) {
+                if (sib->type == NodeType::Element) {
+                    ++pos;
+                    if (sib == node) { found = true; break; }
+                }
+            }
+            if (!found) return false;
+            std::string expr = ps.substr(11, ps.size() - 12);
+            if (!match_nth_expr(pos, expr)) return false;
+            pseudo_spec += 10;
+        } else if (ps == ":empty") {
+            if (!node->children.empty()) return false;
+            pseudo_spec += 10;
+        } else if (ps == ":focus" || ps == ":focus-visible") {
+            if (node->get_attr("data-astra-focused") != "1") return false;
+            pseudo_spec += 10;
+        } else if (ps == ":hover") {
+            if (node->get_attr("data-astra-hovered") != "1") return false;
+            pseudo_spec += 10;
+        } else if (ps == ":checked") {
+            if (!node->has_attr("checked")) return false;
+            pseudo_spec += 10;
+        } else if (ps == ":disabled") {
+            if (!node->has_attr("disabled")) return false;
+            pseudo_spec += 10;
+        } else if (ps == ":enabled") {
+            if (node->has_attr("disabled")) return false;
+            pseudo_spec += 10;
+        } else if (ps == ":link" || ps == ":any-link") {
+            if (node->tag != "a" || !node->has_attr("href")) return false;
+            pseudo_spec += 10;
+        } else if (ps == ":visited" || ps == ":active" || ps == ":target" || ps == ":fullscreen" || ps == ":modal") {
+            return false;
+        } else if (ps.rfind(":not(", 0) == 0 && raw_ps.back() == ')') {
+            std::string inner = raw_ps.substr(5, raw_ps.size() - 6);
+            auto list = split_top_level_commas(inner);
+            int max_s = 0;
+            for (const auto& sub : list) {
+                int s = 0;
+                if (match_selector(node, sub, s, depth + 1)) return false;
+                max_s = std::max(max_s, s);
+            }
+            pseudo_spec += max_s;
+        } else if ((ps.rfind(":is(", 0) == 0 || ps.rfind(":where(", 0) == 0) && raw_ps.back() == ')') {
+            bool is_where = (ps.rfind(":where(", 0) == 0);
+            size_t off = is_where ? 7 : 4;
+            std::string inner = raw_ps.substr(off, raw_ps.size() - off - 1);
+            auto list = split_top_level_commas(inner);
+            bool any_ok = false;
+            int max_s = 0;
+            for (const auto& sub : list) {
+                int s = 0;
+                if (match_selector(node, sub, s, depth + 1)) {
+                    any_ok = true;
+                    max_s = std::max(max_s, s);
+                }
+            }
+            if (!any_ok) return false;
+            if (!is_where) pseudo_spec += max_s;
+        } else {
+            // CRITICAL: unknown pseudo-classes MUST NOT silently match all elements!
+            return false;
+        }
+    }
+
     if (!id.empty()) specificity += 100;
-    specificity += static_cast<int>(classes.size()) * 10;
-    if (has_root_pseudo) specificity += 10;
-    if (!tag.empty()) specificity += 1;
+    specificity += static_cast<int>(classes.size() + attrs.size()) * 10 + pseudo_spec;
+    if (!tag.empty() && tag != "*") specificity += 1;
     return true;
 }
 
-bool match_selector(const DomNode* node, std::string_view selector, int& specificity) {
-    // Tokenize selector supporting both descendant (' ') and direct-child ('>') combinators
+bool match_selector(const DomNode* node, std::string_view selector, int& specificity, int depth) {
+    if (depth > 6) return false;
+    // Tokenize selector supporting descendant (' '), direct-child ('>'), adjacent ('+'), and general sibling ('~')
     std::vector<std::string> parts;
-    std::vector<bool> direct_child; // direct_child[i] applies between parts[i] and parts[i+1]
+    std::vector<char> comb; // comb[i] applies between parts[i] and parts[i+1]
     size_t i = 0;
-    bool pending_child = false;
+    char pending_comb = ' ';
     while (i < selector.size()) {
         while (i < selector.size() && std::isspace(static_cast<unsigned char>(selector[i]))) ++i;
         if (i >= selector.size()) break;
-        if (selector[i] == '>') {
-            pending_child = true;
+        if (selector[i] == '>' || selector[i] == '+' || selector[i] == '~') {
+            pending_comb = selector[i];
             ++i;
             continue;
         }
         size_t st = i;
-        while (i < selector.size() && !std::isspace(static_cast<unsigned char>(selector[i])) && selector[i] != '>') {
+        int pdepth = 0;
+        int bdepth = 0;
+        char quote = 0;
+        while (i < selector.size()) {
+            char c = selector[i];
+            if (quote) {
+                if (c == quote && (i == st || selector[i - 1] != '\\')) quote = 0;
+            } else if (c == '"' || c == '\'') {
+                quote = c;
+            } else if (c == '(') ++pdepth;
+            else if (c == ')' && pdepth > 0) --pdepth;
+            else if (c == '[') ++bdepth;
+            else if (c == ']' && bdepth > 0) --bdepth;
+            else if (pdepth == 0 && bdepth == 0 &&
+                     (std::isspace(static_cast<unsigned char>(c)) || c == '>' || c == '+' || c == '~')) {
+                break;
+            }
             ++i;
         }
         if (i > st) {
-            if (!parts.empty()) direct_child.push_back(pending_child);
+            if (!parts.empty()) comb.push_back(pending_comb);
             parts.emplace_back(selector.substr(st, i - st));
-            pending_child = false;
+            pending_comb = ' ';
         }
     }
     if (parts.empty()) return false;
     specificity = 0;
-    if (!match_compound_selector(node, parts.back(), specificity)) return false;
+    if (!match_compound_selector(node, parts.back(), specificity, depth)) return false;
 
     const DomNode* cur = node;
     for (int idx = static_cast<int>(parts.size()) - 2; idx >= 0; --idx) {
-        bool is_direct = direct_child[static_cast<size_t>(idx)];
-        if (is_direct) {
+        char c = comb[static_cast<size_t>(idx)];
+        if (c == '>') {
             const DomNode* p = cur ? cur->parent : nullptr;
             if (!p || p->type != NodeType::Element) return false;
             int sub_spec = 0;
-            if (!match_compound_selector(p, parts[static_cast<size_t>(idx)], sub_spec)) return false;
+            if (!match_compound_selector(p, parts[static_cast<size_t>(idx)], sub_spec, depth)) return false;
             specificity += sub_spec;
             cur = p;
+        } else if (c == '+' || c == '~') {
+            const DomNode* p = cur ? cur->parent : nullptr;
+            if (!p) return false;
+            int my_idx = -1;
+            for (size_t k = 0; k < p->children.size(); ++k) {
+                if (p->children[k] == cur) { my_idx = static_cast<int>(k); break; }
+            }
+            if (my_idx <= 0) return false;
+            bool found = false;
+            for (int k = my_idx - 1; k >= 0; --k) {
+                const DomNode* sib = p->children[static_cast<size_t>(k)];
+                if (sib->type != NodeType::Element) continue;
+                int sub_spec = 0;
+                if (match_compound_selector(sib, parts[static_cast<size_t>(idx)], sub_spec, depth)) {
+                    specificity += sub_spec;
+                    cur = sib;
+                    found = true;
+                    break;
+                }
+                if (c == '+') break; // Only check immediate preceding element
+            }
+            if (!found) return false;
         } else {
             const DomNode* ancestor = cur ? cur->parent : nullptr;
             bool found = false;
             while (ancestor && ancestor->type == NodeType::Element) {
                 int sub_spec = 0;
-                if (match_compound_selector(ancestor, parts[static_cast<size_t>(idx)], sub_spec)) {
+                if (match_compound_selector(ancestor, parts[static_cast<size_t>(idx)], sub_spec, depth)) {
                     specificity += sub_spec;
                     found = true;
                     cur = ancestor;
@@ -246,10 +539,34 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
         if (vl == "none") st.display = DisplayType::None;
         else if (vl == "flex") st.display = DisplayType::Flex;
         else if (vl == "grid") st.display = DisplayType::Grid;
-        else if (vl == "inline" || vl == "inline-block") st.display = DisplayType::Inline;
+        else if (vl == "inline-block") st.display = DisplayType::InlineBlock;
+        else if (vl == "inline") st.display = DisplayType::Inline;
+        else if (vl == "table") st.display = DisplayType::Table;
+        else if (vl == "table-row") st.display = DisplayType::TableRow;
+        else if (vl == "table-cell") st.display = DisplayType::TableCell;
         else st.display = DisplayType::Block;
+    } else if (p == "float") {
+        if (vl == "left") st.float_mode = FloatMode::Left;
+        else if (vl == "right") st.float_mode = FloatMode::Right;
+        else st.float_mode = FloatMode::None;
+    } else if (p == "clear") {
+        if (vl == "left") st.clear_mode = ClearMode::Left;
+        else if (vl == "right") st.clear_mode = ClearMode::Right;
+        else if (vl == "both") st.clear_mode = ClearMode::Both;
+        else st.clear_mode = ClearMode::None;
+    } else if (p == "content") {
+        st.has_content = (vl != "none" && vl != "normal");
+        if (st.has_content) {
+            std::string ct = v;
+            if (ct.size() >= 2 && ((ct.front() == '"' && ct.back() == '"') || (ct.front() == '\'' && ct.back() == '\''))) {
+                ct = ct.substr(1, ct.size() - 2);
+            }
+            st.content_text = ct;
+        }
     } else if (p == "flex-direction") {
         st.flex_direction = (vl == "column") ? FlexDirection::Column : FlexDirection::Row;
+    } else if (p == "flex-wrap") {
+        st.flex_wrap = (vl == "wrap" || vl == "wrap-reverse");
     } else if (p == "justify-content") {
         if (vl == "center") st.justify_content = JustifyContent::Center;
         else if (vl == "flex-end" || vl == "end" || vl == "right") st.justify_content = JustifyContent::FlexEnd;
@@ -269,13 +586,26 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
     } else if (p == "gap" || p == "grid-gap") {
         st.gap = StyleEngine::parse_px(v, 0.0f);
     } else if (p == "width") {
-        if (vl != "auto" && vl.find('%') == std::string::npos) st.width = StyleEngine::parse_px(v, -1.0f);
+        st.width = -1.0f;
+        st.width_pct = -1.0f;
+        st.width_calc.clear();
+        if (vl.rfind("calc(", 0) == 0) {
+            st.width_calc = v;
+        } else if (vl != "auto" && vl.find('%') != std::string::npos) {
+            st.width_pct = std::clamp(std::strtof(vl.c_str(), nullptr), 0.0f, 100.0f);
+        } else if (vl != "auto") {
+            st.width = StyleEngine::parse_px(v, -1.0f);
+        }
     } else if (p == "min-width") {
         if (vl != "auto" && vl.find('%') == std::string::npos) st.min_width = StyleEngine::parse_px(v, -1.0f);
     } else if (p == "max-width") {
         if (vl != "none" && vl.find('%') == std::string::npos) st.max_width = StyleEngine::parse_px(v, -1.0f);
     } else if (p == "height") {
-        if (vl != "auto" && vl.find('%') == std::string::npos) st.height = StyleEngine::parse_px(v, -1.0f);
+        if (vl.rfind("calc(", 0) == 0) {
+            st.height = StyleEngine::eval_calc(v, 720.0f, 1280.0f, -1.0f);
+        } else if (vl != "auto" && vl.find('%') == std::string::npos) {
+            st.height = StyleEngine::parse_px(v, -1.0f);
+        }
     } else if (p == "margin") {
         st.margin = parse_edges(v);
     } else if (p == "margin-top") {
@@ -365,13 +695,51 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
         st.box_sizing = (vl == "border-box") ? BoxSizing::BorderBox : BoxSizing::ContentBox;
     } else if (p == "color") {
         st.color = StyleEngine::parse_color(v, st.color);
-    } else if (p == "border" || p == "border-left" || p == "border-top" || p == "border-right" || p == "border-bottom") {
+    } else if (p == "border-left") {
         auto toks = split_ws(v);
         for (const auto& t : toks) {
             if (std::isdigit(static_cast<unsigned char>(t[0]))) {
-                st.border_width = StyleEngine::parse_px(t, 1.0f);
+                st.border_left_width = StyleEngine::parse_px(t, 3.0f);
             } else if (t != "solid" && t != "dashed" && t != "dotted" && t != "none") {
-                st.border_color = StyleEngine::parse_color(t, Color{80, 90, 110, 255});
+                st.border_left_color = StyleEngine::parse_color(t, Color{56, 189, 248, 255});
+            }
+        }
+    } else if (p == "border" || p == "border-top" || p == "border-right" || p == "border-bottom") {
+        if (vl == "none" || vl == "0" || vl == "0px") {
+            if (p == "border") st.border_width = 0.0f;
+        } else {
+            auto toks = split_ws(v);
+            for (const auto& t : toks) {
+                if (t == "none") {
+                    if (p == "border") st.border_width = 0.0f;
+                } else if (std::isdigit(static_cast<unsigned char>(t[0]))) {
+                    st.border_width = StyleEngine::parse_px(t, 1.0f);
+                } else if (t != "solid" && t != "dashed" && t != "dotted") {
+                    st.border_color = StyleEngine::parse_color(t, Color{80, 90, 110, 255});
+                }
+            }
+        }
+    } else if (p == "transform") {
+        size_t txp = vl.find("translatex(");
+        if (txp != std::string::npos) {
+            st.translate_x = StyleEngine::parse_px(vl.substr(txp + 11), 0.0f);
+        }
+        size_t typ = vl.find("translatey(");
+        if (typ != std::string::npos) {
+            st.translate_y = StyleEngine::parse_px(vl.substr(typ + 11), 0.0f);
+        }
+        size_t tp = vl.find("translate(");
+        if (tp != std::string::npos) {
+            size_t rp = vl.find(')', tp + 10);
+            if (rp != std::string::npos) {
+                std::string inner = vl.substr(tp + 10, rp - (tp + 10));
+                size_t comma = inner.find(',');
+                if (comma != std::string::npos) {
+                    st.translate_x = StyleEngine::parse_px(inner.substr(0, comma), 0.0f);
+                    st.translate_y = StyleEngine::parse_px(inner.substr(comma + 1), 0.0f);
+                } else {
+                    st.translate_x = StyleEngine::parse_px(inner, 0.0f);
+                }
             }
         }
     } else if (p == "border-color") {
@@ -446,36 +814,52 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
     }
 }
 
-void apply_ua_defaults(const DomNode* node, ComputedStyle& st) {
+void apply_ua_defaults(const DomNode* node, ComputedStyle& st, bool light_web_default) {
     if (!node || node->type != NodeType::Element) return;
     const std::string& t = node->tag;
-    if (t == "head" || t == "style" || t == "script" || t == "meta" || t == "link" || t == "title") {
+    if (t == "head" || t == "style" || t == "script" || t == "meta" || t == "link" ||
+        t == "title" || t == "noscript" || t == "template") {
         st.display = DisplayType::None;
-    } else if (t == "span" || t == "a" || t == "strong" || t == "b" || t == "em" || t == "code") {
+    } else if (t == "span" || t == "a" || t == "strong" || t == "b" || t == "em" ||
+               t == "i" || t == "small" || t == "time" || t == "label" || t == "abbr" ||
+               t == "cite" || t == "sup" || t == "sub" || t == "mark" || t == "font" || t == "code") {
         st.display = DisplayType::Inline;
-        if (t == "a") st.color = Color{96, 175, 255, 255};
+        st.border_width = 0.0f;
+        if (t == "a") {
+            st.color = light_web_default ? Color{29, 78, 216, 255} : Color{96, 175, 255, 255};
+        }
         if (t == "strong" || t == "b") st.bold = true;
+        if (t == "small" || t == "sup" || t == "sub") st.font_size = std::max(10.0f, st.font_size * 0.85f);
         if (t == "code") {
-            st.background = Color{28, 34, 46, 255};
-            st.color = Color{135, 232, 182, 255};
+            st.background = light_web_default ? Color{241, 245, 249, 255} : Color{28, 34, 46, 255};
+            st.color = light_web_default ? Color{15, 23, 42, 255} : Color{135, 232, 182, 255};
             st.padding = {2, 5, 2, 5};
             st.monospace = true;
         }
+    } else if (t == "img" || t == "svg") {
+        st.display = DisplayType::InlineBlock;
     } else if (t == "body") {
-        st.background = Color{13, 17, 24, 255};
-        st.color = Color{226, 232, 240, 255};
-        st.padding = {24, 28, 28, 28};
-        st.font_size = 15.0f;
+        if (light_web_default) {
+            st.background = Color{255, 255, 255, 255};
+            st.color = Color{17, 24, 39, 255};
+            st.padding = {12, 20, 20, 20};
+            st.font_size = 14.0f;
+        } else {
+            st.background = Color{13, 17, 24, 255};
+            st.color = Color{226, 232, 240, 255};
+            st.padding = {24, 28, 28, 28};
+            st.font_size = 15.0f;
+        }
     } else if (t == "h1") {
         st.font_size = 28.0f;
         st.bold = true;
         st.margin = {8, 0, 14, 0};
-        st.color = Color{248, 250, 252, 255};
+        st.color = light_web_default ? Color{15, 23, 42, 255} : Color{248, 250, 252, 255};
     } else if (t == "h2") {
         st.font_size = 22.0f;
         st.bold = true;
         st.margin = {14, 0, 10, 0};
-        st.color = Color{241, 245, 249, 255};
+        st.color = light_web_default ? Color{15, 23, 42, 255} : Color{241, 245, 249, 255};
     } else if (t == "h3") {
         st.font_size = 17.0f;
         st.bold = true;
@@ -483,23 +867,37 @@ void apply_ua_defaults(const DomNode* node, ComputedStyle& st) {
     } else if (t == "p") {
         st.margin = {0, 0, 10, 0};
     } else if (t == "pre") {
-        st.background = Color{18, 23, 33, 255};
-        st.color = Color{166, 226, 194, 255};
+        st.background = light_web_default ? Color{248, 250, 252, 255} : Color{18, 23, 33, 255};
+        st.color = light_web_default ? Color{15, 23, 42, 255} : Color{166, 226, 194, 255};
         st.padding = {12, 14, 12, 14};
         st.border_radius = 8.0f;
         st.border_width = 1.0f;
-        st.border_color = Color{45, 56, 76, 255};
+        st.border_color = light_web_default ? Color{203, 213, 225, 255} : Color{45, 56, 76, 255};
         st.margin = {6, 0, 12, 0};
         st.monospace = true;
     } else if (t == "input" || t == "textarea") {
-        st.background = Color{15, 23, 42, 255};
-        st.color = Color{241, 245, 249, 255};
+        std::string itype = (t == "input") ? node->get_attr("type") : std::string();
+        std::string itype_low;
+        itype_low.reserve(itype.size());
+        for (char c : itype) itype_low.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        if (itype_low == "hidden") {
+            st.display = DisplayType::None;
+            return;
+        }
+        st.background = light_web_default ? Color{255, 255, 255, 255} : Color{15, 23, 42, 255};
+        st.color = light_web_default ? Color{15, 23, 42, 255} : Color{241, 245, 249, 255};
         st.border_width = 1.0f;
-        st.border_color = Color{51, 65, 85, 255};
-        st.border_radius = 6.0f;
-        st.padding = {8, 12, 8, 12};
+        st.border_color = light_web_default ? Color{203, 213, 225, 255} : Color{51, 65, 85, 255};
+        st.border_radius = (itype_low == "radio") ? 7.0f : ((itype_low == "checkbox") ? 3.0f : 6.0f);
+        st.padding = (itype_low == "checkbox" || itype_low == "radio") ? EdgeSizes{0, 0, 0, 0} : EdgeSizes{6, 10, 6, 10};
         st.font_size = 14.0f;
-        st.height = (t == "textarea") ? 88.0f : 38.0f;
+        if (itype_low == "checkbox" || itype_low == "radio") {
+            st.width = 14.0f;
+            st.height = 14.0f;
+            st.display = DisplayType::InlineBlock;
+        } else {
+            st.height = (t == "textarea") ? 88.0f : (light_web_default ? 32.0f : 38.0f);
+        }
     } else if (t == "ul" || t == "ol") {
         st.padding = {0, 0, 0, 20};
         st.margin = {4, 0, 10, 0};
@@ -508,14 +906,84 @@ void apply_ua_defaults(const DomNode* node, ComputedStyle& st) {
     } else if (t == "blockquote") {
         st.padding = {10, 14, 10, 16};
         st.margin = {8, 0, 12, 0};
-        st.background = Color{22, 29, 42, 255};
+        st.background = light_web_default ? Color{248, 250, 252, 255} : Color{22, 29, 42, 255};
         st.border_width = 2.0f;
-        st.border_color = Color{56, 189, 248, 255};
+        st.border_color = light_web_default ? Color{148, 163, 184, 255} : Color{56, 189, 248, 255};
         st.border_radius = 6.0f;
+    } else if (t == "table") {
+        st.display = DisplayType::Table;
+        bool borderless = (node->get_attr("border") == "0") ||
+                          (light_web_default && !node->has_attr("border"));
+        st.border_width = borderless ? 0.0f : 1.0f;
+        st.border_color = light_web_default ? Color{203, 213, 225, 255} : Color{51, 65, 85, 255};
+        st.margin = borderless ? EdgeSizes{0, 0, 4, 0} : EdgeSizes{8, 0, 12, 0};
+    } else if (t == "tr") {
+        st.display = DisplayType::TableRow;
+    } else if (t == "th") {
+        st.display = DisplayType::TableCell;
+        st.bold = true;
+        st.background = light_web_default ? Color{241, 245, 249, 255} : Color{23, 37, 64, 255};
+        st.color = light_web_default ? Color{15, 23, 42, 255} : Color{241, 245, 249, 255};
+        st.padding = {8, 12, 8, 12};
+        st.border_width = 1.0f;
+        st.border_color = light_web_default ? Color{203, 213, 225, 255} : Color{51, 65, 85, 255};
+    } else if (t == "td") {
+        st.display = DisplayType::TableCell;
+        bool parent_borderless = false;
+        for (const DomNode* p = node->parent; p; p = p->parent) {
+            if (p->tag == "table") {
+                parent_borderless = (p->get_attr("border") == "0") ||
+                                    (light_web_default && !p->has_attr("border"));
+                break;
+            }
+        }
+        st.padding = parent_borderless ? EdgeSizes{3, 6, 3, 6} : EdgeSizes{7, 12, 7, 12};
+        st.border_width = parent_borderless ? 0.0f : 1.0f;
+        st.border_color = light_web_default ? Color{226, 232, 240, 255} : Color{30, 41, 59, 255};
+    } else if (t == "iframe") {
+        st.display = DisplayType::Block;
+        st.border_width = 1.0f;
+        st.border_color = light_web_default ? Color{203, 213, 225, 255} : Color{51, 65, 85, 255};
+        st.border_radius = 6.0f;
+        st.background = light_web_default ? Color{248, 250, 252, 255} : Color{11, 17, 30, 255};
+        st.overflow = OverflowMode::Hidden;
     } else if (t == "hr") {
         st.height = 1.0f;
-        st.background = Color{51, 65, 85, 255};
+        st.background = light_web_default ? Color{203, 213, 225, 255} : Color{51, 65, 85, 255};
         st.margin = {12, 0, 12, 0};
+    }
+
+    // Apply legacy HTML presentational attributes (overridden by author CSS cascade)
+    if (node->has_attr("hidden")) {
+        st.display = DisplayType::None;
+    }
+    std::string bg = node->get_attr("bgcolor");
+    if (!bg.empty()) {
+        st.background = StyleEngine::parse_color(bg, st.background);
+    }
+    if (t == "font") {
+        std::string fc = node->get_attr("color");
+        if (!fc.empty()) st.color = StyleEngine::parse_color(fc, st.color);
+    }
+    std::string align = to_lower(node->get_attr("align"));
+    if (align == "center") st.text_align = TextAlign::Center;
+    else if (align == "right") st.text_align = TextAlign::Right;
+    else if (align == "left") st.text_align = TextAlign::Left;
+    if (t == "table" || t == "td" || t == "th" || t == "iframe") {
+        std::string wa = trim(node->get_attr("width"));
+        if (!wa.empty()) {
+            if (wa.find('%') != std::string::npos) {
+                st.width_pct = std::clamp(std::strtof(wa.c_str(), nullptr), 0.0f, 100.0f);
+            } else {
+                float px = StyleEngine::parse_px(wa, -1.0f);
+                if (px > 0.0f) st.width = px;
+            }
+        }
+        std::string ha = trim(node->get_attr("height"));
+        if (!ha.empty() && ha.find('%') == std::string::npos) {
+            float px = StyleEngine::parse_px(ha, -1.0f);
+            if (px > 0.0f) st.height = px;
+        }
     }
 }
 
@@ -542,7 +1010,7 @@ void CssStylesheet::parse_block(std::string_view css, float min_w, float max_w) 
         }
         if (pos >= n) break;
 
-        // Parse @media blocks; skip other @rules cleanly
+        // Parse @media, @layer, and @supports blocks; skip print media & other @rules cleanly
         if (css[pos] == '@') {
             size_t brace = css.find('{', pos);
             size_t semi = css.find(';', pos);
@@ -561,26 +1029,40 @@ void CssStylesheet::parse_block(std::string_view css, float min_w, float max_w) 
                     ++pos;
                 }
                 size_t inner_end = (pos > 0 && depth == 0) ? (pos - 1) : pos;
-                if (header.rfind("@media", 0) == 0 && inner_end > inner_start) {
-                    float q_min = min_w;
-                    float q_max = max_w;
-                    size_t pmax = header.find("max-width");
-                    if (pmax != std::string::npos) {
-                        size_t col = header.find(':', pmax);
-                        if (col != std::string::npos) {
-                            float v = StyleEngine::parse_px(header.substr(col + 1), -1.0f);
-                            if (v > 0.0f) q_max = (q_max < 0.0f) ? v : std::min(q_max, v);
+                if (inner_end > inner_start) {
+                    if (header.rfind("@media", 0) == 0) {
+                        // Skip print-only stylesheets on screen rendering
+                        bool is_print_only = (header.find("print") != std::string::npos &&
+                                              header.find("screen") == std::string::npos &&
+                                              header.find("not print") == std::string::npos);
+                        if (!is_print_only) {
+                            float q_min = min_w;
+                            float q_max = max_w;
+                            size_t pmax = header.find("max-width");
+                            if (pmax != std::string::npos) {
+                                size_t col = header.find(':', pmax);
+                                if (col != std::string::npos) {
+                                    float v = StyleEngine::parse_px(header.substr(col + 1), -1.0f);
+                                    if (v > 0.0f) q_max = (q_max < 0.0f) ? v : std::min(q_max, v);
+                                }
+                            }
+                            size_t pmin = header.find("min-width");
+                            if (pmin != std::string::npos) {
+                                size_t col = header.find(':', pmin);
+                                if (col != std::string::npos) {
+                                    float v = StyleEngine::parse_px(header.substr(col + 1), -1.0f);
+                                    if (v > 0.0f) q_min = (q_min < 0.0f) ? v : std::max(q_min, v);
+                                }
+                            }
+                            parse_block(css.substr(inner_start, inner_end - inner_start), q_min, q_max);
+                        }
+                    } else if (header.rfind("@layer", 0) == 0) {
+                        parse_block(css.substr(inner_start, inner_end - inner_start), min_w, max_w);
+                    } else if (header.rfind("@supports", 0) == 0) {
+                        if (header.find("@supports not") == std::string::npos) {
+                            parse_block(css.substr(inner_start, inner_end - inner_start), min_w, max_w);
                         }
                     }
-                    size_t pmin = header.find("min-width");
-                    if (pmin != std::string::npos) {
-                        size_t col = header.find(':', pmin);
-                        if (col != std::string::npos) {
-                            float v = StyleEngine::parse_px(header.substr(col + 1), -1.0f);
-                            if (v > 0.0f) q_min = (q_min < 0.0f) ? v : std::max(q_min, v);
-                        }
-                    }
-                    parse_block(css.substr(inner_start, inner_end - inner_start), q_min, q_max);
                 }
                 continue;
             }
@@ -590,8 +1072,16 @@ void CssStylesheet::parse_block(std::string_view css, float min_w, float max_w) 
         size_t lbrace = css.find('{', pos);
         if (lbrace == std::string_view::npos) break;
         std::string_view sel_group = css.substr(pos, lbrace - pos);
-        size_t rbrace = css.find('}', lbrace + 1);
-        if (rbrace == std::string_view::npos) break;
+        // Find matching closing brace (handles nested CSS cleanly without corrupting subsequent rules)
+        int bdepth = 1;
+        size_t scan = lbrace + 1;
+        while (scan < n && bdepth > 0) {
+            if (css[scan] == '{') ++bdepth;
+            else if (css[scan] == '}') --bdepth;
+            if (bdepth > 0) ++scan;
+        }
+        if (bdepth != 0) break;
+        size_t rbrace = scan;
         std::string_view body = css.substr(lbrace + 1, rbrace - lbrace - 1);
         pos = rbrace + 1;
 
@@ -599,15 +1089,7 @@ void CssStylesheet::parse_block(std::string_view css, float min_w, float max_w) 
         rule.source_order = rules_.size();
         rule.media_min_width = min_w;
         rule.media_max_width = max_w;
-        size_t s = 0;
-        while (s < sel_group.size()) {
-            size_t comma = sel_group.find(',', s);
-            std::string_view part = (comma == std::string_view::npos) ? sel_group.substr(s) : sel_group.substr(s, comma - s);
-            std::string t = trim(part);
-            if (!t.empty()) rule.selectors.push_back(std::move(t));
-            if (comma == std::string_view::npos) break;
-            s = comma + 1;
-        }
+        rule.selectors = split_top_level_commas(sel_group);
         rule.declarations = parse_declarations(body);
         if (!rule.selectors.empty() && !rule.declarations.empty()) {
             rules_.push_back(std::move(rule));
@@ -679,6 +1161,9 @@ Color StyleEngine::parse_color(std::string_view val, Color fallback) {
 float StyleEngine::parse_px(std::string_view val, float fallback) {
     std::string s = trim(val);
     if (s.empty()) return fallback;
+    if (to_lower(s).rfind("calc(", 0) == 0) {
+        return eval_calc(s, 1280.0f, 1280.0f, fallback);
+    }
     char* end = nullptr;
     float num = std::strtof(s.c_str(), &end);
     if (end == s.c_str()) return fallback;
@@ -686,6 +1171,82 @@ float StyleEngine::parse_px(std::string_view val, float fallback) {
         return num * 16.0f;
     }
     return num;
+}
+
+float StyleEngine::eval_calc(std::string_view val, float ref_px, float viewport_w, float fallback) {
+    std::string s = trim(val);
+    std::string sl = to_lower(s);
+    if (sl.rfind("calc(", 0) == 0 && s.back() == ')') {
+        s = s.substr(5, s.size() - 6);
+    }
+    struct CalcParser {
+        const std::string& src;
+        size_t pos = 0;
+        float ref_px;
+        float vw_px;
+        bool ok = true;
+
+        void skip_ws() {
+            while (pos < src.size() && std::isspace(static_cast<unsigned char>(src[pos]))) ++pos;
+        }
+        float parse_expr() {
+            float v = parse_term();
+            while (ok) {
+                skip_ws();
+                if (pos < src.size() && (src[pos] == '+' || src[pos] == '-')) {
+                    char op = src[pos++];
+                    float r = parse_term();
+                    v = (op == '+') ? (v + r) : (v - r);
+                } else break;
+            }
+            return v;
+        }
+        float parse_term() {
+            float v = parse_factor();
+            while (ok) {
+                skip_ws();
+                if (pos < src.size() && (src[pos] == '*' || src[pos] == '/')) {
+                    char op = src[pos++];
+                    float r = parse_factor();
+                    if (op == '*') v *= r;
+                    else v = (std::abs(r) > 1e-6f) ? (v / r) : v;
+                } else break;
+            }
+            return v;
+        }
+        float parse_factor() {
+            skip_ws();
+            if (pos >= src.size()) { ok = false; return 0.0f; }
+            if (src[pos] == '(') {
+                if (++depth > 32) { ok = false; return 0.0f; }
+                ++pos;
+                float v = parse_expr();
+                skip_ws();
+                if (pos < src.size() && src[pos] == ')') ++pos;
+                --depth;
+                return v;
+            }
+            if (src[pos] == '-') { if (++depth > 32) { ok = false; return 0.0f; } ++pos; float r = -parse_factor(); --depth; return r; }
+            if (src[pos] == '+') { if (++depth > 32) { ok = false; return 0.0f; } ++pos; float r = parse_factor(); --depth; return r; }
+            const char* start = src.c_str() + pos;
+            char* end = nullptr;
+            float num = std::strtof(start, &end);
+            if (end == start) { ok = false; return 0.0f; }
+            pos = static_cast<size_t>(end - src.c_str());
+            size_t ust = pos;
+            while (pos < src.size() && (std::isalpha(static_cast<unsigned char>(src[pos])) || src[pos] == '%')) ++pos;
+            std::string unit = to_lower(src.substr(ust, pos - ust));
+            if (unit == "%") return num * 0.01f * ref_px;
+            if (unit == "vw") return num * 0.01f * vw_px;
+            if (unit == "vh") return num * 0.01f * 720.0f;
+            if (unit == "rem" || unit == "em") return num * 16.0f;
+            return num;
+        }
+        int depth = 0;
+    };
+    CalcParser cp{s, 0, ref_px, viewport_w, true, 0};
+    float res = cp.parse_expr();
+    return (cp.ok && std::isfinite(res)) ? res : fallback;
 }
 
 std::string StyleEngine::resolve_var_expr(std::string_view val,
@@ -766,7 +1327,8 @@ std::unordered_map<std::string, std::string> StyleEngine::collect_root_vars(cons
 ComputedStyle StyleEngine::compute_style(const DomNode* node,
                                          const CssStylesheet& sheet,
                                          const ComputedStyle* parent_style,
-                                         float viewport_w) {
+                                         float viewport_w,
+                                         bool light_web_default) {
     ComputedStyle st;
     // Inherit text properties & CSS custom properties from parent
     if (parent_style) {
@@ -779,7 +1341,7 @@ ComputedStyle StyleEngine::compute_style(const DomNode* node,
         st.css_vars = parent_style->css_vars;
     }
 
-    apply_ua_defaults(node, st);
+    apply_ua_defaults(node, st, light_web_default);
 
     if (!node || node->type != NodeType::Element) return st;
 
@@ -850,6 +1412,79 @@ ComputedStyle StyleEngine::compute_style(const DomNode* node,
     }
 
     return st;
+}
+
+bool StyleEngine::compute_pseudo_style(const DomNode* node,
+                                       const CssStylesheet& sheet,
+                                       std::string_view pseudo_name,
+                                       const ComputedStyle& element_style,
+                                       ComputedStyle& out_style,
+                                       float viewport_w) {
+    if (!node || node->type != NodeType::Element) return false;
+    std::string want_double = to_lower(pseudo_name); // "::before" or "::after"
+    std::string want_single = (want_double.size() > 1 && want_double[0] == ':' && want_double[1] == ':')
+                                  ? want_double.substr(1)
+                                  : want_double;
+
+    struct MatchedRule {
+        int specificity;
+        size_t order;
+        const CssRule* rule;
+    };
+    std::vector<MatchedRule> matched;
+    for (const auto& rule : sheet.rules()) {
+        if (rule.media_min_width >= 0.0f && viewport_w < rule.media_min_width) continue;
+        if (rule.media_max_width >= 0.0f && viewport_w > rule.media_max_width) continue;
+        int best_spec = -1;
+        for (const auto& sel : rule.selectors) {
+            std::string sl = to_lower(trim(sel));
+            std::string base_sel;
+            if (sl.size() > want_double.size() &&
+                sl.compare(sl.size() - want_double.size(), want_double.size(), want_double) == 0) {
+                base_sel = trim(sel.substr(0, sel.size() - want_double.size()));
+            } else if (sl.size() > want_single.size() &&
+                       sl.compare(sl.size() - want_single.size(), want_single.size(), want_single) == 0) {
+                base_sel = trim(sel.substr(0, sel.size() - want_single.size()));
+            } else {
+                continue;
+            }
+            int spec = 0;
+            if (match_selector(node, base_sel, spec)) {
+                best_spec = std::max(best_spec, spec + 1);
+            }
+        }
+        if (best_spec >= 0) {
+            matched.push_back(MatchedRule{best_spec, rule.source_order, &rule});
+        }
+    }
+    if (matched.empty()) return false;
+
+    std::sort(matched.begin(), matched.end(), [](const MatchedRule& a, const MatchedRule& b) {
+        if (a.specificity != b.specificity) return a.specificity < b.specificity;
+        return a.order < b.order;
+    });
+
+    out_style = ComputedStyle{};
+    out_style.display = DisplayType::InlineBlock;
+    out_style.color = element_style.color;
+    out_style.font_size = element_style.font_size;
+    out_style.bold = element_style.bold;
+    out_style.monospace = element_style.monospace;
+    out_style.line_height = element_style.line_height;
+    out_style.css_vars = element_style.css_vars;
+
+    for (const auto& m : matched) {
+        for (const auto& decl : m.rule->declarations) {
+            if (decl.property.rfind("--", 0) == 0) continue;
+            if (decl.value.find("var(") != std::string::npos) {
+                CssDeclaration resolved{decl.property, resolve_var_expr(decl.value, out_style.css_vars)};
+                if (!resolved.value.empty()) apply_declaration(out_style, resolved);
+            } else {
+                apply_declaration(out_style, decl);
+            }
+        }
+    }
+    return out_style.has_content && out_style.display != DisplayType::None;
 }
 
 } // namespace astra

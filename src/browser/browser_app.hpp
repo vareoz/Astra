@@ -13,6 +13,7 @@
 #include "media/media_engine.hpp"
 #include "net/http_cache.hpp"
 #include "net/http_client.hpp"
+#include "privacy/security_policy.hpp"
 #include "privacy/shield.hpp"
 
 #include <cstdint>
@@ -50,6 +51,9 @@ struct Tab {
     DisplayList cached_display_list;
     std::string focused_input_selector;
     std::vector<std::string> console_logs;
+    SecurityOrigin origin;
+    ContentSecurityPolicy csp;
+    size_t csp_blocks = 0;
 };
 
 struct NavigationResult {
@@ -88,15 +92,34 @@ struct ClickResult {
     std::string detail;
 };
 
-// Astra v6 Multi-Process Desktop Browser Coordinator:
-// - Main + Content + RDD Media workers over AF_UNIX IPC
-// - Hard <= 2 GB RAM governor + LRU Tab Dehydration + 32 MiB HttpCache
-// - Interactive Chrome v4 (Omnibox, Back/Forward/Reload, [+]/[x] tabs, History stack)
-// - AstraNet v5: True HTTP/2 multi-stream multiplexing over single TLS 1.3 ALPN h2 + AstraShield + Multi-Ext MV3
-// - AstraJS v6 Bytecode VM (try/catch/throw, for..of, async/await, closures, rAF, HTML5 <canvas> 2D, Promises, GC, fetch)
-// - CSS3 v6 (box-sizing:border-box, linear-gradient, Grid, @media, overflow:hidden, ASD5) + AstraFont + Astra3D + AstraMedia v4
+struct YouTubeWatchInfo {
+    bool is_youtube = false;
+    std::string video_id;
+    std::string playability_status;
+    std::string playability_reason;
+    std::string title;
+    std::string author;
+    std::string length_seconds;
+    std::string view_count;
+    std::string thumbnail_url;
+    std::string stream_url;
+    std::string stream_mime;
+    std::string stream_quality;
+};
+
+// Astra v10 Multi-Process Desktop Browser Coordinator:
+// - Main + Site-Isolated Seccomp Content + RDD Media workers over AF_UNIX IPC
+// - Hard <= 2 GB RAM governor + LRU Tab Dehydration + 32 MiB HttpCache + bounded media cache
+// - Interactive Chrome (Omnibox, Back/Forward/Reload, [+]/[x] tabs, History stack)
+// - AstraNet v8: HTTP/2 multi-stream mux + TLS 1.3 ALPN + Brotli/gzip + AstraShield + MV3 DNR
+// - AstraJS v10 Bytecode VM (Prototypes, RegExp, Date, Map/Set, URL, Web/DOM/Media APIs, Promises, GC, fetch)
+// - CSS3 v10 (Attr selectors, :not/:is/:where, @layer/@supports, Grid/Flex/Table/Float/IFC) + AstraMedia v5 (MP4/WebM/HLS)
 class BrowserApp {
 public:
+    static std::string extract_youtube_video_id(const std::string& url);
+    static YouTubeWatchInfo parse_youtube_player_response(const std::string& html_or_json,
+                                                          const std::string& video_id);
+
     explicit BrowserApp(uint64_t ram_ceiling_bytes = MemoryGovernor::kDefaultCeilingBytes);
     ~BrowserApp();
 
@@ -153,26 +176,36 @@ public:
 
     pid_t content_pid() const { return content_worker_.pid(); }
     pid_t media_pid() const { return media_worker_.pid(); }
+    size_t site_isolated_worker_count() const;
+    size_t security_blocks_count() const { return security_blocks_; }
+    WorkerProcess* acquire_content_worker_for_origin(const SecurityOrigin& origin);
 
 private:
     Tab* find_tab(uint32_t id);
     const Tab* find_tab(uint32_t id) const;
     void relayout_live_tab(Tab& tab, float vw = 1280.0f, float vh = 636.0f);
+    bool submit_form_for_element(Tab& tab, DomNode* trigger_el);
     void persist_downloads_ledger() const;
     std::string resolve_source_html(const std::string& url,
                                     std::string& final_url,
                                     bool& tls_verified_out,
                                     bool& from_cache_out,
                                     std::string& protocol_out,
-                                    std::string& error_out);
+                                    std::string& error_out,
+                                    std::string* csp_header_out = nullptr);
     std::string fetch_external_stylesheets(const HtmlDocument& doc,
                                            const std::string& base_url,
-                                           size_t& loaded_count);
+                                           size_t& loaded_count,
+                                           const SecurityOrigin* doc_origin = nullptr,
+                                           const ContentSecurityPolicy* csp = nullptr);
     void preload_remote_images_parallel(const HtmlDocument& doc, const std::string& base_url);
+    std::string resolve_media_source_to_local(const std::string& base_url, const std::string& src);
     JsFetchResult perform_js_fetch(const std::string& base_url,
                                    const std::string& url,
                                    const std::string& method,
-                                   const std::string& body);
+                                   const std::string& body,
+                                   const std::vector<std::pair<std::string, std::string>>& headers = {},
+                                   uint32_t tab_id = 0);
     std::string origin_storage_get(const std::string& origin_key, const std::string& k);
     void origin_storage_set(const std::string& origin_key, const std::string& k, const std::string& v);
     bool render_html_via_content_ipc(const std::string& html,
@@ -181,7 +214,9 @@ private:
                                      DisplayList& out_dl,
                                      std::string& out_title,
                                      size_t& out_blob_bytes,
-                                     size_t& out_arena_bytes);
+                                     size_t& out_arena_bytes,
+                                     const SecurityOrigin* doc_origin = nullptr,
+                                     bool light_web_default = false);
     void run_content_worker_loop(IpcChannel& ch);
     void run_media_worker_loop(IpcChannel& ch);
 
@@ -193,11 +228,14 @@ private:
 
     WorkerProcess content_worker_;
     WorkerProcess media_worker_;
+    std::unordered_map<std::string, std::unique_ptr<WorkerProcess>> site_workers_;
+    size_t security_blocks_ = 0;
 
     std::vector<Tab> tabs_;
     std::vector<DownloadRecord> downloads_;
     std::unordered_map<std::string, DecodedImage> image_cache_;
     std::unordered_map<std::string, AudioBlitCard> audio_cache_;
+    std::unordered_map<std::string, std::string> media_cache_;
     uint32_t next_tab_id_ = 1;
     uint32_t active_tab_id_ = 0;
     uint64_t tick_counter_ = 0;

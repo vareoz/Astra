@@ -283,8 +283,128 @@ VideoContainerInfo MediaEngine::probe_container(const std::string& path) {
         return info;
     }
 
+    // MPEG-TS (HLS streaming video segments: sync byte 0x47 every 188 bytes)
+    if (n >= 376 && buf[0] == 0x47 && buf[188] == 0x47) {
+        info.format = "MPEG-TS/HLS";
+        info.video_codec = "h264/aac";
+        info.has_audio = true;
+        info.valid = true;
+        return info;
+    }
+
+    // Ogg container (Opus/Vorbis/Theora)
+    if (std::memcmp(buf.data(), "OggS", 4) == 0) {
+        info.format = "Ogg";
+        info.audio_codec = "opus/vorbis";
+        info.has_audio = true;
+        info.valid = true;
+        return info;
+    }
+
+    // FLAC audio
+    if (std::memcmp(buf.data(), "fLaC", 4) == 0) {
+        info.format = "FLAC";
+        info.audio_codec = "flac";
+        info.has_audio = true;
+        info.valid = true;
+        return info;
+    }
+
+    // MP3 (ID3 tag or raw MPEG audio frame sync)
+    if (std::memcmp(buf.data(), "ID3", 3) == 0 ||
+        (buf[0] == 0xFF && (buf[1] & 0xE0) == 0xE0)) {
+        info.format = "MP3/MPEG";
+        info.audio_codec = "mp3";
+        info.has_audio = true;
+        info.valid = true;
+        return info;
+    }
+
     info.error = "Unrecognized video container format";
     return info;
+}
+
+HlsPlaylist MediaEngine::parse_hls_playlist(std::string_view m3u8_text, const std::string& base_url) {
+    HlsPlaylist pl;
+    auto trim_sv = [](std::string_view sv) {
+        while (!sv.empty() && (sv.front() == ' ' || sv.front() == '\t' || sv.front() == '\r' || sv.front() == '\n')) {
+            sv.remove_prefix(1);
+        }
+        while (!sv.empty() && (sv.back() == ' ' || sv.back() == '\t' || sv.back() == '\r' || sv.back() == '\n')) {
+            sv.remove_suffix(1);
+        }
+        return sv;
+    };
+    auto resolve_hls_url = [&](const std::string& rel) -> std::string {
+        if (rel.rfind("http://", 0) == 0 || rel.rfind("https://", 0) == 0 || rel.rfind("file://", 0) == 0) {
+            return rel;
+        }
+        size_t scheme_end = base_url.find("://");
+        if (scheme_end == std::string::npos) return rel;
+        if (rel.rfind("//", 0) == 0) {
+            return base_url.substr(0, scheme_end + 1) + rel;
+        }
+        size_t path_start = base_url.find('/', scheme_end + 3);
+        std::string origin = (path_start == std::string::npos) ? base_url : base_url.substr(0, path_start);
+        if (!rel.empty() && rel[0] == '/') return origin + rel;
+        std::string path_part = (path_start == std::string::npos) ? "/" : base_url.substr(path_start);
+        size_t q = path_part.find('?');
+        if (q != std::string::npos) path_part.resize(q);
+        size_t last_slash = path_part.rfind('/');
+        std::string dir = (last_slash == std::string::npos) ? "/" : path_part.substr(0, last_slash + 1);
+        return origin + dir + rel;
+    };
+
+    // Skip optional UTF-8 BOM
+    if (m3u8_text.size() >= 3 &&
+        static_cast<unsigned char>(m3u8_text[0]) == 0xEF &&
+        static_cast<unsigned char>(m3u8_text[1]) == 0xBB &&
+        static_cast<unsigned char>(m3u8_text[2]) == 0xBF) {
+        m3u8_text.remove_prefix(3);
+    }
+
+    std::istringstream iss{std::string(m3u8_text)};
+    std::string raw_line;
+    bool saw_header = false;
+    bool expect_variant = false;
+    bool expect_segment = false;
+
+    while (std::getline(iss, raw_line)) {
+        std::string_view line = trim_sv(raw_line);
+        if (line.empty()) continue;
+        if (!saw_header) {
+            if (line.rfind("#EXTM3U", 0) == 0) {
+                saw_header = true;
+                pl.valid = true;
+                continue;
+            }
+            return pl;
+        }
+        if (line.rfind("#EXT-X-STREAM-INF:", 0) == 0) {
+            pl.is_master = true;
+            expect_variant = true;
+            continue;
+        }
+        if (line.rfind("#EXT-X-TARGETDURATION:", 0) == 0) {
+            pl.target_duration_sec = std::atof(std::string(line.substr(22)).c_str());
+            continue;
+        }
+        if (line.rfind("#EXTINF:", 0) == 0) {
+            expect_segment = true;
+            continue;
+        }
+        if (line[0] == '#') continue;
+
+        std::string resolved = resolve_hls_url(std::string(line));
+        if (expect_variant) {
+            pl.variant_urls.push_back(std::move(resolved));
+            expect_variant = false;
+        } else if (expect_segment || !pl.is_master) {
+            pl.segment_urls.push_back(std::move(resolved));
+            expect_segment = false;
+        }
+    }
+    return pl;
 }
 
 void MediaEngine::yuv420p_to_argb(const uint8_t* y_plane,

@@ -1,4 +1,5 @@
 #include "browser/browser_app.hpp"
+#include "core/json.hpp"
 #include "dom/html_parser.hpp"
 #include "style/css_engine.hpp"
 
@@ -93,6 +94,109 @@ std::string json_escape_str(std::string_view s) {
     return out;
 }
 
+std::string url_encode_component(std::string_view s) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size() * 3 / 2 + 4);
+    for (unsigned char c : s) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back(kHex[(c >> 4) & 0xF]);
+            out.push_back(kHex[c & 0xF]);
+        }
+    }
+    return out;
+}
+
+std::string to_lower_copy(std::string_view s) {
+    std::string out(s);
+    for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return out;
+}
+
+std::string decode_base64_str(std::string_view in) {
+    static const int8_t kTable[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+    };
+    std::string out;
+    out.reserve((in.size() * 3) / 4);
+    int val = 0, valb = -8;
+    for (unsigned char c : in) {
+        if (c == '=') break;
+        int8_t d = kTable[c];
+        if (d == -1) continue;
+        val = (val << 6) + d;
+        valb += 6;
+        if (valb >= 0) {
+            out.push_back(static_cast<char>((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return out;
+}
+
+std::string percent_decode_str(std::string_view in) {
+    auto hex_val = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); ++i) {
+        if (in[i] == '%' && i + 2 < in.size()) {
+            int hi = hex_val(in[i + 1]);
+            int lo = hex_val(in[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(in[i]);
+    }
+    return out;
+}
+
+std::string resolve_img_attr(const DomNode* img) {
+    if (!img) return {};
+    std::string src = img->get_attr("src");
+    if (src.empty()) src = img->get_attr("data-src");
+    if (src.empty()) {
+        std::string ss = img->get_attr("srcset");
+        size_t p = 0;
+        while (p < ss.size() && std::isspace(static_cast<unsigned char>(ss[p]))) ++p;
+        size_t e = p;
+        while (e < ss.size() && !std::isspace(static_cast<unsigned char>(ss[e])) && ss[e] != ',') ++e;
+        if (e > p) src = ss.substr(p, e - p);
+    }
+    return src;
+}
+
+void collect_form_fields(const DomNode* node, std::vector<std::pair<std::string, std::string>>& fields) {
+    if (!node) return;
+    if (node->type == NodeType::Element && (node->tag == "input" || node->tag == "textarea")) {
+        std::string name = node->get_attr("name");
+        if (!name.empty()) {
+            fields.emplace_back(name, node->get_attr("value"));
+        }
+    }
+    for (const DomNode* ch : node->children) {
+        collect_form_fields(ch, fields);
+    }
+}
+
 std::string build_downloads_html(const std::vector<DownloadRecord>& downloads) {
     size_t total_bytes = 0;
     for (const auto& d : downloads) {
@@ -146,7 +250,7 @@ std::string build_home_html(const AstraShield& shield, size_t ext_count,
                             const MemorySnapshot& mem, const CacheStats& cstats,
                             size_t h2_count, size_t h2_mux_count, size_t dl_count) {
     std::ostringstream html;
-    html << "<!doctype html><html><head><title>Astra Browser v6 — Native Core</title>"
+    html << "<!doctype html><html><head><title>Astra Browser v10 — Native Core</title>"
          << "<style>"
          << "body { background: #0b0f19; color: #e2e8f0; padding: 14px 24px; }"
          << ".hero { box-sizing: border-box; background: linear-gradient(135deg, #0f172a, #1e3a5f); border: 1px solid #2b4c7e; border-radius: 12px; padding: 14px 20px; margin-bottom: 12px; box-shadow: 0 6px 16px rgba(0,0,0,0.45); }"
@@ -160,9 +264,9 @@ std::string build_home_html(const AstraShield& shield, size_t ext_count,
          << ".panel { box-sizing: border-box; background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.35); }"
          << "</style></head><body>"
          << "<div class=\"hero\">"
-         << "<div class=\"kicker\">ASTRA v6 NATIVE C++20 | H2 MULTI-STREAM MUX | CANVAS 2D + rAF | TRY/CATCH + FOR..OF | LINEAR-GRADIENT</div>"
-         << "<h1 id=\"headline\">Astra Desktop Browser — Session 6</h1>"
-         << "<p>Multi-process e10s engine (Main + Content + RDD Media) with true single-socket HTTP/2 multi-stream multiplexing over TLS 1.3 ALPN, AstraJS v6 (try/catch/throw, for..of, requestAnimationFrame, native HTML5 &lt;canvas&gt; 2D), CSS linear-gradient + box-sizing: border-box (ASD5), ALSA audio waveform, and SHA-256 Downloads.</p>"
+         << "<div class=\"kicker\">ASTRA v10 NATIVE C++20 | OPEN-WEB BROTLI + H2 | CSS3 IFC + ATTR/:NOT/:IS | HLS/MP4 VIDEO | ASTRAJS v10</div>"
+         << "<h1 id=\"headline\">Astra Desktop Browser — v10 Open Web</h1>"
+         << "<p>Multi-process site-isolated seccomp engine (Main + Content + RDD Media) with HTTP/2 + TLS 1.3 + Brotli, full CSS3 + Inline Formatting Context, remote MP4/WebM/HLS video players, SVG-in-img &amp; data: URIs, external scripts &amp; iframes, and AstraJS v10 Web/DOM APIs.</p>"
          << "</div>"
          << "<div class=\"grid\">"
          << "<div class=\"card\"><div class=\"card-title\">MEMORY &amp; H2 MULTIPLEX</div>"
@@ -368,12 +472,13 @@ void BrowserApp::run_content_worker_loop(IpcChannel& ch) {
         }
         if (req.type == IpcMsgType::RenderHtml) {
             size_t off = 0;
-            uint32_t vw = 1280, vh = 720;
+            uint32_t vw = 1280, vh = 720, light_flag = 0;
             std::string html, extra_css;
             read_u32(req.payload, off, vw);
             read_u32(req.payload, off, vh);
             read_str(req.payload, off, html);
             read_str(req.payload, off, extra_css);
+            if (off + 4 <= req.payload.size()) read_u32(req.payload, off, light_flag);
 
             arena.reset(false);
             HtmlDocument doc = HtmlDocument::parse(arena, html);
@@ -383,7 +488,8 @@ void BrowserApp::run_content_worker_loop(IpcChannel& ch) {
 
             LayoutFrame* root = LayoutEngine::build_layout(arena, doc, sheet,
                                                            static_cast<float>(vw),
-                                                           static_cast<float>(vh));
+                                                           static_cast<float>(vh),
+                                                           light_flag != 0);
             DisplayList dl = LayoutEngine::build_display_list(root, vw, vh);
             std::vector<uint8_t> dl_blob = dl.serialize();
 
@@ -455,10 +561,47 @@ bool BrowserApp::start_workers() {
 }
 
 void BrowserApp::stop_workers() {
+    for (auto& [key, wp] : site_workers_) {
+        if (wp && wp->alive()) {
+            governor_.unregister_process(wp->pid());
+            wp->stop();
+        }
+    }
+    site_workers_.clear();
     if (content_worker_.alive()) governor_.unregister_process(content_worker_.pid());
     if (media_worker_.alive()) governor_.unregister_process(media_worker_.pid());
     content_worker_.stop();
     media_worker_.stop();
+}
+
+size_t BrowserApp::site_isolated_worker_count() const {
+    size_t n = content_worker_.alive() ? 1 : 0;
+    for (const auto& [k, wp] : site_workers_) {
+        if (wp && wp->alive()) ++n;
+    }
+    return n;
+}
+
+WorkerProcess* BrowserApp::acquire_content_worker_for_origin(const SecurityOrigin& origin) {
+    // Isolate distinct HTTP(S) eTLD+1 sites into dedicated seccomp-sandboxed content processes (bounded to 3 extra workers)
+    if ((origin.scheme == "http" || origin.scheme == "https") && !origin.host.empty()) {
+        std::string key = origin.site_key();
+        auto it = site_workers_.find(key);
+        if (it != site_workers_.end() && it->second && it->second->alive()) {
+            return it->second.get();
+        }
+        if (site_workers_.size() < 3) {
+            auto wp = std::make_unique<WorkerProcess>();
+            std::string role = "site:" + origin.host;
+            if (wp->spawn(role, [this](IpcChannel& ch) { run_content_worker_loop(ch); })) {
+                governor_.register_process(wp->pid(), role);
+                WorkerProcess* raw = wp.get();
+                site_workers_[key] = std::move(wp);
+                return raw;
+            }
+        }
+    }
+    return content_worker_.alive() ? &content_worker_ : nullptr;
 }
 
 bool BrowserApp::load_extension(const std::string& dir_path, std::string* error) {
@@ -607,11 +750,13 @@ std::string BrowserApp::resolve_source_html(const std::string& url,
                                             bool& tls_verified_out,
                                             bool& from_cache_out,
                                             std::string& protocol_out,
-                                            std::string& error_out) {
+                                            std::string& error_out,
+                                            std::string* csp_header_out) {
     final_url = url;
     tls_verified_out = false;
     from_cache_out = false;
     protocol_out = "astra";
+    if (csp_header_out) csp_header_out->clear();
 
     if (url == "astra://home" || url == "astra://start") {
         return build_home_html(shield_, extensions_.extensions().size(), memory_snapshot(),
@@ -633,6 +778,8 @@ std::string BrowserApp::resolve_source_html(const std::string& url,
     if (url.rfind("file://", 0) == 0) {
         protocol_out = "file";
         std::string path = url.substr(7);
+        size_t qpos = path.find_first_of("?#");
+        if (qpos != std::string::npos) path = path.substr(0, qpos);
         if (ends_with(path, ".pdf")) {
             ParsedDocument doc = DocViewer::parse_pdf_file(path);
             if (!doc.ok) { error_out = doc.error; return {}; }
@@ -666,6 +813,15 @@ std::string BrowserApp::resolve_source_html(const std::string& url,
     from_cache_out = resp.from_cache;
     protocol_out = !resp.alpn_protocol.empty() ? resp.alpn_protocol : "http/1.1";
 
+    if (csp_header_out) {
+        for (const auto& [hk, hv] : resp.headers) {
+            if (to_lower_copy(hk) == "content-security-policy") {
+                *csp_header_out = hv;
+                break;
+            }
+        }
+    }
+
     if (resp.blocked_by_privacy || resp.blocked_by_extension) {
         error_out = resp.error;
         return "<!doctype html><html><head><title>Request Blocked</title></head><body>"
@@ -675,16 +831,297 @@ std::string BrowserApp::resolve_source_html(const std::string& url,
         error_out = resp.error.empty() ? "Network error" : resp.error;
         return {};
     }
+    if (resp.status_code >= 400) {
+        return "<!doctype html><html><head><title>HTTP " + std::to_string(resp.status_code) + "</title>"
+               "<style>body{background:#0b0f19;color:#e2e8f0;padding:24px;}h1{color:#f87171;}</style></head><body>"
+               "<h1>HTTP " + std::to_string(resp.status_code) + " Error</h1><p>Server returned status " +
+               std::to_string(resp.status_code) + " for " + escape_html_text(final_url) + "</p></body></html>";
+    }
     if (resp.content_type.find("application/pdf") != std::string::npos) {
         ParsedDocument pdf = DocViewer::parse_pdf_bytes(resp.body, final_url);
         return pdf.ok ? DocViewer::to_astra_html(pdf) : ("<html><body><h1>PDF Error</h1><p>" + pdf.error + "</p></body></html>");
     }
+
+    // Native YouTube Watch Page extractor (youtube.com/watch, youtu.be, /shorts/, /embed/)
+    std::string yt_id = extract_youtube_video_id(final_url);
+    if (!yt_id.empty()) {
+        YouTubeWatchInfo yt = parse_youtube_player_response(resp.body, yt_id);
+        if (yt.stream_url.empty() && yt.playability_status != "LOGIN_REQUIRED") {
+            // Try InnerTube player API using page API key + visitor data if available
+            std::string api_key, vis;
+            size_t kp = resp.body.find("\"INNERTUBE_API_KEY\":\"");
+            if (kp != std::string::npos) {
+                kp += 21;
+                size_t ke = resp.body.find('"', kp);
+                if (ke != std::string::npos && ke - kp < 80) api_key = resp.body.substr(kp, ke - kp);
+            }
+            size_t vp = resp.body.find("\"VISITOR_DATA\":\"");
+            if (vp != std::string::npos) {
+                vp += 16;
+                size_t ve = resp.body.find('"', vp);
+                if (ve != std::string::npos && ve - vp < 120) vis = resp.body.substr(vp, ve - vp);
+            }
+            if (!api_key.empty()) {
+                std::string purl = "https://www.youtube.com/youtubei/v1/player?key=" + api_key + "&prettyPrint=false";
+                std::string payload = "{\"context\":{\"client\":{\"clientName\":\"IOS\",\"clientVersion\":\"20.10.4\","
+                                      "\"deviceModel\":\"iPhone16,2\",\"hl\":\"en\",\"gl\":\"US\"" +
+                                      (vis.empty() ? std::string() : (",\"visitorData\":\"" + vis + "\"")) +
+                                      "}},\"videoId\":\"" + yt_id + "\"}";
+                std::vector<std::pair<std::string, std::string>> hdrs = {
+                    {"X-YouTube-Client-Name", "5"},
+                    {"X-YouTube-Client-Version", "20.10.4"}
+                };
+                if (!vis.empty()) hdrs.push_back({"X-Goog-Visitor-Id", vis});
+                HttpResponse pr = http_.request("POST", purl, payload, hdrs, "application/json", "youtube.com");
+                if (pr.status_code == 200 && !pr.body.empty()) {
+                    YouTubeWatchInfo yt2 = parse_youtube_player_response(pr.body, yt_id);
+                    if (!yt2.stream_url.empty()) yt = std::move(yt2);
+                    else if (yt.playability_status.empty()) {
+                        yt.playability_status = yt2.playability_status;
+                        yt.playability_reason = yt2.playability_reason;
+                    }
+                }
+            }
+        }
+        if (yt.title.empty() || yt.thumbnail_url.empty()) {
+            HttpResponse oe = http_.get("https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=" +
+                                        yt_id + "&format=json", "youtube.com", false);
+            if (oe.status_code == 200 && !oe.body.empty()) {
+                JsonValue oj;
+                if (JsonValue::parse(oe.body, oj) && oj.is_object()) {
+                    if (yt.title.empty()) yt.title = oj.get_string("title");
+                    if (yt.author.empty()) yt.author = oj.get_string("author_name");
+                    if (yt.thumbnail_url.empty()) yt.thumbnail_url = oj.get_string("thumbnail_url");
+                }
+            }
+        }
+        if (yt.thumbnail_url.empty()) {
+            yt.thumbnail_url = "https://i.ytimg.com/vi/" + yt_id + "/hqdefault.jpg";
+        }
+        if (yt.title.empty()) yt.title = "YouTube Video (" + yt_id + ")";
+        if (yt.author.empty()) yt.author = "YouTube Creator";
+
+        std::ostringstream yhtml;
+        yhtml << "<!doctype html><html><head><title>" << escape_html_text(yt.title) << " - YouTube</title>"
+              << "<style>"
+              << "body{background:#0f0f0f;color:#f1f1f1;padding:20px 28px;font-size:14px;}"
+              << ".yt-bar{display:flex;justify-content:space-between;align-items:center;padding:10px 16px;"
+              << "background:#181818;border:1px solid #2a2a2a;border-radius:10px;margin-bottom:16px;}"
+              << ".yt-brand{color:#ff0033;font-size:18px;font-weight:bold;}"
+              << ".yt-meta-pill{color:#aaaaaa;font-size:12px;}"
+              << ".yt-player-wrap{background:#000000;border:1px solid #272727;border-radius:12px;padding:12px;margin-bottom:14px;}"
+              << ".yt-title{color:#ffffff;font-size:20px;font-weight:bold;margin:6px 0 6px 0;}"
+              << ".yt-channel{color:#cbd5e1;font-size:14px;margin-bottom:10px;}"
+              << ".yt-notice{background:#2a1719;border:1px solid #ef4444;border-radius:8px;padding:10px 14px;color:#fecaca;font-size:13px;margin-top:10px;}"
+              << ".yt-ok{background:#0f291e;border:1px solid #10b981;border-radius:8px;padding:8px 12px;color:#a7f3d0;font-size:12px;margin-top:8px;}"
+              << "</style></head><body>"
+              << "<div class=\"yt-bar\"><div class=\"yt-brand\">YouTube</div>"
+              << "<div class=\"yt-meta-pill\">Video ID: " << escape_html_text(yt_id)
+              << " | AstraMedia v5 RDD</div></div>"
+              << "<div class=\"yt-player-wrap\">";
+        if (!yt.stream_url.empty()) {
+            yhtml << "<video src=\"" << escape_html_text(yt.stream_url) << "\" controls style=\"height:430px;\"></video>"
+                  << "<div class=\"yt-ok\">Stream OK | Quality: " << escape_html_text(yt.stream_quality)
+                  << " | MIME: " << escape_html_text(yt.stream_mime) << "</div>";
+        } else {
+            yhtml << "<img src=\"" << escape_html_text(yt.thumbnail_url)
+                  << "\" style=\"width:720px;height:405px;border-radius:8px;\">"
+                  << "<div class=\"yt-notice\"><strong>YouTube Playability: "
+                  << escape_html_text(yt.playability_status.empty() ? "UNAVAILABLE" : yt.playability_status)
+                  << "</strong> — "
+                  << escape_html_text(yt.playability_reason.empty()
+                                          ? "YouTube did not return a direct stream URL for this anonymous session."
+                                          : yt.playability_reason)
+                  << "</div>";
+        }
+        yhtml << "</div>"
+              << "<div class=\"yt-title\">" << escape_html_text(yt.title) << "</div>"
+              << "<div class=\"yt-channel\">Channel: " << escape_html_text(yt.author);
+        if (!yt.length_seconds.empty()) yhtml << " | Duration: " << escape_html_text(yt.length_seconds) << "s";
+        if (!yt.view_count.empty()) yhtml << " | Views: " << escape_html_text(yt.view_count);
+        yhtml << "</div></body></html>";
+        return yhtml.str();
+    }
+
+    std::string ct_low = to_lower_copy(resp.content_type);
+    bool is_hls_doc = (ct_low.find("mpegurl") != std::string::npos || ends_with(final_url, ".m3u8"));
+    bool is_video_doc = (ct_low.rfind("video/", 0) == 0 ||
+                         ends_with(final_url, ".mp4") || ends_with(final_url, ".webm"));
+    if (is_video_doc || is_hls_doc) {
+        if (is_video_doc && !is_hls_doc && !resp.body.empty()) {
+            std::string ext = ".mp4";
+            if (ct_low.find("webm") != std::string::npos || ends_with(final_url, ".webm")) ext = ".webm";
+            std::error_code ec;
+            std::filesystem::create_directories("/tmp/astra_media_cache", ec);
+            std::ostringstream fn;
+            fn << "/tmp/astra_media_cache/" << std::hex << fnv1a_64(final_url) << ext;
+            std::string local_path = fn.str();
+            size_t cap = std::min<size_t>(resp.body.size(), 12ULL * 1024 * 1024);
+            std::ofstream out(local_path, std::ios::binary | std::ios::trunc);
+            if (out) {
+                out.write(resp.body.data(), static_cast<std::streamsize>(cap));
+                out.close();
+                media_cache_[final_url] = local_path;
+            }
+        }
+        return "<!doctype html><html><head><title>AstraMedia Stream: " + escape_html_text(final_url) + "</title>"
+               "<style>body{background:#0b0f19;color:#e2e8f0;padding:24px;}h1{color:#f8fafc;}</style></head><body>"
+               "<h1>AstraMedia v5 Stream Player</h1><video src=\"" + escape_html_text(final_url) + "\" controls style=\"height:460px;\"></video></body></html>";
+    }
+    if (ct_low.rfind("audio/", 0) == 0 || ends_with(final_url, ".mp3") || ends_with(final_url, ".ogg") || ends_with(final_url, ".wav")) {
+        return "<!doctype html><html><head><title>AstraMedia Audio: " + escape_html_text(final_url) + "</title>"
+               "<style>body{background:#0b0f19;color:#e2e8f0;padding:24px;}h1{color:#f8fafc;}</style></head><body>"
+               "<h1>AstraMedia v5 Audio Stream</h1><audio src=\"" + escape_html_text(final_url) + "\" controls></audio></body></html>";
+    }
     return resp.body;
+}
+
+std::string BrowserApp::extract_youtube_video_id(const std::string& url) {
+    ParsedUrl p = parse_url(url);
+    if (!p.valid) return {};
+    std::string host = to_lower_copy(p.host);
+    auto valid_id = [](const std::string& s) -> bool {
+        if (s.size() != 11) return false;
+        for (char c : s) {
+            if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-') return false;
+        }
+        return true;
+    };
+    if (host == "youtu.be") {
+        std::string path = p.path;
+        if (!path.empty() && path[0] == '/') path.erase(path.begin());
+        size_t sl = path.find_first_of("/?#");
+        if (sl != std::string::npos) path.resize(sl);
+        return valid_id(path) ? path : std::string();
+    }
+    if (host == "youtube.com" || host == "www.youtube.com" || host == "m.youtube.com" || host == "music.youtube.com") {
+        // /watch?v=ID
+        std::string qs = p.query;
+        if (!qs.empty() && qs[0] == '?') qs.erase(qs.begin());
+        if (!qs.empty()) {
+            size_t pos = 0;
+            while (pos < qs.size()) {
+                size_t amp = qs.find('&', pos);
+                std::string kv = (amp == std::string::npos) ? qs.substr(pos) : qs.substr(pos, amp - pos);
+                if (kv.rfind("v=", 0) == 0) {
+                    std::string id = kv.substr(2);
+                    if (valid_id(id)) return id;
+                }
+                if (amp == std::string::npos) break;
+                pos = amp + 1;
+            }
+        }
+        // /shorts/ID or /embed/ID or /live/ID
+        std::string clean = p.path;
+        for (const char* prefix : {"/shorts/", "/embed/", "/live/"}) {
+            std::string pf(prefix);
+            if (clean.rfind(pf, 0) == 0) {
+                std::string id = clean.substr(pf.size());
+                size_t sl = id.find('/');
+                if (sl != std::string::npos) id.resize(sl);
+                if (valid_id(id)) return id;
+            }
+        }
+    }
+    return {};
+}
+
+YouTubeWatchInfo BrowserApp::parse_youtube_player_response(const std::string& html_or_json,
+                                                           const std::string& video_id) {
+    YouTubeWatchInfo info;
+    info.is_youtube = true;
+    info.video_id = video_id;
+
+    std::string json_slice;
+    size_t first_non_ws = html_or_json.find_first_not_of(" \t\r\n");
+    if (first_non_ws != std::string::npos && html_or_json[first_non_ws] == '{') {
+        json_slice = html_or_json.substr(first_non_ws);
+    } else {
+        size_t marker = html_or_json.find("ytInitialPlayerResponse");
+        if (marker == std::string::npos) return info;
+        size_t brace = html_or_json.find('{', marker);
+        if (brace == std::string::npos) return info;
+        int depth = 0;
+        bool in_str = false;
+        bool esc = false;
+        size_t end = brace;
+        for (size_t i = brace; i < html_or_json.size(); ++i) {
+            char c = html_or_json[i];
+            if (in_str) {
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') in_str = false;
+            } else {
+                if (c == '"') in_str = true;
+                else if (c == '{') ++depth;
+                else if (c == '}') {
+                    --depth;
+                    if (depth == 0) {
+                        end = i + 1;
+                        break;
+                    }
+                }
+            }
+        }
+        if (end <= brace) return info;
+        json_slice = html_or_json.substr(brace, end - brace);
+    }
+
+    JsonValue root;
+    if (!JsonValue::parse(json_slice, root) || !root.is_object()) return info;
+
+    if (const JsonValue* ps = root.get("playabilityStatus"); ps && ps->is_object()) {
+        info.playability_status = ps->get_string("status");
+        info.playability_reason = ps->get_string("reason");
+    }
+    if (const JsonValue* vd = root.get("videoDetails"); vd && vd->is_object()) {
+        info.title = vd->get_string("title");
+        info.author = vd->get_string("author");
+        info.length_seconds = vd->get_string("lengthSeconds");
+        info.view_count = vd->get_string("viewCount");
+        if (const JsonValue* th = vd->get("thumbnail"); th && th->is_object()) {
+            if (const JsonValue* arr = th->get("thumbnails"); arr && arr->is_array() && !arr->as_array().empty()) {
+                info.thumbnail_url = arr->as_array().back().get_string("url");
+            }
+        }
+    }
+    if (const JsonValue* sd = root.get("streamingData"); sd && sd->is_object()) {
+        auto pick_from = [&](const JsonValue* arr, bool prefer_mp4) {
+            if (!arr || !arr->is_array()) return;
+            for (const auto& f : arr->as_array()) {
+                if (!f.is_object()) continue;
+                std::string u = f.get_string("url");
+                if (u.empty()) continue;
+                std::string mime = f.get_string("mimeType");
+                if (prefer_mp4 && mime.find("video/mp4") == std::string::npos) continue;
+                if (!prefer_mp4 && mime.find("video/") == std::string::npos) continue;
+                info.stream_url = u;
+                info.stream_mime = mime;
+                info.stream_quality = f.get_string("qualityLabel", f.get_string("quality", "auto"));
+                return;
+            }
+        };
+        pick_from(sd->get("formats"), true);
+        if (info.stream_url.empty()) pick_from(sd->get("formats"), false);
+        if (info.stream_url.empty()) {
+            std::string hls = sd->get_string("hlsManifestUrl");
+            if (!hls.empty()) {
+                info.stream_url = hls;
+                info.stream_mime = "application/vnd.apple.mpegurl";
+                info.stream_quality = "HLS";
+            }
+        }
+        if (info.stream_url.empty()) pick_from(sd->get("adaptiveFormats"), true);
+        if (info.stream_url.empty()) pick_from(sd->get("adaptiveFormats"), false);
+    }
+    return info;
 }
 
 std::string BrowserApp::fetch_external_stylesheets(const HtmlDocument& doc,
                                                    const std::string& base_url,
-                                                   size_t& loaded_count) {
+                                                   size_t& loaded_count,
+                                                   const SecurityOrigin* doc_origin,
+                                                   const ContentSecurityPolicy* csp) {
     std::string combined;
     loaded_count = 0;
     ParsedUrl base = parse_url(base_url);
@@ -696,6 +1133,17 @@ std::string BrowserApp::fetch_external_stylesheets(const HtmlDocument& doc,
         std::string href = link->get_attr("href");
         if (href.empty()) continue;
         std::string resolved = HttpClient::resolve_relative_url(base_url, href);
+
+        if (doc_origin) {
+            if (MixedContentBlocker::is_blocked(*doc_origin, resolved, ResourceKind::Style)) {
+                ++security_blocks_;
+                continue;
+            }
+            if (csp && csp->active() && !csp->allows_url(ResourceKind::Style, resolved, *doc_origin)) {
+                ++security_blocks_;
+                continue;
+            }
+        }
 
         if (resolved.rfind("file://", 0) == 0) {
             std::string css;
@@ -723,13 +1171,13 @@ std::string BrowserApp::fetch_external_stylesheets(const HtmlDocument& doc,
 void BrowserApp::preload_remote_images_parallel(const HtmlDocument& doc, const std::string& base_url) {
     std::vector<std::string> remote_imgs;
     for (DomNode* img : doc.query_selector_all("img")) {
-        std::string src = img->get_attr("src");
-        if (src.empty()) continue;
+        std::string src = resolve_img_attr(img);
+        if (src.empty() || src.rfind("data:", 0) == 0) continue;
         std::string resolved = HttpClient::resolve_relative_url(base_url, src);
         if ((resolved.rfind("http://", 0) == 0 || resolved.rfind("https://", 0) == 0) &&
             image_cache_.find(resolved) == image_cache_.end()) {
             remote_imgs.push_back(resolved);
-            if (remote_imgs.size() >= 8) break; // Bound concurrent preload per page
+            if (remote_imgs.size() >= 12) break; // Bound concurrent preload per page
         }
     }
     if (remote_imgs.size() <= 1) return;
@@ -741,15 +1189,135 @@ void BrowserApp::preload_remote_images_parallel(const HtmlDocument& doc, const s
             DecodedImage dec = ImageDecoder::decode_bytes(
                 reinterpret_cast<const uint8_t*>(r.body.data()), r.body.size());
             if (dec.valid) {
-                if (image_cache_.size() > 32) image_cache_.clear();
+                if (image_cache_.size() > 48) image_cache_.clear();
                 image_cache_[remote_imgs[i]] = std::move(dec);
             }
         }
     }
 }
 
+std::string BrowserApp::resolve_media_source_to_local(const std::string& base_url, const std::string& src) {
+    if (src.empty()) return {};
+    std::string resolved = HttpClient::resolve_relative_url(base_url, src);
+    if (resolved.rfind("file://", 0) == 0) {
+        std::string p = resolved.substr(7);
+        size_t q = p.find_first_of("?#");
+        if (q != std::string::npos) p.resize(q);
+        if (std::ifstream(p)) return p;
+    }
+    if (resolved.rfind("http://", 0) != 0 && resolved.rfind("https://", 0) != 0) {
+        if (std::ifstream(src)) return src;
+        if (std::ifstream("astra/" + src)) return "astra/" + src;
+        return src;
+    }
+
+    auto cached = media_cache_.find(resolved);
+    if (cached != media_cache_.end() && std::ifstream(cached->second)) {
+        return cached->second;
+    }
+
+    ParsedUrl b = parse_url(base_url);
+    std::string top_site = b.valid ? b.registrable_domain() : "";
+    HttpResponse resp = http_.get(resolved, top_site, false);
+    if (resp.blocked_by_privacy || resp.blocked_by_extension || resp.status_code < 200 || resp.status_code >= 400 || resp.body.empty()) {
+        return {};
+    }
+
+    std::string media_bytes = resp.body;
+    std::string media_url = resp.final_url.empty() ? resolved : resp.final_url;
+    std::string low_url = to_lower_copy(media_url);
+    bool is_hls = (low_url.find(".m3u8") != std::string::npos) ||
+                  (media_bytes.size() >= 7 && media_bytes.rfind("#EXTM3U", 0) == 0);
+
+    if (is_hls) {
+        HlsPlaylist pl = MediaEngine::parse_hls_playlist(media_bytes, media_url);
+        if (pl.valid && pl.is_master && !pl.variant_urls.empty()) {
+            HttpResponse vresp = http_.get(pl.variant_urls[0], top_site, false);
+            if (!vresp.blocked_by_privacy && !vresp.blocked_by_extension && vresp.status_code == 200 && !vresp.body.empty()) {
+                media_url = vresp.final_url.empty() ? pl.variant_urls[0] : vresp.final_url;
+                pl = MediaEngine::parse_hls_playlist(vresp.body, media_url);
+            }
+        }
+        if (!pl.valid || pl.segment_urls.empty()) return {};
+        HttpResponse sresp = http_.get(pl.segment_urls[0], top_site, false);
+        if (sresp.blocked_by_privacy || sresp.blocked_by_extension || sresp.status_code < 200 || sresp.status_code >= 400 || sresp.body.empty()) {
+            return {};
+        }
+        media_bytes = std::move(sresp.body);
+        media_url = sresp.final_url.empty() ? pl.segment_urls[0] : sresp.final_url;
+    }
+
+    // Hard cap single remote stream cache entry at 12 MiB to keep RAM/disk bounded
+    constexpr size_t kMaxStreamBytes = 12ULL * 1024 * 1024;
+    if (media_bytes.size() > kMaxStreamBytes) {
+        media_bytes.resize(kMaxStreamBytes);
+    }
+
+    std::string ext = ".bin";
+    std::string low_m = to_lower_copy(media_url);
+    size_t qpos = low_m.find('?');
+    if (qpos != std::string::npos) low_m.resize(qpos);
+    if (ends_with(low_m, ".mp4") || ends_with(low_m, ".m4v") || ends_with(low_m, ".m4s")) ext = ".mp4";
+    else if (ends_with(low_m, ".webm")) ext = ".webm";
+    else if (ends_with(low_m, ".ts")) ext = ".ts";
+    else if (ends_with(low_m, ".wav")) ext = ".wav";
+    else if (ends_with(low_m, ".mp3")) ext = ".mp3";
+    else if (ends_with(low_m, ".ogg") || ends_with(low_m, ".oga")) ext = ".ogg";
+    else if (ends_with(low_m, ".y4m")) ext = ".y4m";
+    else if (media_bytes.size() >= 12 && media_bytes.compare(4, 4, "ftyp") == 0) ext = ".mp4";
+    else if (media_bytes.size() >= 4 &&
+             static_cast<unsigned char>(media_bytes[0]) == 0x1Au &&
+             static_cast<unsigned char>(media_bytes[1]) == 0x45u &&
+             static_cast<unsigned char>(media_bytes[2]) == 0xDFu &&
+             static_cast<unsigned char>(media_bytes[3]) == 0xA3u) ext = ".webm";
+    else if (media_bytes.size() >= 189 && media_bytes[0] == 0x47 && media_bytes[188] == 0x47) ext = ".ts";
+
+    std::error_code ec;
+    std::filesystem::create_directories("/tmp/astra_media_cache", ec);
+    std::ostringstream fn;
+    fn << "/tmp/astra_media_cache/" << std::hex << fnv1a_64(resolved) << ext;
+    std::string local_path = fn.str();
+
+    std::ofstream out(local_path, std::ios::binary | std::ios::trunc);
+    if (!out) return {};
+    out.write(media_bytes.data(), static_cast<std::streamsize>(media_bytes.size()));
+    out.close();
+
+    if (media_cache_.size() >= 16) media_cache_.clear();
+    media_cache_[resolved] = local_path;
+    return local_path;
+}
+
 bool BrowserApp::load_image_subresource(const std::string& base_url, const std::string& src, DecodedImage& out) {
     if (src.empty()) return false;
+
+    // Support inline data:image/... URIs (PNG, JPEG, GIF, WebP, BMP, and SVG XML)
+    if (src.rfind("data:", 0) == 0) {
+        std::string key = "data:" + std::to_string(fnv1a_64(src));
+        auto it = image_cache_.find(key);
+        if (it != image_cache_.end()) {
+            out = it->second;
+            return out.valid;
+        }
+        size_t comma = src.find(',');
+        if (comma == std::string::npos) return false;
+        std::string meta = to_lower_copy(src.substr(5, comma - 5));
+        std::string_view payload_sv(src.data() + comma + 1, src.size() - comma - 1);
+        std::string raw_bytes = (meta.find(";base64") != std::string::npos)
+                                    ? decode_base64_str(payload_sv)
+                                    : percent_decode_str(payload_sv);
+        if (raw_bytes.empty()) return false;
+        DecodedImage decoded = ImageDecoder::decode_bytes(
+            reinterpret_cast<const uint8_t*>(raw_bytes.data()), raw_bytes.size());
+        if (decoded.valid) {
+            if (image_cache_.size() > 48) image_cache_.clear();
+            image_cache_[key] = decoded;
+            out = std::move(decoded);
+            return true;
+        }
+        return false;
+    }
+
     std::string resolved = HttpClient::resolve_relative_url(base_url, src);
 
     auto it = image_cache_.find(resolved);
@@ -772,7 +1340,7 @@ bool BrowserApp::load_image_subresource(const std::string& base_url, const std::
     }
 
     if (decoded.valid) {
-        if (image_cache_.size() > 32) image_cache_.clear(); // Keep decoded image RAM bounded
+        if (image_cache_.size() > 48) image_cache_.clear(); // Keep decoded image RAM bounded
         image_cache_[resolved] = decoded;
         out = std::move(decoded);
         return true;
@@ -786,17 +1354,22 @@ bool BrowserApp::render_html_via_content_ipc(const std::string& html,
                                              DisplayList& out_dl,
                                              std::string& out_title,
                                              size_t& out_blob_bytes,
-                                             size_t& out_arena_bytes) {
-    if (!content_worker_.alive()) return false;
+                                             size_t& out_arena_bytes,
+                                             const SecurityOrigin* doc_origin,
+                                             bool light_web_default) {
+    WorkerProcess* worker = doc_origin ? acquire_content_worker_for_origin(*doc_origin)
+                                       : (content_worker_.alive() ? &content_worker_ : nullptr);
+    if (!worker || !worker->alive()) return false;
     IpcMessage req{IpcMsgType::RenderHtml, next_req_id_++, {}};
     write_u32(req.payload, vw);
     write_u32(req.payload, vh);
     write_str(req.payload, html);
     write_str(req.payload, extra_css);
+    write_u32(req.payload, light_web_default ? 1u : 0u);
 
-    if (!content_worker_.channel().send(req)) return false;
+    if (!worker->channel().send(req)) return false;
     IpcMessage resp;
-    if (!content_worker_.channel().recv(resp) || resp.type != IpcMsgType::DisplayListBlob) {
+    if (!worker->channel().recv(resp) || resp.type != IpcMsgType::DisplayListBlob) {
         return false;
     }
 
@@ -820,9 +1393,63 @@ void BrowserApp::relayout_live_tab(Tab& tab, float vw, float vh) {
     CssStylesheet sheet;
     sheet.parse(tab.live_doc->collect_stylesheets());
     if (!tab.extra_css.empty()) sheet.parse(tab.extra_css);
-    LayoutFrame* root = LayoutEngine::build_layout(*tab.live_arena, *tab.live_doc, sheet, vw, vh);
+    bool light_web = (tab.url.rfind("http://", 0) == 0 || tab.url.rfind("https://", 0) == 0);
+    LayoutFrame* root = LayoutEngine::build_layout(*tab.live_arena, *tab.live_doc, sheet, vw, vh, light_web);
     tab.cached_display_list = LayoutEngine::build_display_list(root, static_cast<uint32_t>(vw), static_cast<uint32_t>(vh));
     tab.arena_bytes = tab.live_arena->bytes_used();
+}
+
+bool BrowserApp::submit_form_for_element(Tab& tab, DomNode* trigger_el) {
+    if (!trigger_el) return false;
+    DomNode* form = nullptr;
+    for (DomNode* cur = trigger_el; cur; cur = cur->parent) {
+        if (cur->type == NodeType::Element && cur->tag == "form") {
+            form = cur;
+            break;
+        }
+    }
+    if (!form) return false;
+
+    std::string action = form->get_attr("action");
+    std::string method = to_lower_copy(form->get_attr("method"));
+    if (method.empty()) method = "get";
+
+    std::vector<std::pair<std::string, std::string>> fields;
+    collect_form_fields(form, fields);
+    std::string encoded;
+    for (size_t i = 0; i < fields.size(); ++i) {
+        if (i > 0) encoded.push_back('&');
+        encoded += url_encode_component(fields[i].first) + "=" + url_encode_component(fields[i].second);
+    }
+
+    std::string target = action.empty() ? tab.url : HttpClient::resolve_relative_url(tab.url, action);
+    if (method == "post" && (target.rfind("http://", 0) == 0 || target.rfind("https://", 0) == 0)) {
+        ParsedUrl base = parse_url(tab.url);
+        HttpResponse resp = http_.post(target, encoded, "application/x-www-form-urlencoded",
+                                       base.valid ? base.registrable_domain() : "");
+        if (resp.status_code >= 200 && resp.status_code < 400 && !resp.body.empty()) {
+            std::string tmp_path = "/tmp/astra_form_post_resp.html";
+            std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
+            f << resp.body;
+            f.close();
+            navigate(tab.id, "file://" + tmp_path, true);
+            return true;
+        }
+        return false;
+    }
+
+    // Default GET submission: append URL-encoded query parameters
+    if (!encoded.empty()) {
+        size_t hash_pos = target.find('#');
+        std::string frag;
+        if (hash_pos != std::string::npos) {
+            frag = target.substr(hash_pos);
+            target = target.substr(0, hash_pos);
+        }
+        target += (target.find('?') == std::string::npos ? "?" : "&") + encoded + frag;
+    }
+    navigate(tab.id, target, true);
+    return true;
 }
 
 NavigationResult BrowserApp::navigate(uint32_t tab_id, const std::string& url, bool push_history) {
@@ -836,9 +1463,9 @@ NavigationResult BrowserApp::navigate(uint32_t tab_id, const std::string& url, b
         return res;
     }
 
-    std::string final_url, err, proto;
+    std::string final_url, err, proto, csp_hdr;
     bool tls_ok = false, cached_hit = false;
-    std::string html = resolve_source_html(url, final_url, tls_ok, cached_hit, proto, err);
+    std::string html = resolve_source_html(url, final_url, tls_ok, cached_hit, proto, err, &csp_hdr);
     if (html.empty()) {
         res.error = err;
         return res;
@@ -853,40 +1480,20 @@ NavigationResult BrowserApp::navigate(uint32_t tab_id, const std::string& url, b
     tab->live_doc = std::make_unique<HtmlDocument>(HtmlDocument::parse(*tab->live_arena, html));
     tab->js_vm = std::make_unique<AstraJsEngine>();
     tab->focused_input_selector.clear();
+    tab->origin = SecurityOrigin::from_url(final_url);
+    tab->csp.clear();
+    tab->csp_blocks = 0;
 
-    // Bind disk-persisted per-origin storage & network fetch (GET/POST)
-    ParsedUrl pu = parse_url(final_url);
-    std::string origin_key = pu.valid ? pu.origin() : final_url;
-    tab->js_vm->bind_storage(
-        [this, origin_key](const std::string& k) { return origin_storage_get(origin_key, k); },
-        [this, origin_key](const std::string& k, const std::string& v) { origin_storage_set(origin_key, k, v); });
-    std::string fetch_base = final_url;
-    tab->js_vm->bind_fetch([this, fetch_base](const std::string& req_url,
-                                              const std::string& method,
-                                              const std::string& body) {
-        return perform_js_fetch(fetch_base, req_url, method, body);
-    });
-
-    // Load external <link rel="stylesheet"> subresources through AstraShield + HttpCache (parallel batch)
-    size_t ext_css_count = 0;
-    std::string subresource_css = fetch_external_stylesheets(*tab->live_doc, final_url, ext_css_count);
-    preload_remote_images_parallel(*tab->live_doc, final_url);
-
-    // Execute page <script> blocks via AstraJS v4 Bytecode VM (Promises + Event Loop)
-    tab->console_logs.clear();
-    auto scripts = tab->live_doc->collect_scripts();
-    for (const auto& sc : scripts) {
-        auto rep = tab->js_vm->execute(sc, *tab->live_doc);
-        for (const auto& l : rep.logs) tab->console_logs.push_back(l);
+    // Parse CSP from HTTP Content-Security-Policy header and <meta http-equiv="Content-Security-Policy">
+    if (!csp_hdr.empty()) tab->csp.parse(csp_hdr);
+    for (DomNode* meta : tab->live_doc->query_selector_all("meta")) {
+        if (to_lower_copy(meta->get_attr("http-equiv")) == "content-security-policy") {
+            std::string content = meta->get_attr("content");
+            if (!content.empty()) tab->csp.parse(content);
+        }
     }
 
-    // Execute matching Manifest V3 WebExtension content scripts & CSS
-    std::string ext_css;
-    auto ext_sum = extensions_.run_content_scripts(final_url, *tab->live_doc, ext_css);
-    for (const auto& l : ext_sum.logs) tab->console_logs.push_back(l);
-
-    std::string all_extra_css = subresource_css + "\n" + ext_css;
-
+    // Record baseline URL & history before scripts run so JS history.pushState/replaceState updates stick
     if (push_history) {
         if (tab->history_index >= 0 &&
             static_cast<size_t>(tab->history_index + 1) < tab->history.size()) {
@@ -897,8 +1504,163 @@ NavigationResult BrowserApp::navigate(uint32_t tab_id, const std::string& url, b
             tab->history_index = static_cast<int>(tab->history.size()) - 1;
         }
     }
-
     tab->url = final_url;
+
+    // Bind disk-persisted per-origin storage, SPA history, and policy-checked network fetch (GET/POST/PUT/DELETE)
+    ParsedUrl pu = parse_url(final_url);
+    std::string origin_key = pu.valid ? pu.origin() : final_url;
+    tab->js_vm->bind_storage(
+        [this, origin_key](const std::string& k) { return origin_storage_get(origin_key, k); },
+        [this, origin_key](const std::string& k, const std::string& v) { origin_storage_set(origin_key, k, v); });
+    std::string fetch_base = final_url;
+    uint32_t captured_tab_id = tab->id;
+    tab->js_vm->bind_fetch([this, fetch_base, captured_tab_id](const std::string& req_url,
+                                                               const std::string& method,
+                                                               const std::string& body,
+                                                               const std::vector<std::pair<std::string, std::string>>& headers) {
+        return perform_js_fetch(fetch_base, req_url, method, body, headers, captured_tab_id);
+    });
+    tab->js_vm->bind_history([this, captured_tab_id](const std::string& new_url, bool replace) {
+        Tab* t = find_tab(captured_tab_id);
+        if (!t) return;
+        t->url = new_url;
+        t->origin = SecurityOrigin::from_url(new_url);
+        if (replace && t->history_index >= 0 && static_cast<size_t>(t->history_index) < t->history.size()) {
+            t->history[static_cast<size_t>(t->history_index)] = new_url;
+        } else {
+            if (t->history_index >= 0 && static_cast<size_t>(t->history_index + 1) < t->history.size()) {
+                t->history.resize(static_cast<size_t>(t->history_index + 1));
+            }
+            t->history.push_back(new_url);
+            t->history_index = static_cast<int>(t->history.size()) - 1;
+        }
+    }, final_url);
+
+    // Load external <link rel="stylesheet"> subresources through MixedContent + CSP + AstraShield + HttpCache
+    size_t ext_css_count = 0;
+    std::string subresource_css = fetch_external_stylesheets(*tab->live_doc, final_url, ext_css_count,
+                                                             &tab->origin, &tab->csp);
+    preload_remote_images_parallel(*tab->live_doc, final_url);
+
+    // Pre-fetch remote <iframe src="..."> documents (bounded to 2 iframes, max 256 KiB each, respecting CSP & X-Frame-Options)
+    size_t iframes_loaded = 0;
+    for (DomNode* ifr : tab->live_doc->query_selector_all("iframe")) {
+        if (iframes_loaded >= 2) break;
+        if (!ifr->get_attr("srcdoc").empty() || !ifr->get_attr("data-astra-iframe-doc").empty()) continue;
+        std::string isrc = ifr->get_attr("src");
+        if (isrc.empty() || isrc == "about:blank" || isrc.rfind("javascript:", 0) == 0) continue;
+        std::string iurl = HttpClient::resolve_relative_url(final_url, isrc);
+        if (iurl == final_url) continue;
+        if (MixedContentBlocker::is_blocked(tab->origin, iurl, ResourceKind::Frame)) {
+            ++tab->csp_blocks;
+            ++security_blocks_;
+            continue;
+        }
+        if (tab->csp.active() && !tab->csp.allows_url(ResourceKind::Frame, iurl, tab->origin)) {
+            ++tab->csp_blocks;
+            ++security_blocks_;
+            continue;
+        }
+        if (iurl.rfind("file://", 0) == 0) {
+            std::string body;
+            if (read_local_file(iurl.substr(7), body) && !body.empty()) {
+                if (body.size() > 256 * 1024) body.resize(256 * 1024);
+                ifr->set_attr("data-astra-iframe-doc", body);
+                ++iframes_loaded;
+            }
+        } else if (iurl.rfind("http://", 0) == 0 || iurl.rfind("https://", 0) == 0) {
+            std::string top_site = pu.valid ? pu.registrable_domain() : "";
+            HttpResponse ir = http_.get(iurl, top_site, false);
+            bool xfo_deny = false;
+            for (const auto& [hk, hv] : ir.headers) {
+                if (to_lower_copy(hk) == "x-frame-options" && to_lower_copy(hv).find("deny") != std::string::npos) {
+                    xfo_deny = true;
+                    break;
+                }
+            }
+            if (!xfo_deny && !ir.blocked_by_privacy && !ir.blocked_by_extension &&
+                ir.status_code >= 200 && ir.status_code < 400 && !ir.body.empty()) {
+                std::string body = ir.body;
+                if (body.size() > 256 * 1024) body.resize(256 * 1024);
+                ifr->set_attr("data-astra-iframe-doc", body);
+                ++iframes_loaded;
+            }
+        }
+    }
+
+    // Execute inline & external <script src="..."> blocks in document order via AstraJS v10 Bytecode VM
+    tab->console_logs.clear();
+    auto script_entries = tab->live_doc->collect_script_entries();
+    std::vector<std::string> remote_script_urls;
+    std::vector<size_t> remote_script_indices;
+    std::vector<std::string> resolved_script_code(script_entries.size());
+
+    for (size_t i = 0; i < script_entries.size(); ++i) {
+        const auto& entry = script_entries[i];
+        if (entry.src.empty()) continue;
+        std::string surl = HttpClient::resolve_relative_url(final_url, entry.src);
+        if (MixedContentBlocker::is_blocked(tab->origin, surl, ResourceKind::Script)) {
+            ++tab->csp_blocks;
+            ++security_blocks_;
+            tab->console_logs.push_back("[MixedContent] Blocked script: " + surl);
+            continue;
+        }
+        if (tab->csp.active() && !tab->csp.allows_url(ResourceKind::Script, surl, tab->origin)) {
+            ++tab->csp_blocks;
+            ++security_blocks_;
+            tab->console_logs.push_back("[CSP] Blocked external script: " + surl);
+            continue;
+        }
+        if (surl.rfind("file://", 0) == 0) {
+            std::string body;
+            if (read_local_file(surl.substr(7), body) && body.size() <= 512 * 1024) {
+                resolved_script_code[i] = std::move(body);
+            }
+        } else if ((surl.rfind("http://", 0) == 0 || surl.rfind("https://", 0) == 0) &&
+                   remote_script_urls.size() < 8) {
+            remote_script_urls.push_back(surl);
+            remote_script_indices.push_back(i);
+        }
+    }
+    if (!remote_script_urls.empty()) {
+        std::string top_site = pu.valid ? pu.registrable_domain() : "";
+        auto sresps = http_.fetch_batch(remote_script_urls, top_site, 4);
+        for (size_t k = 0; k < sresps.size() && k < remote_script_indices.size(); ++k) {
+            const auto& r = sresps[k];
+            if (!r.blocked_by_privacy && !r.blocked_by_extension &&
+                r.status_code == 200 && !r.body.empty() && r.body.size() <= 512 * 1024) {
+                resolved_script_code[remote_script_indices[k]] = r.body;
+            }
+        }
+    }
+
+    size_t scripts_executed = 0;
+    for (size_t i = 0; i < script_entries.size(); ++i) {
+        const auto& entry = script_entries[i];
+        if (entry.src.empty()) {
+            if (!tab->csp.allows_inline_script()) {
+                ++tab->csp_blocks;
+                ++security_blocks_;
+                tab->console_logs.push_back("[CSP] Blocked inline script execution");
+                continue;
+            }
+            auto rep = tab->js_vm->execute(entry.inline_code, *tab->live_doc);
+            for (const auto& l : rep.logs) tab->console_logs.push_back(l);
+            ++scripts_executed;
+        } else if (!resolved_script_code[i].empty()) {
+            auto rep = tab->js_vm->execute(resolved_script_code[i], *tab->live_doc);
+            for (const auto& l : rep.logs) tab->console_logs.push_back(l);
+            ++scripts_executed;
+        }
+    }
+
+    // Execute matching Manifest V3 WebExtension content scripts & CSS
+    std::string ext_css;
+    auto ext_sum = extensions_.run_content_scripts(final_url, *tab->live_doc, ext_css);
+    for (const auto& l : ext_sum.logs) tab->console_logs.push_back(l);
+
+    std::string all_extra_css = subresource_css + "\n" + ext_css;
+
     tab->raw_html = html;
     tab->extra_css = all_extra_css;
     tab->dom_nodes = tab->live_doc->node_count();
@@ -911,9 +1673,10 @@ NavigationResult BrowserApp::navigate(uint32_t tab_id, const std::string& url, b
     DisplayList dl;
     std::string rendered_title;
     size_t blob_bytes = 0, arena_used = 0;
+    bool light_web = (tab->url.rfind("http://", 0) == 0 || tab->url.rfind("https://", 0) == 0);
 
-    if (content_worker_.alive() && ext_sum.scripts_injected == 0 && scripts.empty()) {
-        if (render_html_via_content_ipc(html, all_extra_css, 1280, 636, dl, rendered_title, blob_bytes, arena_used)) {
+    if (content_worker_.alive() && ext_sum.scripts_injected == 0 && scripts_executed == 0 && iframes_loaded == 0) {
+        if (render_html_via_content_ipc(html, all_extra_css, 1280, 636, dl, rendered_title, blob_bytes, arena_used, &tab->origin, light_web)) {
             res.rendered_via_ipc = true;
         }
     }
@@ -921,14 +1684,14 @@ NavigationResult BrowserApp::navigate(uint32_t tab_id, const std::string& url, b
         CssStylesheet sheet;
         sheet.parse(tab->live_doc->collect_stylesheets());
         if (!all_extra_css.empty()) sheet.parse(all_extra_css);
-        LayoutFrame* root = LayoutEngine::build_layout(*tab->live_arena, *tab->live_doc, sheet, 1280.0f, 636.0f);
+        LayoutFrame* root = LayoutEngine::build_layout(*tab->live_arena, *tab->live_doc, sheet, 1280.0f, 636.0f, light_web);
         dl = LayoutEngine::build_display_list(root, 1280, 636);
         rendered_title = tab->live_doc->title();
         blob_bytes = dl.serialize().size();
         arena_used = tab->live_arena->bytes_used();
     }
 
-    tab->title = rendered_title.empty() ? final_url : rendered_title;
+    tab->title = rendered_title.empty() ? tab->url : rendered_title;
     tab->cached_display_list = std::move(dl);
     tab->arena_bytes = arena_used;
 
@@ -1135,15 +1898,9 @@ ClickResult BrowserApp::click_at(int x, int y) {
         out.action = "download";
         out.detail = rec.ok ? (rec.saved_path + " sha256:" + rec.sha256_hex.substr(0, 12)) : rec.error;
     } else if (hit->kind == HitRegionKind::Audio) {
-        std::string path = hit->target;
-        std::string resolved = HttpClient::resolve_relative_url(active->url, hit->target);
-        if (resolved.rfind("file://", 0) == 0 && std::ifstream(resolved.substr(7))) {
-            path = resolved.substr(7);
-        } else if (!std::ifstream(path) && std::ifstream("astra/" + path)) {
-            path = "astra/" + path;
-        }
+        std::string path = resolve_media_source_to_local(active->url, hit->target);
         DecodedAudioBuffer abuf;
-        if (MediaEngine::decode_audio_pcm(path, 2.0, abuf)) {
+        if (!path.empty() && MediaEngine::decode_audio_pcm(path, 2.0, abuf)) {
             auto rep = MediaEngine::play_audio_alsa(abuf);
             out.handled = true;
             out.action = "play_audio";
@@ -1165,15 +1922,24 @@ ClickResult BrowserApp::click_at(int x, int y) {
             out.action = "focus_input";
             out.detail = hit->target;
         }
-    } else if (hit->kind == HitRegionKind::Button && active->live_doc && active->js_vm) {
+    } else if (hit->kind == HitRegionKind::Button && active->live_doc) {
         DomNode* btn = active->live_doc->query_selector(hit->target);
         if (btn) {
-            auto rep = active->js_vm->dispatch_event(btn, "click", *active->live_doc);
-            for (const auto& l : rep.logs) active->console_logs.push_back(l);
-            relayout_live_tab(*active);
-            out.handled = true;
-            out.action = "js_click";
-            out.detail = hit->target;
+            if (active->js_vm) {
+                auto rep = active->js_vm->dispatch_event(btn, "click", *active->live_doc);
+                for (const auto& l : rep.logs) active->console_logs.push_back(l);
+            }
+            std::string btype = to_lower_copy(btn->get_attr("type"));
+            if (btype != "button" && submit_form_for_element(*active, btn)) {
+                out.handled = true;
+                out.action = "form_submit";
+                out.detail = active->url;
+            } else {
+                relayout_live_tab(*active);
+                out.handled = true;
+                out.action = "js_click";
+                out.detail = hit->target;
+            }
         }
     } else if (hit->kind == HitRegionKind::Scene3D) {
         cam3d_.yaw += 0.45f;
@@ -1204,11 +1970,39 @@ ClickResult BrowserApp::click_at(int x, int y) {
 JsFetchResult BrowserApp::perform_js_fetch(const std::string& base_url,
                                            const std::string& url,
                                            const std::string& method,
-                                           const std::string& body) {
+                                           const std::string& body,
+                                           const std::vector<std::pair<std::string, std::string>>& headers,
+                                           uint32_t tab_id) {
     JsFetchResult out;
     std::string resolved = HttpClient::resolve_relative_url(base_url, url);
+    SecurityOrigin doc_origin = SecurityOrigin::from_url(base_url);
+    const Tab* tab_ctx = tab_id ? find_tab(tab_id) : nullptr;
+    if (tab_ctx) doc_origin = tab_ctx->origin;
+
+    // 1. Mixed Content enforcement (blocks http:// / ws:// fetch from https:// document)
+    std::string policy_reason;
+    if (MixedContentBlocker::is_blocked(doc_origin, resolved, ResourceKind::Connect, &policy_reason)) {
+        out.ok = false;
+        out.blocked_by_shield = true;
+        out.error = policy_reason;
+        ++security_blocks_;
+        return out;
+    }
+
+    // 2. Content-Security-Policy connect-src enforcement
+    if (tab_ctx && tab_ctx->csp.active() &&
+        !tab_ctx->csp.allows_url(ResourceKind::Connect, resolved, doc_origin, &policy_reason)) {
+        out.ok = false;
+        out.blocked_by_shield = true;
+        out.error = policy_reason;
+        ++security_blocks_;
+        return out;
+    }
+
     if (resolved.rfind("file://", 0) == 0) {
         std::string path = resolved.substr(7);
+        size_t qpos = path.find_first_of("?#");
+        if (qpos != std::string::npos) path = path.substr(0, qpos);
         std::string fbody;
         if (read_local_file(path, fbody)) {
             out.ok = true;
@@ -1222,9 +2016,24 @@ JsFetchResult BrowserApp::perform_js_fetch(const std::string& base_url,
     }
     ParsedUrl base_p = parse_url(base_url);
     std::string top_site = base_p.valid ? base_p.registrable_domain() : "";
-    HttpResponse resp = (method == "POST" || method == "post")
-                            ? http_.post(resolved, body, "application/json", top_site)
-                            : http_.get(resolved, top_site, false);
+    std::string upper_m = method.empty() ? "GET" : method;
+    std::transform(upper_m.begin(), upper_m.end(), upper_m.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    HttpResponse resp = (upper_m == "GET" && headers.empty() && body.empty())
+                            ? http_.get(resolved, top_site, false)
+                            : http_.request(upper_m, resolved, body, headers, "application/json", top_site);
+
+    // 3. Same-Origin Policy & CORS Access-Control-Allow-Origin enforcement
+    if (!resp.blocked_by_privacy && !resp.blocked_by_extension &&
+        !CorsEnforcer::allows_response(doc_origin, resolved, resp.headers, &policy_reason)) {
+        out.ok = false;
+        out.status = 0;
+        out.blocked_by_shield = true;
+        out.error = policy_reason;
+        ++security_blocks_;
+        return out;
+    }
+
     out.status = resp.status_code;
     out.body = std::move(resp.body);
     out.error = resp.error;
@@ -1287,6 +2096,9 @@ bool BrowserApp::press_enter() {
     if (active->js_vm) {
         auto rep = active->js_vm->dispatch_event(el, "submit", *active->live_doc);
         for (const auto& l : rep.logs) active->console_logs.push_back(l);
+    }
+    if (submit_form_for_element(*active, el)) {
+        return true;
     }
     relayout_live_tab(*active);
     return true;
@@ -1385,13 +2197,8 @@ bool BrowserApp::paint_active_tab(Framebuffer& fb) {
     fb.composite_display_list(
         active->cached_display_list, content_y, active->scroll_y,
         [this, base_url](const std::string& src, VideoBlitFrame& out) -> bool {
-            std::string path = src;
-            std::string resolved = HttpClient::resolve_relative_url(base_url, src);
-            if (resolved.rfind("file://", 0) == 0 && std::ifstream(resolved.substr(7))) {
-                path = resolved.substr(7);
-            } else if (!std::ifstream(path) && std::ifstream("astra/" + path)) {
-                path = "astra/" + path;
-            }
+            std::string path = resolve_media_source_to_local(base_url, src);
+            if (path.empty()) return false;
             DecodedVideoFrame df;
             if (!decode_video_via_rdd(path, video_frame_idx_, df)) return false;
             out.width = df.width;
@@ -1410,13 +2217,8 @@ bool BrowserApp::paint_active_tab(Framebuffer& fb) {
         },
         cam3d_, time3d_sec_,
         [this, base_url](const std::string& src, AudioBlitCard& out) -> bool {
-            std::string path = src;
-            std::string resolved = HttpClient::resolve_relative_url(base_url, src);
-            if (resolved.rfind("file://", 0) == 0 && std::ifstream(resolved.substr(7))) {
-                path = resolved.substr(7);
-            } else if (!std::ifstream(path) && std::ifstream("astra/" + path)) {
-                path = "astra/" + path;
-            }
+            std::string path = resolve_media_source_to_local(base_url, src);
+            if (path.empty()) return false;
             auto it = audio_cache_.find(path);
             if (it != audio_cache_.end()) {
                 out = it->second;

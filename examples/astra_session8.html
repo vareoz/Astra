@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Astra Sesión 8 — AstraSVG v1, CSS3 Flex-Wrap, REST Fetch y AstraJS v8</title>
+  <style>
+    :root {
+      --bg-canvas: #070b14;
+      --bg-surface: #0f172a;
+      --bg-elevated: #131f38;
+      --border-subtle: #1e293b;
+      --accent-sky: #38bdf8;
+      --accent-emerald: #10b981;
+      --accent-amber: #f59e0b;
+      --accent-violet: #a78bfa;
+      --text-primary: #f8fafc;
+      --text-muted: #94a3b8;
+      --radius-lg: 12px;
+    }
+
+    body {
+      background: var(--bg-canvas);
+      color: var(--text-primary);
+      padding: 16px 24px;
+      margin: 0;
+    }
+
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      box-sizing: border-box;
+      background: linear-gradient(135deg, #0f172a, #172554);
+      border: 1px solid #1e3a8a;
+      border-radius: var(--radius-lg);
+      padding: 12px 18px;
+      margin-bottom: 14px;
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+    }
+
+    .brand-left {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .brand-title {
+      color: var(--text-primary);
+      font-size: 20px;
+      font-weight: bold;
+      margin: 0 0 4px 0;
+    }
+
+    .brand-sub {
+      color: var(--text-muted);
+      font-size: 12px;
+      margin: 0;
+    }
+
+    .status-badge {
+      box-sizing: border-box;
+      width: 220px;
+      background: #064e3b;
+      border: 1px solid var(--accent-emerald);
+      border-radius: 10px;
+      padding: 9px 12px;
+      text-align: center;
+      font-family: monospace;
+      font-size: 12px;
+      font-weight: bold;
+      color: #a7f3d0;
+    }
+
+    .wrap-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    .feature-chip {
+      box-sizing: border-box;
+      width: 606px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-left: 4px solid var(--accent-sky);
+      border-radius: 10px;
+      padding: 12px 14px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+    }
+
+    .feature-chip:first-child {
+      border-left: 4px solid var(--accent-emerald);
+      background: #0c1f24;
+    }
+
+    .feature-chip:last-child {
+      border-left: 4px solid var(--accent-amber);
+      background: #1b1912;
+    }
+
+    .chip-tag {
+      font-family: monospace;
+      font-size: 11px;
+      font-weight: bold;
+      color: var(--accent-sky);
+      margin-bottom: 4px;
+    }
+
+    .chip-title {
+      font-size: 15px;
+      font-weight: bold;
+      color: var(--text-primary);
+      margin-bottom: 3px;
+    }
+
+    .chip-desc {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .main-split {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+
+    .card {
+      box-sizing: border-box;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: 14px 16px;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+    }
+
+    .card-header {
+      color: var(--accent-sky);
+      font-family: monospace;
+      font-size: 12px;
+      font-weight: bold;
+      margin-bottom: 10px;
+    }
+
+    .svg-stage {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      background: #081020;
+      border: 1px solid #1e293b;
+      border-radius: 10px;
+      padding: 10px;
+    }
+
+    .callout {
+      box-sizing: border-box;
+      background: var(--bg-elevated);
+      border-left: 4px solid var(--accent-violet);
+      border-radius: 8px;
+      padding: 10px 14px;
+      margin-bottom: 10px;
+      font-family: monospace;
+      font-size: 12px;
+      color: #e2e8f0;
+    }
+
+    .mono-row {
+      font-family: monospace;
+      font-size: 12px;
+      color: #cbd5e1;
+      margin: 6px 0;
+    }
+
+    .shifted-pill {
+      box-sizing: border-box;
+      width: 440px;
+      background: #0c4a6e;
+      border: 1px solid var(--accent-sky);
+      border-radius: 8px;
+      padding: 8px 12px;
+      margin-top: 8px;
+      transform: translate(12px, 4px);
+      font-family: monospace;
+      font-size: 12px;
+      font-weight: bold;
+      color: #e0f2fe;
+    }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="brand-left">
+      <svg width="48" height="48" viewBox="0 0 64 64">
+        <rect x="2" y="2" width="60" height="60" rx="14" fill="#0c4a6e" stroke="#38bdf8" stroke-width="3" />
+        <polygon points="32,10 52,50 32,40 12,50" fill="#38bdf8" />
+        <circle cx="32" cy="34" r="6" fill="#f8fafc" />
+      </svg>
+      <div>
+        <h1 class="brand-title">Astra Browser Core v8 — Sesión 8</h1>
+        <p class="brand-sub">AstraSVG v1 (2x2 AA Bezier) · CSS3 flex-wrap / :first-child / :last-child / border-left / transform · REST fetch · AstraJS v8</p>
+      </div>
+    </div>
+    <div class="status-badge">48 / 48 TESTS PASS</div>
+  </div>
+
+  <div class="wrap-grid">
+    <div class="feature-chip">
+      <div class="chip-tag">01 · ASTRASVG v1 (:first-child)</div>
+      <div class="chip-title">Rasterizador Vectorial Nativo</div>
+      <div class="chip-desc">viewBox, &lt;rect rx&gt;, &lt;circle&gt;, &lt;polygon&gt;, curvas Bezier Q/C</div>
+    </div>
+    <div class="feature-chip">
+      <div class="chip-tag">02 · CSS ENGINE v8</div>
+      <div class="chip-title">Flex-Wrap + Pseudo-Clases</div>
+      <div class="chip-desc">Filas automáticas, border-left acento y transform: translate()</div>
+    </div>
+    <div class="feature-chip">
+      <div class="chip-tag">03 · ASTRANET v7</div>
+      <div class="chip-title">REST Completo + Headers</div>
+      <div class="chip-desc">GET/POST/PUT/DELETE/PATCH con cabeceras personalizadas en fetch()</div>
+    </div>
+    <div class="feature-chip">
+      <div class="chip-tag">04 · ASTRAJS v8 (:last-child)</div>
+      <div class="chip-title">ES6 Destructuring &amp; Spread</div>
+      <div class="chip-desc">{ a, b }, [...arr], default params, filter/reduce/Object.entries</div>
+    </div>
+  </div>
+
+  <div class="main-split">
+    <div class="card">
+      <div class="card-header">ASTRASVG v1 — GRÁFICA VECTORIAL BEZIER 2x2 ANTI-ALIASED</div>
+      <div class="svg-stage">
+        <svg width="460" height="190" viewBox="0 0 460 190">
+          <rect x="0" y="0" width="460" height="190" rx="8" fill="#070d1a" />
+          <line x1="36" y1="30" x2="436" y2="30" stroke="#1e293b" stroke-width="1" />
+          <line x1="36" y1="80" x2="436" y2="80" stroke="#1e293b" stroke-width="1" />
+          <line x1="36" y1="130" x2="436" y2="130" stroke="#1e293b" stroke-width="1" />
+          <line x1="36" y1="162" x2="436" y2="162" stroke="#334155" stroke-width="2" />
+          <rect x="58" y="114" width="38" height="48" rx="5" fill="#1d4ed8" />
+          <rect x="132" y="92" width="38" height="70" rx="5" fill="#0284c7" />
+          <rect x="206" y="70" width="38" height="92" rx="5" fill="#0ea5e9" />
+          <rect x="280" y="52" width="38" height="110" rx="5" fill="#10b981" />
+          <rect x="354" y="34" width="38" height="128" rx="5" fill="#34d399" />
+          <path d="M 77 112 Q 150 86 225 68 Q 300 48 373 30" stroke="#f59e0b" stroke-width="3" fill="none" />
+          <circle cx="77" cy="112" r="5" fill="#fbbf24" stroke="#070d1a" stroke-width="2" />
+          <circle cx="225" cy="68" r="5" fill="#fbbf24" stroke="#070d1a" stroke-width="2" />
+          <circle cx="373" cy="30" r="6" fill="#fde047" stroke="#070d1a" stroke-width="2" />
+        </svg>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">ASTRAJS v8 — ES6 DESTRUCTURING, SPREAD Y STDLIB FUNCIONAL</div>
+      <div id="s8-js-out" class="callout">Ejecutando AstraJS v8...</div>
+      <p id="s8-arr-out" class="mono-row">Calculando filter/reduce/spread...</p>
+      <p id="s8-obj-out" class="mono-row">Inspeccionando Object.entries...</p>
+      <div id="s8-shift" class="shifted-pill">transform: translate(12px, 4px) activo</div>
+    </div>
+  </div>
+
+  <script>
+    const release = { core: "Astra", version: 8, tests: 48, rssCapGb: 2 };
+    const { core, version, tests } = release;
+    const baseMods = ["SVG", "CSS3", "REST"];
+    const allMods = [...baseMods, "ES6"];
+
+    function formatBadge(name, ver = 8, total = 48) {
+      return `${name} v${ver} · ${total} pruebas · ${allMods.join("+")}`;
+    }
+
+    const scores = [12, 18, 25, 30, 40];
+    const high = scores.filter((v) => v >= 20);
+    const totalScore = high.reduce((acc, v) => acc + v, 0);
+    const [firstMod, secondMod] = allMods;
+
+    const metrics = Object.assign({ svg: "2x2-AA", wrap: true }, { rest: "PUT/DEL" });
+    const entryText = Object.entries(metrics).map((kv) => `${kv[0]}=${kv[1]}`).join(" | ");
+
+    document.querySelector("#s8-js-out").textContent = formatBadge(core, version, tests);
+    document.querySelector("#s8-arr-out").textContent = `Spread=[${firstMod},${secondMod},...] | filter>=20 sum=${totalScore}`;
+    document.querySelector("#s8-obj-out").textContent = `Object.entries: ${entryText}`;
+  </script>
+</body>
+</html>

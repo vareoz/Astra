@@ -1,4 +1,5 @@
 #include "ipc/ipc_channel.hpp"
+#include "ipc/sandbox.hpp"
 
 #include <cerrno>
 #include <cstring>
@@ -131,8 +132,13 @@ bool WorkerProcess::spawn(const std::string& role, const std::function<void(IpcC
     if (pid < 0) return false;
 
     if (pid == 0) {
-        // Child worker process
+        // Child worker process — engage kernel seccomp-BPF + PR_SET_NO_NEW_PRIVS + rlimits
         parent_end.close();
+        if (role.rfind("rdd", 0) == 0) {
+            (void)ProcessSandbox::apply(SandboxProfile::RddMediaWorker);
+        } else {
+            (void)ProcessSandbox::apply(SandboxProfile::ContentWorker);
+        }
         worker_main(child_end);
         child_end.close();
         _exit(0);

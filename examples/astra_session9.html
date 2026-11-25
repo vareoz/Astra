@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Astra Browser Core v9 — Wikipedia/MDN Layout + SPA + Seccomp Security</title>
+  <style>
+    body {
+      background: #0b1120;
+      color: #e2e8f0;
+      margin: 0;
+      padding: 12px 24px;
+      font-size: 13px;
+    }
+    .masthead {
+      box-sizing: border-box;
+      background: linear-gradient(135deg, #0f172a, #1e3a5f);
+      border: 1px solid #2b4c7e;
+      border-radius: 10px;
+      padding: 12px 18px;
+      margin-bottom: 14px;
+    }
+    .masthead-title {
+      font-size: 20px;
+      font-weight: bold;
+      color: #f8fafc;
+      margin-bottom: 4px;
+    }
+    .masthead-title::before {
+      content: "v9 LIVE ";
+      color: #38bdf8;
+      font-family: monospace;
+      font-size: 12px;
+      font-weight: bold;
+    }
+    .masthead-title::after {
+      content: " [SECCOMP-BPF]";
+      color: #34d399;
+      font-family: monospace;
+      font-size: 11px;
+    }
+    .masthead-sub {
+      color: #94a3b8;
+      font-size: 12px;
+      margin: 0;
+    }
+    .infobox {
+      float: right;
+      width: 286px;
+      box-sizing: border-box;
+      background: #111c33;
+      border: 1px solid #273a5c;
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin-left: 16px;
+      margin-bottom: 12px;
+    }
+    .infobox-head {
+      color: #38bdf8;
+      font-family: monospace;
+      font-size: 11px;
+      font-weight: bold;
+      margin-bottom: 8px;
+      padding-bottom: 4px;
+      border-bottom: 1px solid #243656;
+    }
+    .spec-row {
+      margin-bottom: 3px;
+      font-size: 12px;
+      color: #cbd5e1;
+    }
+    .spec-k {
+      color: #7dd3fc;
+      font-weight: bold;
+    }
+    .article-col {
+      width: calc(100% - 306px);
+      box-sizing: border-box;
+    }
+    .badge-strip {
+      margin-bottom: 10px;
+    }
+    .pill-tag {
+      display: inline-block;
+      background: #172554;
+      color: #93c5fd;
+      border: 1px solid #1d4ed8;
+      border-radius: 6px;
+      padding: 4px 10px;
+      margin-right: 8px;
+      margin-bottom: 4px;
+      font-family: monospace;
+      font-size: 11px;
+      font-weight: bold;
+    }
+    .pill-tag.green {
+      background: #064e3b;
+      color: #6ee7b7;
+      border: 1px solid #059669;
+    }
+    .pill-tag.amber {
+      background: #451a03;
+      color: #fcd34d;
+      border: 1px solid #b45309;
+    }
+    table.specs {
+      width: 100%;
+      border: 1px solid #24324a;
+      background: #0f172a;
+      margin-top: 6px;
+      margin-bottom: 12px;
+    }
+    table.specs th {
+      background: #1e293b;
+      color: #7dd3fc;
+      font-family: monospace;
+      font-size: 11px;
+      padding: 6px 8px;
+      border: 1px solid #24324a;
+    }
+    table.specs td {
+      color: #e2e8f0;
+      font-size: 12px;
+      padding: 6px 8px;
+      border: 1px solid #1e293b;
+    }
+    table.specs tr:nth-child(even) {
+      background: #131f36;
+    }
+    .lower-grid {
+      clear: both;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      margin-top: 10px;
+    }
+    .card {
+      box-sizing: border-box;
+      background: #111827;
+      border: 1px solid #24324a;
+      border-radius: 10px;
+      padding: 12px 14px;
+    }
+    .card-hdr {
+      color: #38bdf8;
+      font-family: monospace;
+      font-size: 11px;
+      font-weight: bold;
+      margin-bottom: 6px;
+    }
+    .spa-line {
+      font-family: monospace;
+      font-size: 11px;
+      color: #a7f3d0;
+      margin-bottom: 4px;
+    }
+    .form-bar {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin-top: 8px;
+    }
+    .search-in {
+      width: 390px;
+      background: #0b1120;
+      color: #f8fafc;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      padding: 5px 8px;
+    }
+    .btn-go {
+      width: 118px;
+      background: #0284c7;
+      color: #ffffff;
+      border-radius: 6px;
+      padding: 6px 12px;
+      font-size: 12px;
+      font-weight: bold;
+      text-align: center;
+    }
+    iframe.demo-frame {
+      width: 100%;
+      height: 62px;
+      border: 1px solid #334155;
+      background: #0f172a;
+      border-radius: 6px;
+      margin-bottom: 6px;
+    }
+  </style>
+</head>
+<body>
+  <div class="masthead">
+    <div class="masthead-title">Astra Browser Core — Architecture Reference</div>
+    <p class="masthead-sub">Zero-dependency C++20 engine implementing Real Web Layout (tables, floats, calc, pseudo-elements, iframes, GIF/WebP, forms), AstraJS v9 (prototypes, RegExp, Date, Map/Set, SPA History), and Linux seccomp-BPF + CSP/CORS/SameSite security.</p>
+  </div>
+
+  <div class="infobox">
+    <div class="infobox-head">ENGINE SPECIFICATIONS (FLOAT: RIGHT)</div>
+    <div class="spec-row"><span class="spec-k">Layout:</span> Tables, Floats, Inline-Block, calc()</div>
+    <div class="spec-row"><span class="spec-k">JS VM:</span> Prototypes, RegExp, Date, Map/Set</div>
+    <div class="spec-row"><span class="spec-k">SPA APIs:</span> history.pushState, sessionStorage</div>
+    <div class="spec-row"><span class="spec-k">Sandbox:</span> Linux seccomp-BPF + setrlimit</div>
+    <div class="spec-row"><span class="spec-k">Policies:</span> CSP, SOP/CORS, Mixed Content</div>
+    <div class="spec-row"><span class="spec-k">Images:</span> PNG, JPEG, GIF89a LZW, WebP, SVG</div>
+  </div>
+
+  <div class="article-col">
+    <div class="badge-strip">
+      <span class="pill-tag">Hito A: Web Layout</span>
+      <span class="pill-tag green">Hito B: AstraJS v9 SPA</span>
+      <span class="pill-tag amber">Hito C: Seccomp + CSP</span>
+    </div>
+
+    <table class="specs">
+      <thead>
+        <tr>
+          <th>Milestone</th>
+          <th>Implemented Capabilities</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Hito A (Layout)</td>
+          <td>HTML table/colspan, float/clear, inline-block, calc(), :nth-child, ::before/::after, GIF/WebP, GET forms</td>
+          <td>VERIFIED</td>
+        </tr>
+        <tr>
+          <td>Hito B (JS/SPA)</td>
+          <td>[[Prototype]] chain, class extends, instanceof, RegExp, Date, Map/Set, history.pushState, sessionStorage</td>
+          <td>VERIFIED</td>
+        </tr>
+        <tr>
+          <td>Hito C (Security)</td>
+          <td>Kernel seccomp-BPF worker sandbox, CSP, Mixed Content, CORS/SOP, SameSite cookies, Site Isolation, Fuzz</td>
+          <td>VERIFIED</td>
+        </tr>
+        <tr>
+          <td colspan="3">Memory Governor Hard Cap: &lt;= 2048 MB RSS across Main + Sandboxed Content + RDD Media workers</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="lower-grid">
+    <div class="card">
+      <div class="card-hdr">EMBEDDED &lt;IFRAME SRCDOC&gt; + HTML GET FORM</div>
+      <iframe class="demo-frame" srcdoc="<html><body style='background:#0f172a;color:#cbd5e1;padding:8px;margin:0;'><div style='color:#38bdf8;font-weight:bold;font-size:12px;'>Embedded srcdoc Document</div><div style='font-size:11px;color:#94a3b8;'>Rendered recursively inside clipped iframe frame (depth-capped).</div></body></html>"></iframe>
+      <form class="form-bar" action="astra_session9.html" method="GET">
+        <input id="q" class="search-in" name="q" value="seccomp-bpf" />
+        <button id="go" type="submit" class="btn-go">Search GET</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <div class="card-hdr">ASTRAJS v9 LIVE SPA RUNTIME VERIFICATION</div>
+      <div id="spa-proto" class="spa-line">Loading prototypes...</div>
+      <div id="spa-regex" class="spa-line">Loading RegExp &amp; Date...</div>
+      <div id="spa-colls" class="spa-line">Loading Map &amp; Set...</div>
+      <div id="spa-route" class="spa-line">Loading History &amp; Storage...</div>
+    </div>
+  </div>
+
+  <script>
+    class EngineBase {
+      constructor(name) { this.name = name; }
+      describe() { return this.name + "-core"; }
+    }
+    class AstraEngine extends EngineBase {
+      constructor(name, ver) {
+        super(name);
+        this.ver = ver;
+      }
+      tag() { return this.describe() + "@v" + this.ver; }
+    }
+    const eng = new AstraEngine("astra", 9);
+    const protoOk = (eng instanceof AstraEngine) && (eng instanceof EngineBase);
+    document.querySelector("#spa-proto").textContent =
+      "Proto: " + eng.tag() + " | instanceof=" + protoOk;
+
+    const re = /astra-v(\d+)/i;
+    const m = re.exec("Build ASTRA-V9 ready");
+    const cleaned = "a1b2c3".replace(/\d/g, "#");
+    const d = new Date("2026-11-25T12:30:00Z");
+    document.querySelector("#spa-regex").textContent =
+      "RegExp: v" + m[1] + " (" + cleaned + ") | Date: " + d.getUTCFullYear() + "-11-25";
+
+    const mp = new Map();
+    mp.set("HitoA", "Layout");
+    mp.set("HitoB", "JSv9");
+    mp.set("HitoC", "Seccomp");
+    const st = new Set();
+    st.add("CSP");
+    st.add("CORS");
+    st.add("CSP");
+    let keys = "";
+    for (const k of mp.keys()) { keys = keys + k + " "; }
+    document.querySelector("#spa-colls").textContent =
+      "Map(" + mp.size + "): " + keys + "| Set(" + st.size + ")=" + st.has("CORS");
+
+    sessionStorage.setItem("astra_mode", "v9-verified");
+    history.pushState({ view: "specs" }, "", "/wiki/astra-v9?milestone=all");
+    document.querySelector("#spa-route").textContent =
+      "SPA: " + location.pathname + location.search + " | len=" + history.length + " | ss=" + sessionStorage.getItem("astra_mode");
+  </script>
+</body>
+</html>

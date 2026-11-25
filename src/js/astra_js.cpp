@@ -1,12 +1,17 @@
 #include "js/astra_js.hpp"
 #include "core/json.hpp"
 #include "gfx/font_engine.hpp"
+#include "privacy/shield.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <ctime>
 #include <functional>
+#include <iomanip>
+#include <regex>
 #include <sstream>
 
 namespace astra {
@@ -14,13 +19,13 @@ namespace astra {
 namespace {
 
 enum class TokKind {
-    Eof, Number, String, Ident,
+    Eof, Number, String, Regex, Ident,
     KwLet, KwConst, KwVar, KwFunction, KwAsync, KwAwait, KwReturn, KwIf, KwElse, KwWhile, KwFor,
     KwTry, KwCatch, KwFinally, KwThrow,
-    KwClass, KwNew, KwThis,
+    KwClass, KwExtends, KwNew, KwThis, KwInstanceOf,
     KwTrue, KwFalse, KwNull,
     LParen, RParen, LBrace, RBrace, LBracket, RBracket,
-    Comma, Semi, Dot, Colon, Question, Arrow,
+    Comma, Semi, Dot, DotDotDot, Colon, Question, Arrow,
     Plus, Minus, Star, Slash, Percent, Bang,
     Assign, Eq, Neq, Lt, Le, Gt, Ge, AndAnd, OrOr
 };
@@ -123,6 +128,53 @@ std::vector<Token> tokenize(std::string_view src) {
             size_t end = src.find("*/", i + 2);
             i = (end == std::string_view::npos) ? n : end + 2;
             continue;
+        }
+        if (c == '/') {
+            bool can_be_regex = out.empty();
+            if (!can_be_regex) {
+                TokKind pk = out.back().kind;
+                can_be_regex = (pk == TokKind::Assign || pk == TokKind::LParen || pk == TokKind::LBracket ||
+                                pk == TokKind::LBrace || pk == TokKind::Comma || pk == TokKind::Semi ||
+                                pk == TokKind::Colon || pk == TokKind::Question || pk == TokKind::Bang ||
+                                pk == TokKind::KwReturn || pk == TokKind::KwThrow || pk == TokKind::Plus ||
+                                pk == TokKind::Minus || pk == TokKind::Star || pk == TokKind::Slash ||
+                                pk == TokKind::Percent || pk == TokKind::Eq || pk == TokKind::Neq ||
+                                pk == TokKind::Lt || pk == TokKind::Le || pk == TokKind::Gt ||
+                                pk == TokKind::Ge || pk == TokKind::AndAnd || pk == TokKind::OrOr ||
+                                pk == TokKind::Arrow);
+            }
+            if (can_be_regex) {
+                size_t j = i + 1;
+                std::string pat;
+                bool in_class = false;
+                bool closed = false;
+                while (j < n && src[j] != '\n') {
+                    if (src[j] == '\\' && j + 1 < n) {
+                        pat.push_back(src[j]);
+                        pat.push_back(src[j + 1]);
+                        j += 2;
+                        continue;
+                    }
+                    if (src[j] == '[') in_class = true;
+                    else if (src[j] == ']') in_class = false;
+                    else if (src[j] == '/' && !in_class) {
+                        closed = true;
+                        ++j;
+                        break;
+                    }
+                    pat.push_back(src[j++]);
+                }
+                if (closed) {
+                    std::string flags;
+                    while (j < n && std::isalpha(static_cast<unsigned char>(src[j]))) flags.push_back(src[j++]);
+                    i = j;
+                    std::string packed = pat;
+                    packed.push_back('\0');
+                    packed += flags;
+                    out.push_back({TokKind::Regex, std::move(packed), 0.0});
+                    continue;
+                }
+            }
         }
         if (c == '`') {
             // ES6 Template Literal: desugar `a ${expr} b` into ("a " + (expr) + " b")
@@ -227,8 +279,10 @@ std::vector<Token> tokenize(std::string_view src) {
             else if (id == "finally") k = TokKind::KwFinally;
             else if (id == "throw") k = TokKind::KwThrow;
             else if (id == "class") k = TokKind::KwClass;
+            else if (id == "extends") k = TokKind::KwExtends;
             else if (id == "new") k = TokKind::KwNew;
             else if (id == "this") k = TokKind::KwThis;
+            else if (id == "instanceof") k = TokKind::KwInstanceOf;
             else if (id == "true") k = TokKind::KwTrue;
             else if (id == "false") k = TokKind::KwFalse;
             else if (id == "null") k = TokKind::KwNull;
@@ -248,6 +302,11 @@ std::vector<Token> tokenize(std::string_view src) {
         if (two == ">=") { out.push_back({TokKind::Ge, ">=", 0}); i += 2; continue; }
         if (two == "&&") { out.push_back({TokKind::AndAnd, "&&", 0}); i += 2; continue; }
         if (two == "||") { out.push_back({TokKind::OrOr, "||", 0}); i += 2; continue; }
+        if (i + 2 < src.size() && src[i] == '.' && src[i + 1] == '.' && src[i + 2] == '.') {
+            out.push_back({TokKind::DotDotDot, "...", 0});
+            i += 3;
+            continue;
+        }
 
         ++i;
         switch (c) {
@@ -350,6 +409,81 @@ private:
             return true;
         }
         if (match(TokKind::KwLet) || match(TokKind::KwConst) || match(TokKind::KwVar)) {
+            auto store_var = [&](const std::string& vname) {
+                if (in_function_) {
+                    int32_t slot = find_local(vname);
+                    if (slot < 0) {
+                        slot = static_cast<int32_t>(locals_.size());
+                        locals_.push_back(vname);
+                    }
+                    emit(OpCode::StoreLocal, slot);
+                } else {
+                    emit(OpCode::StoreGlobal, add_name(vname));
+                }
+                emit(OpCode::Pop);
+            };
+            auto load_var = [&](const std::string& vname) {
+                if (in_function_) {
+                    int32_t slot = find_local(vname);
+                    emit(OpCode::LoadLocal, slot);
+                } else {
+                    emit(OpCode::LoadGlobal, add_name(vname));
+                }
+            };
+
+            if (match(TokKind::LBrace)) {
+                // ES6 Object destructuring: const { a, b: alias } = expr;
+                std::vector<std::pair<std::string, std::string>> bindings;
+                while (!check(TokKind::RBrace) && !check(TokKind::Eof)) {
+                    if (!is_ident_or_keyword(peek().kind)) { err = "Expected property name in destructuring"; return false; }
+                    std::string prop = advance().text;
+                    std::string var = prop;
+                    if (match(TokKind::Colon)) {
+                        if (!check(TokKind::Ident)) { err = "Expected variable name after ':'"; return false; }
+                        var = advance().text;
+                    }
+                    bindings.emplace_back(std::move(prop), std::move(var));
+                    if (!match(TokKind::Comma)) break;
+                }
+                match(TokKind::RBrace);
+                if (!match(TokKind::Assign)) { err = "Expected '=' in object destructuring"; return false; }
+                if (!compile_expr(err)) return false;
+                match(TokKind::Semi);
+                std::string tmp = "__destr_" + std::to_string(chunk_->code.size());
+                store_var(tmp);
+                for (const auto& [prop, var] : bindings) {
+                    load_var(tmp);
+                    emit(OpCode::PushConst, add_const(JsValue::make_string(prop)));
+                    emit(OpCode::GetProp);
+                    store_var(var);
+                }
+                return true;
+            }
+
+            if (match(TokKind::LBracket)) {
+                // ES6 Array destructuring: const [x, y, z] = expr;
+                std::vector<std::string> vars;
+                while (!check(TokKind::RBracket) && !check(TokKind::Eof)) {
+                    if (check(TokKind::Ident)) vars.push_back(advance().text);
+                    else vars.emplace_back("");
+                    if (!match(TokKind::Comma)) break;
+                }
+                match(TokKind::RBracket);
+                if (!match(TokKind::Assign)) { err = "Expected '=' in array destructuring"; return false; }
+                if (!compile_expr(err)) return false;
+                match(TokKind::Semi);
+                std::string tmp = "__destr_" + std::to_string(chunk_->code.size());
+                store_var(tmp);
+                for (size_t idx = 0; idx < vars.size(); ++idx) {
+                    if (vars[idx].empty()) continue;
+                    load_var(tmp);
+                    emit(OpCode::PushConst, add_const(JsValue::make_number(static_cast<double>(idx))));
+                    emit(OpCode::GetProp);
+                    store_var(vars[idx]);
+                }
+                return true;
+            }
+
             if (!check(TokKind::Ident)) { err = "Expected variable name"; return false; }
             std::string name = advance().text;
             if (match(TokKind::Assign)) {
@@ -358,22 +492,17 @@ private:
                 emit(OpCode::PushConst, add_const(JsValue::make_undefined()));
             }
             match(TokKind::Semi);
-            if (in_function_) {
-                int32_t slot = find_local(name);
-                if (slot < 0) {
-                    slot = static_cast<int32_t>(locals_.size());
-                    locals_.push_back(name);
-                }
-                emit(OpCode::StoreLocal, slot);
-            } else {
-                emit(OpCode::StoreGlobal, add_name(name));
-            }
-            emit(OpCode::Pop);
+            store_var(name);
             return true;
         }
         if (match(TokKind::KwClass)) {
             if (!check(TokKind::Ident)) { err = "Expected class name"; return false; }
             std::string cname = advance().text;
+            std::string super_name;
+            if (match(TokKind::KwExtends)) {
+                if (!check(TokKind::Ident)) { err = "Expected superclass name after extends"; return false; }
+                super_name = advance().text;
+            }
             match(TokKind::LBrace);
             GcObject* cls = alloc_(GcObject::Type::Class);
             cls->fn_name = cname;
@@ -393,6 +522,12 @@ private:
             match(TokKind::RBrace);
             int32_t cidx = add_const(JsValue::make_obj(cls));
             emit(OpCode::PushConst, cidx);
+            if (!super_name.empty()) {
+                int32_t sslot = in_function_ ? find_local(super_name) : -1;
+                if (sslot >= 0) emit(OpCode::LoadLocal, sslot);
+                else emit(OpCode::LoadGlobal, add_name(super_name));
+                emit(OpCode::InheritClass);
+            }
             if (in_function_) {
                 int32_t slot = static_cast<int32_t>(locals_.size());
                 locals_.push_back(cname);
@@ -627,9 +762,29 @@ private:
         GcObject* fn = alloc_(GcObject::Type::Function);
         fn->fn_name = fname;
         fn->is_async = is_async;
+        std::vector<std::pair<int32_t, std::pair<size_t, size_t>>> default_exprs;
         match(TokKind::LParen);
         while (!check(TokKind::RParen) && !check(TokKind::Eof)) {
-            if (check(TokKind::Ident)) fn->params.push_back(advance().text);
+            if (check(TokKind::Ident)) {
+                int32_t pidx = static_cast<int32_t>(fn->params.size());
+                fn->params.push_back(advance().text);
+                if (match(TokKind::Assign)) {
+                    size_t expr_start = pos_;
+                    int depth = 0;
+                    while (pos_ < toks_.size() && !check(TokKind::Eof)) {
+                        TokKind tk = peek().kind;
+                        if (tk == TokKind::LParen || tk == TokKind::LBracket || tk == TokKind::LBrace) ++depth;
+                        else if (tk == TokKind::RParen || tk == TokKind::RBracket || tk == TokKind::RBrace) {
+                            if (depth == 0) break;
+                            --depth;
+                        } else if (tk == TokKind::Comma && depth == 0) {
+                            break;
+                        }
+                        ++pos_;
+                    }
+                    default_exprs.push_back({pidx, {expr_start, pos_}});
+                }
+            }
             if (!match(TokKind::Comma)) break;
         }
         match(TokKind::RParen);
@@ -642,6 +797,27 @@ private:
         chunk_ = &fn->chunk;
         locals_ = fn->params;
         in_function_ = true;
+
+        // Emit default parameter initializers for any parameter with '= expr'
+        size_t body_pos = pos_;
+        for (const auto& [pidx, span] : default_exprs) {
+            emit(OpCode::LoadLocal, pidx);
+            emit(OpCode::PushConst, add_const(JsValue::make_undefined()));
+            emit(OpCode::Eq);
+            size_t jskip = emit(OpCode::JumpIfFalse, 0);
+            pos_ = span.first;
+            if (!compile_expr(err)) {
+                pos_ = body_pos;
+                chunk_ = prev_chunk;
+                locals_ = prev_locals;
+                in_function_ = prev_in_fn;
+                return nullptr;
+            }
+            emit(OpCode::StoreLocal, pidx);
+            emit(OpCode::Pop);
+            chunk_->code[jskip].operand = static_cast<int32_t>(chunk_->code.size());
+        }
+        pos_ = body_pos;
 
         while (!check(TokKind::RBrace) && !check(TokKind::Eof)) {
             if (!compile_stmt(err)) {
@@ -773,13 +949,14 @@ private:
 
     bool compile_compare(std::string& err) {
         if (!compile_add(err)) return false;
-        while (check(TokKind::Lt) || check(TokKind::Le) || check(TokKind::Gt) || check(TokKind::Ge)) {
+        while (check(TokKind::Lt) || check(TokKind::Le) || check(TokKind::Gt) || check(TokKind::Ge) || check(TokKind::KwInstanceOf)) {
             TokKind k = advance().kind;
             if (!compile_add(err)) return false;
             if (k == TokKind::Lt) emit(OpCode::Lt);
             else if (k == TokKind::Le) emit(OpCode::Le);
             else if (k == TokKind::Gt) emit(OpCode::Gt);
-            else emit(OpCode::Ge);
+            else if (k == TokKind::Ge) emit(OpCode::Ge);
+            else emit(OpCode::InstanceOf);
         }
         return true;
     }
@@ -882,6 +1059,10 @@ private:
         }
         if (check(TokKind::String)) {
             emit(OpCode::PushConst, add_const(JsValue::make_string(advance().text)));
+            return true;
+        }
+        if (check(TokKind::Regex)) {
+            emit(OpCode::MakeRegExp, add_const(JsValue::make_string(advance().text)));
             return true;
         }
         if (match(TokKind::KwTrue)) {
@@ -991,6 +1172,33 @@ private:
             return true;
         }
         if (match(TokKind::LBracket)) {
+            // Check if any top-level element uses spread '...'
+            bool has_spread = false;
+            {
+                int depth = 0;
+                for (size_t k = pos_; k < toks_.size(); ++k) {
+                    TokKind tk = toks_[k].kind;
+                    if (tk == TokKind::LBracket || tk == TokKind::LParen || tk == TokKind::LBrace) ++depth;
+                    else if (tk == TokKind::RBracket || tk == TokKind::RParen || tk == TokKind::RBrace) {
+                        if (depth == 0) break;
+                        --depth;
+                    } else if (tk == TokKind::DotDotDot && depth == 0) {
+                        has_spread = true;
+                        break;
+                    }
+                }
+            }
+            if (has_spread) {
+                emit(OpCode::MakeArray, 0);
+                while (!check(TokKind::RBracket) && !check(TokKind::Eof)) {
+                    bool is_sp = match(TokKind::DotDotDot);
+                    if (!compile_expr(err)) return false;
+                    emit(OpCode::ArrayPush, is_sp ? 1 : 0);
+                    if (!match(TokKind::Comma)) break;
+                }
+                match(TokKind::RBracket);
+                return true;
+            }
             int32_t count = 0;
             while (!check(TokKind::RBracket) && !check(TokKind::Eof)) {
                 if (!compile_expr(err)) return false;
@@ -1005,11 +1213,20 @@ private:
             int32_t count = 0;
             while (!check(TokKind::RBrace) && !check(TokKind::Eof)) {
                 std::string key;
-                if (is_ident_or_keyword(peek().kind) || check(TokKind::String)) key = advance().text;
+                bool was_ident = is_ident_or_keyword(peek().kind);
+                if (was_ident || check(TokKind::String)) key = advance().text;
                 else { err = "Expected object key"; return false; }
-                match(TokKind::Colon);
                 emit(OpCode::PushConst, add_const(JsValue::make_string(key)));
-                if (!compile_expr(err)) return false;
+                if (match(TokKind::Colon)) {
+                    if (!compile_expr(err)) return false;
+                } else if (was_ident) {
+                    // ES6 shorthand property: { key } -> { key: key }
+                    int32_t slot = in_function_ ? find_local(key) : -1;
+                    if (slot >= 0) emit(OpCode::LoadLocal, slot);
+                    else emit(OpCode::LoadGlobal, add_name(key));
+                } else {
+                    emit(OpCode::PushConst, add_const(JsValue::make_undefined()));
+                }
                 ++count;
                 if (!match(TokKind::Comma)) break;
             }
@@ -1380,6 +1597,14 @@ void AstraJsEngine::bind_fetch(FetchFn fetcher) {
     fetch_fn_ = std::move(fetcher);
 }
 
+void AstraJsEngine::bind_history(HistoryFn on_history, std::string initial_url) {
+    history_fn_ = std::move(on_history);
+    current_url_ = initial_url.empty() ? "about:blank" : std::move(initial_url);
+    history_entries_.clear();
+    history_entries_.emplace_back(current_url_, JsValue::make_null());
+    history_index_ = 0;
+}
+
 GcObject* AstraJsEngine::alloc_object(GcObject::Type type) {
     GcObject* o = new GcObject();
     o->type = type;
@@ -1398,8 +1623,12 @@ void AstraJsEngine::mark_object(GcObject* o) {
     if (!o || o->marked) return;
     o->marked = true;
     if (o->proto_class) mark_object(o->proto_class);
+    if (o->proto_obj) mark_object(o->proto_obj);
+    if (o->fn_prototype) mark_object(o->fn_prototype);
     for (const auto& e : o->elements) mark_value(e);
     for (const auto& [k, v] : o->props) mark_value(v);
+    for (const auto& [k, v] : o->map_entries) { mark_value(k); mark_value(v); }
+    for (const auto& v : o->set_entries) mark_value(v);
     for (const auto& c : o->chunk.constants) mark_value(c);
     if (o->closure_env) {
         for (const auto& [k, v] : *o->closure_env) mark_value(v);
@@ -1504,6 +1733,7 @@ size_t AstraJsEngine::gc_collect() {
     for (const auto& [key, vec] : listeners_) {
         for (const auto& cb : vec) mark_value(cb);
     }
+    for (const auto& [u, st] : history_entries_) mark_value(st);
 
     size_t freed = 0;
     std::vector<GcObject*> alive;
@@ -1557,15 +1787,22 @@ JsValue AstraJsEngine::invoke_callable(const JsValue& fn,
             std::string url = args[0].to_string();
             std::string method = "GET";
             std::string body;
+            std::vector<std::pair<std::string, std::string>> headers;
             if (args.size() >= 2 && args[1].kind == JsValue::Kind::Object && args[1].obj) {
                 auto mit = args[1].obj->props.find("method");
                 if (mit != args[1].obj->props.end()) method = mit->second.to_string();
                 auto bit = args[1].obj->props.find("body");
                 if (bit != args[1].obj->props.end()) body = bit->second.to_string();
+                auto hit = args[1].obj->props.find("headers");
+                if (hit != args[1].obj->props.end() && hit->second.kind == JsValue::Kind::Object && hit->second.obj) {
+                    for (const auto& [hk, hv] : hit->second.obj->props) {
+                        headers.emplace_back(hk, hv.to_string());
+                    }
+                }
             }
             JsFetchResult fr;
             if (fetch_fn_) {
-                fr = fetch_fn_(url, method, body);
+                fr = fetch_fn_(url, method, body, headers);
             } else {
                 fr.error = "No network transport bound";
             }
@@ -1578,6 +1815,124 @@ JsValue AstraJsEngine::invoke_callable(const JsValue& fn,
             resp->props["blockedByShield"] = JsValue::make_bool(fr.blocked_by_shield);
             resp->props["__is_fetch_resp__"] = JsValue::make_bool(true);
             return JsValue::make_obj(resp);
+        }
+        if (fn.sval == "__setInterval__" && !args.empty()) {
+            int64_t delay = args.size() > 1 ? static_cast<int64_t>(args[1].to_number()) : 0;
+            timers_.push_back({delay, args[0]});
+            return JsValue::make_number(static_cast<double>(timers_.size()));
+        }
+        if (fn.sval == "__clearTimeout__" || fn.sval == "__clearInterval__" || fn.sval == "__cancelAnimationFrame__") {
+            return JsValue::make_undefined();
+        }
+        if (fn.sval == "__encodeURIComponent__" && !args.empty()) {
+            static constexpr char kHex[] = "0123456789ABCDEF";
+            std::string s = args[0].to_string();
+            std::string out;
+            out.reserve(s.size() * 2);
+            for (unsigned char c : s) {
+                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                    c == '-' || c == '_' || c == '.' || c == '!' || c == '~' || c == '*' || c == '\'' || c == '(' || c == ')') {
+                    out.push_back(static_cast<char>(c));
+                } else {
+                    out.push_back('%');
+                    out.push_back(kHex[(c >> 4) & 0xF]);
+                    out.push_back(kHex[c & 0xF]);
+                }
+            }
+            return JsValue::make_string(std::move(out));
+        }
+        if (fn.sval == "__decodeURIComponent__" && !args.empty()) {
+            auto hv = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            std::string s = args[0].to_string();
+            std::string out;
+            out.reserve(s.size());
+            for (size_t i = 0; i < s.size(); ++i) {
+                if (s[i] == '%' && i + 2 < s.size()) {
+                    int hi = hv(s[i + 1]), lo = hv(s[i + 2]);
+                    if (hi >= 0 && lo >= 0) {
+                        out.push_back(static_cast<char>((hi << 4) | lo));
+                        i += 2;
+                        continue;
+                    }
+                }
+                out.push_back(s[i]);
+            }
+            return JsValue::make_string(std::move(out));
+        }
+        if (fn.sval == "__btoa__" && !args.empty()) {
+            static constexpr char kB64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            std::string s = args[0].to_string();
+            std::string out;
+            int val = 0, valb = -6;
+            for (unsigned char c : s) {
+                val = (val << 8) + c;
+                valb += 8;
+                while (valb >= 0) {
+                    out.push_back(kB64[(val >> valb) & 0x3F]);
+                    valb -= 6;
+                }
+            }
+            if (valb > -6) out.push_back(kB64[((val << 8) >> (valb + 8)) & 0x3F]);
+            while (out.size() % 4) out.push_back('=');
+            return JsValue::make_string(std::move(out));
+        }
+        if (fn.sval == "__atob__" && !args.empty()) {
+            static const int8_t kDec[256] = {
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+                -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+                -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+            };
+            std::string s = args[0].to_string();
+            std::string out;
+            int val = 0, valb = -8;
+            for (unsigned char c : s) {
+                if (c == '=') break;
+                int8_t d = kDec[c];
+                if (d == -1) continue;
+                val = (val << 6) + d;
+                valb += 6;
+                if (valb >= 0) {
+                    out.push_back(static_cast<char>((val >> valb) & 0xFF));
+                    valb -= 8;
+                }
+            }
+            return JsValue::make_string(std::move(out));
+        }
+        if (fn.sval == "__parseInt__" && !args.empty()) {
+            int radix = args.size() >= 2 ? static_cast<int>(args[1].to_number()) : 10;
+            if (radix < 2 || radix > 36) radix = 10;
+            return JsValue::make_number(static_cast<double>(std::strtoll(args[0].to_string().c_str(), nullptr, radix)));
+        }
+        if (fn.sval == "__parseFloat__" && !args.empty()) {
+            return JsValue::make_number(std::strtod(args[0].to_string().c_str(), nullptr));
+        }
+        if (fn.sval == "__isNaN__" && !args.empty()) {
+            return JsValue::make_bool(std::isnan(args[0].to_number()));
+        }
+        if (fn.sval == "__Number__") {
+            return JsValue::make_number(args.empty() ? 0.0 : args[0].to_number());
+        }
+        if (fn.sval == "__String__") {
+            return JsValue::make_string(args.empty() ? "" : args[0].to_string());
+        }
+        if (fn.sval == "__Boolean__") {
+            return JsValue::make_bool(!args.empty() && args[0].truthy());
+        }
+        if (fn.sval == "__builtin_Error__" || fn.sval == "__builtin_TypeError__") {
+            GcObject* err = alloc_object(GcObject::Type::Map);
+            err->props["name"] = JsValue::make_string(fn.sval == "__builtin_TypeError__" ? "TypeError" : "Error");
+            err->props["message"] = JsValue::make_string(args.empty() ? "" : args[0].to_string());
+            return JsValue::make_obj(err);
         }
         return JsValue::make_undefined();
     }
@@ -1705,15 +2060,52 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                 const std::string& name = chunk.names[static_cast<size_t>(ins.operand)];
                 if (name == "document" || name == "console" || name == "astra" ||
                     name == "Math" || name == "JSON" || name == "localStorage" ||
+                    name == "sessionStorage" || name == "history" || name == "location" ||
                     name == "Promise" || name == "chrome" || name == "browser" ||
-                    name == "WebSocket") {
+                    name == "WebSocket" || name == "Object" || name == "RegExp" ||
+                    name == "Date" || name == "Map" || name == "Set" || name == "Array" ||
+                    name == "navigator" || name == "performance" || name == "URL" ||
+                    name == "URLSearchParams" || name == "Error" || name == "TypeError" ||
+                    name == "AbortController" || name == "super") {
                     stack_.push_back(JsValue::make_string("__builtin_" + name + "__"));
+                } else if (name == "window" || name == "self" || name == "globalThis") {
+                    stack_.push_back(JsValue::make_string("__builtin_window__"));
+                } else if (name == "MutationObserver" || name == "IntersectionObserver" || name == "ResizeObserver") {
+                    stack_.push_back(JsValue::make_string("__builtin_Observer__"));
                 } else if (name == "queueMicrotask") {
                     stack_.push_back(JsValue::make_string("__queueMicrotask__"));
                 } else if (name == "setTimeout") {
                     stack_.push_back(JsValue::make_string("__setTimeout__"));
+                } else if (name == "setInterval") {
+                    stack_.push_back(JsValue::make_string("__setInterval__"));
+                } else if (name == "clearTimeout") {
+                    stack_.push_back(JsValue::make_string("__clearTimeout__"));
+                } else if (name == "clearInterval") {
+                    stack_.push_back(JsValue::make_string("__clearInterval__"));
+                } else if (name == "cancelAnimationFrame") {
+                    stack_.push_back(JsValue::make_string("__cancelAnimationFrame__"));
                 } else if (name == "requestAnimationFrame") {
                     stack_.push_back(JsValue::make_string("__requestAnimationFrame__"));
+                } else if (name == "encodeURIComponent") {
+                    stack_.push_back(JsValue::make_string("__encodeURIComponent__"));
+                } else if (name == "decodeURIComponent") {
+                    stack_.push_back(JsValue::make_string("__decodeURIComponent__"));
+                } else if (name == "btoa") {
+                    stack_.push_back(JsValue::make_string("__btoa__"));
+                } else if (name == "atob") {
+                    stack_.push_back(JsValue::make_string("__atob__"));
+                } else if (name == "parseInt") {
+                    stack_.push_back(JsValue::make_string("__parseInt__"));
+                } else if (name == "parseFloat") {
+                    stack_.push_back(JsValue::make_string("__parseFloat__"));
+                } else if (name == "isNaN") {
+                    stack_.push_back(JsValue::make_string("__isNaN__"));
+                } else if (name == "Number") {
+                    stack_.push_back(JsValue::make_string("__Number__"));
+                } else if (name == "String") {
+                    stack_.push_back(JsValue::make_string("__String__"));
+                } else if (name == "Boolean") {
+                    stack_.push_back(JsValue::make_string("__Boolean__"));
                 } else if (name == "gc") {
                     stack_.push_back(JsValue::make_string("__gc__"));
                 } else if (name == "fetch") {
@@ -1772,6 +2164,56 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
             case OpCode::Le: { JsValue b = pop(), a = pop(); stack_.push_back(JsValue::make_bool(a.to_number() <= b.to_number())); break; }
             case OpCode::Gt: { JsValue b = pop(), a = pop(); stack_.push_back(JsValue::make_bool(a.to_number() > b.to_number())); break; }
             case OpCode::Ge: { JsValue b = pop(), a = pop(); stack_.push_back(JsValue::make_bool(a.to_number() >= b.to_number())); break; }
+            case OpCode::InstanceOf: {
+                JsValue rhs = pop(), lhs = pop();
+                bool match = false;
+                if (lhs.kind == JsValue::Kind::Object && lhs.obj) {
+                    if (rhs.kind == JsValue::Kind::String) {
+                        if (rhs.sval == "__builtin_RegExp__") match = (lhs.obj->type == GcObject::Type::RegExp);
+                        else if (rhs.sval == "__builtin_Date__") match = (lhs.obj->type == GcObject::Type::Date);
+                        else if (rhs.sval == "__builtin_Map__") match = (lhs.obj->type == GcObject::Type::JsMap);
+                        else if (rhs.sval == "__builtin_Set__") match = (lhs.obj->type == GcObject::Type::JsSet);
+                        else if (rhs.sval == "__builtin_Array__") match = (lhs.obj->type == GcObject::Type::Array);
+                        else if (rhs.sval == "__builtin_Promise__") match = (lhs.obj->type == GcObject::Type::Promise);
+                        else if (rhs.sval == "__builtin_Object__") match = true;
+                    } else if (rhs.kind == JsValue::Kind::Object && rhs.obj) {
+                        GcObject* target_proto = rhs.obj->fn_prototype ? rhs.obj->fn_prototype : rhs.obj;
+                        GcObject* cur_p = lhs.obj->proto_obj;
+                        for (int depth = 0; cur_p && depth < 32; ++depth) {
+                            if (cur_p == target_proto || cur_p == rhs.obj) { match = true; break; }
+                            cur_p = cur_p->proto_obj ? cur_p->proto_obj : cur_p->proto_class;
+                        }
+                        if (!match) {
+                            GcObject* cur_c = lhs.obj->proto_class;
+                            for (int depth = 0; cur_c && depth < 32; ++depth) {
+                                if (cur_c == rhs.obj || cur_c == target_proto) { match = true; break; }
+                                cur_c = cur_c->proto_class ? cur_c->proto_class : cur_c->proto_obj;
+                            }
+                        }
+                    }
+                }
+                stack_.push_back(JsValue::make_bool(match));
+                break;
+            }
+            case OpCode::MakeRegExp: {
+                const std::string& packed = chunk.constants[static_cast<size_t>(ins.operand)].sval;
+                size_t z = packed.find('\0');
+                GcObject* re = alloc_object(GcObject::Type::RegExp);
+                re->regex_pattern = (z == std::string::npos) ? packed : packed.substr(0, z);
+                re->regex_flags = (z == std::string::npos) ? "" : packed.substr(z + 1);
+                stack_.push_back(JsValue::make_obj(re));
+                break;
+            }
+            case OpCode::InheritClass: {
+                JsValue sup = pop();
+                JsValue sub = stack_.empty() ? JsValue::make_undefined() : stack_.back();
+                if (sub.kind == JsValue::Kind::Object && sub.obj &&
+                    sup.kind == JsValue::Kind::Object && sup.obj) {
+                    sub.obj->proto_class = sup.obj;
+                    sub.obj->proto_obj = sup.obj->fn_prototype ? sup.obj->fn_prototype : sup.obj;
+                }
+                break;
+            }
             case OpCode::Jump:
                 ip = static_cast<size_t>(ins.operand);
                 break;
@@ -1786,6 +2228,23 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                 arr->elements.resize(static_cast<size_t>(cnt));
                 for (int32_t i = cnt - 1; i >= 0; --i) arr->elements[static_cast<size_t>(i)] = pop();
                 stack_.push_back(JsValue::make_obj(arr));
+                break;
+            }
+            case OpCode::ArrayPush: {
+                JsValue item = pop();
+                JsValue arr_v = pop();
+                if (arr_v.kind == JsValue::Kind::Object && arr_v.obj && arr_v.obj->type == GcObject::Type::Array) {
+                    if (ins.operand == 1) {
+                        if (item.kind == JsValue::Kind::Object && item.obj && item.obj->type == GcObject::Type::Array) {
+                            for (const auto& el : item.obj->elements) arr_v.obj->elements.push_back(el);
+                        } else if (item.kind == JsValue::Kind::String) {
+                            for (char c : item.sval) arr_v.obj->elements.push_back(JsValue::make_string(std::string(1, c)));
+                        }
+                    } else {
+                        arr_v.obj->elements.push_back(std::move(item));
+                    }
+                }
+                stack_.push_back(arr_v);
                 break;
             }
             case OpCode::MakeObject: {
@@ -1808,16 +2267,109 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                     stack_.push_back(JsValue::make_string("__builtin_astra_storage__"));
                 } else if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_astra_storage__" && k == "local") {
                     stack_.push_back(JsValue::make_string("__builtin_astra_storage__"));
-                } else if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_document__" && k == "title") {
-                    stack_.push_back(JsValue::make_string(doc.title()));
+                } else if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_window__") {
+                    if (k == "window" || k == "self" || k == "globalThis") stack_.push_back(JsValue::make_string("__builtin_window__"));
+                    else if (k == "document") stack_.push_back(JsValue::make_string("__builtin_document__"));
+                    else if (k == "location") stack_.push_back(JsValue::make_string("__builtin_location__"));
+                    else if (k == "history") stack_.push_back(JsValue::make_string("__builtin_history__"));
+                    else if (k == "localStorage") stack_.push_back(JsValue::make_string("__builtin_localStorage__"));
+                    else if (k == "sessionStorage") stack_.push_back(JsValue::make_string("__builtin_sessionStorage__"));
+                    else if (k == "navigator") stack_.push_back(JsValue::make_string("__builtin_navigator__"));
+                    else if (k == "performance") stack_.push_back(JsValue::make_string("__builtin_performance__"));
+                    else if (k == "console") stack_.push_back(JsValue::make_string("__builtin_console__"));
+                    else if (k == "innerWidth") stack_.push_back(JsValue::make_number(1280.0));
+                    else if (k == "innerHeight") stack_.push_back(JsValue::make_number(636.0));
+                    else if (k == "devicePixelRatio") stack_.push_back(JsValue::make_number(1.0));
+                    else {
+                        auto git = globals_.find(k);
+                        stack_.push_back(git != globals_.end() ? git->second : JsValue::make_undefined());
+                    }
+                } else if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_navigator__") {
+                    if (k == "userAgent") stack_.push_back(JsValue::make_string("Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0"));
+                    else if (k == "language") stack_.push_back(JsValue::make_string("en-US"));
+                    else if (k == "platform") stack_.push_back(JsValue::make_string("Linux x86_64"));
+                    else if (k == "onLine" || k == "cookieEnabled") stack_.push_back(JsValue::make_bool(true));
+                    else stack_.push_back(JsValue::make_undefined());
+                } else if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_document__") {
+                    if (k == "title") stack_.push_back(JsValue::make_string(doc.title()));
+                    else if (k == "body") stack_.push_back(JsValue::make_dom(doc.body()));
+                    else if (k == "head") stack_.push_back(JsValue::make_dom(doc.query_selector("head")));
+                    else if (k == "documentElement") stack_.push_back(JsValue::make_dom(doc.query_selector("html") ? doc.query_selector("html") : doc.root()));
+                    else if (k == "readyState") stack_.push_back(JsValue::make_string("complete"));
+                    else if (k == "URL") stack_.push_back(JsValue::make_string(current_url_));
+                    else if (k == "location") stack_.push_back(JsValue::make_string("__builtin_location__"));
+                    else stack_.push_back(JsValue::make_undefined());
                 } else if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_Math__" && k == "PI") {
                     stack_.push_back(JsValue::make_number(3.14159265358979323846));
+                } else if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_history__") {
+                    if (k == "length") {
+                        stack_.push_back(JsValue::make_number(static_cast<double>(history_entries_.size())));
+                    } else if (k == "state") {
+                        if (history_index_ >= 0 && static_cast<size_t>(history_index_) < history_entries_.size()) {
+                            stack_.push_back(history_entries_[static_cast<size_t>(history_index_)].second);
+                        } else {
+                            stack_.push_back(JsValue::make_null());
+                        }
+                    } else {
+                        stack_.push_back(JsValue::make_undefined());
+                    }
+                } else if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_location__") {
+                    ParsedUrl pu = parse_url(current_url_);
+                    if (k == "href") stack_.push_back(JsValue::make_string(current_url_));
+                    else if (k == "protocol") stack_.push_back(JsValue::make_string(pu.scheme.empty() ? "" : (pu.scheme + ":")));
+                    else if (k == "pathname") stack_.push_back(JsValue::make_string(pu.path.empty() ? "/" : pu.path));
+                    else if (k == "search") stack_.push_back(JsValue::make_string(pu.query.empty() ? "" : ("?" + pu.query)));
+                    else if (k == "hash") stack_.push_back(JsValue::make_string(pu.fragment.empty() ? "" : ("#" + pu.fragment)));
+                    else if (k == "origin") stack_.push_back(JsValue::make_string(pu.origin()));
+                    else if (k == "hostname" || k == "host") stack_.push_back(JsValue::make_string(pu.host));
+                    else stack_.push_back(JsValue::make_undefined());
+                } else if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_sessionStorage__" && k == "length") {
+                    stack_.push_back(JsValue::make_number(static_cast<double>(session_storage_.size())));
                 } else if (obj.kind == JsValue::Kind::DomRef && obj.node) {
-                    if (k == "textContent") stack_.push_back(JsValue::make_string(obj.node->text_content()));
+                    if (k == "textContent" || k == "innerText") stack_.push_back(JsValue::make_string(obj.node->text_content()));
                     else if (k == "innerHTML") stack_.push_back(JsValue::make_string(obj.node->inner_html()));
-                    else if (k == "tagName") stack_.push_back(JsValue::make_string(obj.node->tag));
+                    else if (k == "tagName" || k == "nodeName") stack_.push_back(JsValue::make_string(obj.node->tag));
+                    else if (k == "id") stack_.push_back(JsValue::make_string(obj.node->get_attr("id")));
                     else if (k == "className") stack_.push_back(JsValue::make_string(obj.node->get_attr("class")));
-                    else if (obj.node->tag == "canvas" && (k == "width" || k == "height")) {
+                    else if (k == "parentNode" || k == "parentElement") stack_.push_back(obj.node->parent ? JsValue::make_dom(obj.node->parent) : JsValue::make_null());
+                    else if (k == "firstChild") stack_.push_back(obj.node->children.empty() ? JsValue::make_null() : JsValue::make_dom(obj.node->children.front()));
+                    else if (k == "lastChild") stack_.push_back(obj.node->children.empty() ? JsValue::make_null() : JsValue::make_dom(obj.node->children.back()));
+                    else if (k == "children") {
+                        GcObject* arr = alloc_object(GcObject::Type::Array);
+                        for (DomNode* ch : obj.node->children) {
+                            if (ch->type == NodeType::Element) arr->elements.push_back(JsValue::make_dom(ch));
+                        }
+                        stack_.push_back(JsValue::make_obj(arr));
+                    } else if (k == "nextSibling") {
+                        DomNode* next_s = nullptr;
+                        if (obj.node->parent) {
+                            const auto& sibs = obj.node->parent->children;
+                            for (size_t si = 0; si + 1 < sibs.size(); ++si) {
+                                if (sibs[si] == obj.node) { next_s = sibs[si + 1]; break; }
+                            }
+                        }
+                        stack_.push_back(next_s ? JsValue::make_dom(next_s) : JsValue::make_null());
+                    } else if ((obj.node->tag == "video" || obj.node->tag == "audio") &&
+                               (k == "paused" || k == "muted" || k == "currentTime" || k == "duration" || k == "volume" || k == "readyState")) {
+                        if (k == "paused") {
+                            std::string pv = obj.node->get_attr("data-astra-paused");
+                            stack_.push_back(JsValue::make_bool(pv != "0"));
+                        } else if (k == "muted") {
+                            std::string mv = obj.node->get_attr("data-astra-muted");
+                            stack_.push_back(JsValue::make_bool(mv == "1" || obj.node->has_attr("muted")));
+                        } else if (k == "currentTime") {
+                            std::string ct = obj.node->get_attr("data-astra-current-time");
+                            stack_.push_back(JsValue::make_number(ct.empty() ? 0.0 : std::strtod(ct.c_str(), nullptr)));
+                        } else if (k == "duration") {
+                            std::string du = obj.node->get_attr("data-astra-duration");
+                            stack_.push_back(JsValue::make_number(du.empty() ? 120.0 : std::strtod(du.c_str(), nullptr)));
+                        } else if (k == "volume") {
+                            std::string vo = obj.node->get_attr("data-astra-volume");
+                            stack_.push_back(JsValue::make_number(vo.empty() ? 1.0 : std::strtod(vo.c_str(), nullptr)));
+                        } else {
+                            stack_.push_back(JsValue::make_number(4.0));
+                        }
+                    } else if (obj.node->tag == "canvas" && (k == "width" || k == "height")) {
                         std::string cid = obj.node->get_attr("id");
                         if (cid.empty()) cid = "canvas";
                         auto cit = canvases_.find(cid);
@@ -1838,12 +2390,59 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                         stack_.push_back(JsValue::make_obj(sp));
                     } else stack_.push_back(JsValue::make_string(obj.node->get_attr(k)));
                 } else if (obj.kind == JsValue::Kind::Object && obj.obj) {
-                    if (obj.obj->type == GcObject::Type::Array) {
+                    if (k == "__proto__") {
+                        GcObject* p = obj.obj->proto_obj ? obj.obj->proto_obj : obj.obj->proto_class;
+                        stack_.push_back(p ? JsValue::make_obj(p) : JsValue::make_null());
+                    } else if (k == "prototype" && (obj.obj->type == GcObject::Type::Function || obj.obj->type == GcObject::Type::Class)) {
+                        if (!obj.obj->fn_prototype) {
+                            obj.obj->fn_prototype = alloc_object(GcObject::Type::Map);
+                            if (obj.obj->type == GcObject::Type::Class && obj.obj->proto_class) {
+                                obj.obj->fn_prototype->proto_obj = obj.obj->proto_class;
+                            }
+                        }
+                        stack_.push_back(JsValue::make_obj(obj.obj->fn_prototype));
+                    } else if (obj.obj->type == GcObject::Type::Array) {
                         if (k == "length") {
                             stack_.push_back(JsValue::make_number(static_cast<double>(obj.obj->elements.size())));
                         } else {
-                            size_t idx = static_cast<size_t>(std::max(0.0, key.to_number()));
-                            stack_.push_back(idx < obj.obj->elements.size() ? obj.obj->elements[idx] : JsValue::make_undefined());
+                            auto pit = obj.obj->props.find(k);
+                            if (pit != obj.obj->props.end()) {
+                                stack_.push_back(pit->second);
+                            } else {
+                                size_t idx = static_cast<size_t>(std::max(0.0, key.to_number()));
+                                stack_.push_back(idx < obj.obj->elements.size() ? obj.obj->elements[idx] : JsValue::make_undefined());
+                            }
+                        }
+                    } else if (obj.obj->type == GcObject::Type::RegExp) {
+                        if (k == "source") stack_.push_back(JsValue::make_string(obj.obj->regex_pattern));
+                        else if (k == "flags") stack_.push_back(JsValue::make_string(obj.obj->regex_flags));
+                        else if (k == "global") stack_.push_back(JsValue::make_bool(obj.obj->regex_flags.find('g') != std::string::npos));
+                        else if (k == "ignoreCase") stack_.push_back(JsValue::make_bool(obj.obj->regex_flags.find('i') != std::string::npos));
+                        else stack_.push_back(JsValue::make_undefined());
+                    } else if (obj.obj->type == GcObject::Type::JsMap) {
+                        if (k == "size" || k == "length") {
+                            stack_.push_back(JsValue::make_number(static_cast<double>(obj.obj->map_entries.size())));
+                        } else if (key.kind == JsValue::Kind::Number) {
+                            size_t idx = static_cast<size_t>(std::max(0.0, key.nval));
+                            if (idx < obj.obj->map_entries.size()) {
+                                GcObject* pair = alloc_object(GcObject::Type::Array);
+                                pair->elements.push_back(obj.obj->map_entries[idx].first);
+                                pair->elements.push_back(obj.obj->map_entries[idx].second);
+                                stack_.push_back(JsValue::make_obj(pair));
+                            } else {
+                                stack_.push_back(JsValue::make_undefined());
+                            }
+                        } else {
+                            stack_.push_back(JsValue::make_undefined());
+                        }
+                    } else if (obj.obj->type == GcObject::Type::JsSet) {
+                        if (k == "size" || k == "length") {
+                            stack_.push_back(JsValue::make_number(static_cast<double>(obj.obj->set_entries.size())));
+                        } else if (key.kind == JsValue::Kind::Number) {
+                            size_t idx = static_cast<size_t>(std::max(0.0, key.nval));
+                            stack_.push_back(idx < obj.obj->set_entries.size() ? obj.obj->set_entries[idx] : JsValue::make_undefined());
+                        } else {
+                            stack_.push_back(JsValue::make_undefined());
                         }
                     } else if (obj.obj->type == GcObject::Type::StyleProxy && obj.obj->style_node) {
                         stack_.push_back(JsValue::make_string(get_inline_css_prop(obj.obj->style_node, k)));
@@ -1870,14 +2469,19 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                             stack_.push_back(it != obj.obj->props.end() ? it->second : JsValue::make_undefined());
                         }
                     } else {
-                        auto it = obj.obj->props.find(k);
-                        if (it != obj.obj->props.end()) {
-                            stack_.push_back(it->second);
-                        } else if (obj.obj->proto_class && obj.obj->proto_class->props.count(k) > 0) {
-                            stack_.push_back(obj.obj->proto_class->props[k]);
-                        } else {
-                            stack_.push_back(JsValue::make_undefined());
+                        // Real [[Prototype]] chain lookup (up to 32 hops)
+                        JsValue found_val = JsValue::make_undefined();
+                        GcObject* cur = obj.obj;
+                        for (int hop = 0; cur && hop < 32; ++hop) {
+                            auto it = cur->props.find(k);
+                            if (it != cur->props.end()) { found_val = it->second; break; }
+                            if (cur->fn_prototype && cur->fn_prototype->props.count(k) > 0) {
+                                found_val = cur->fn_prototype->props[k];
+                                break;
+                            }
+                            cur = cur->proto_obj ? cur->proto_obj : cur->proto_class;
                         }
+                        stack_.push_back(found_val);
                     }
                 } else if (obj.kind == JsValue::Kind::String) {
                     if (k == "length") {
@@ -1898,17 +2502,38 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
             case OpCode::SetProp: {
                 JsValue val = pop(), key = pop(), obj = pop();
                 std::string k = key.to_string();
-                if (obj.kind == JsValue::Kind::DomRef && obj.node) {
-                    if (k == "textContent") obj.node->set_text_content(doc.arena(), val.to_string());
+                if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_window__") {
+                    globals_[k] = val;
+                } else if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_document__" && k == "title") {
+                    if (DomNode* t = doc.query_selector("title")) t->set_text_content(doc.arena(), val.to_string());
+                } else if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_location__" && k == "href") {
+                    current_url_ = val.to_string();
+                    if (history_fn_) history_fn_(current_url_, false);
+                } else if (obj.kind == JsValue::Kind::DomRef && obj.node) {
+                    if (k == "textContent" || k == "innerText") obj.node->set_text_content(doc.arena(), val.to_string());
                     else if (k == "innerHTML") obj.node->set_inner_html(doc.arena(), val.to_string());
                     else if (k == "className") obj.node->set_attr("class", val.to_string());
                     else if (k == "style") obj.node->set_attr("style", val.to_string());
-                    else obj.node->set_attr(k, val.to_string());
+                    else if ((obj.node->tag == "video" || obj.node->tag == "audio") && k == "currentTime") {
+                        obj.node->set_attr("data-astra-current-time", val.to_string());
+                    } else if ((obj.node->tag == "video" || obj.node->tag == "audio") && k == "muted") {
+                        obj.node->set_attr("data-astra-muted", val.truthy() ? "1" : "0");
+                    } else if ((obj.node->tag == "video" || obj.node->tag == "audio") && k == "volume") {
+                        obj.node->set_attr("data-astra-volume", val.to_string());
+                    } else obj.node->set_attr(k, val.to_string());
                 } else if (obj.kind == JsValue::Kind::Object && obj.obj) {
-                    if (obj.obj->type == GcObject::Type::Array) {
-                        size_t idx = static_cast<size_t>(std::max(0.0, key.to_number()));
-                        if (idx >= obj.obj->elements.size()) obj.obj->elements.resize(idx + 1, JsValue::make_undefined());
-                        obj.obj->elements[idx] = val;
+                    if (k == "__proto__") {
+                        obj.obj->proto_obj = (val.kind == JsValue::Kind::Object) ? val.obj : nullptr;
+                    } else if (k == "prototype" && (obj.obj->type == GcObject::Type::Function || obj.obj->type == GcObject::Type::Class)) {
+                        if (val.kind == JsValue::Kind::Object) obj.obj->fn_prototype = val.obj;
+                    } else if (obj.obj->type == GcObject::Type::Array) {
+                        if (key.kind == JsValue::Kind::Number) {
+                            size_t idx = static_cast<size_t>(std::max(0.0, key.to_number()));
+                            if (idx >= obj.obj->elements.size()) obj.obj->elements.resize(idx + 1, JsValue::make_undefined());
+                            obj.obj->elements[idx] = val;
+                        } else {
+                            obj.obj->props[k] = val;
+                        }
                     } else if (obj.obj->type == GcObject::Type::StyleProxy && obj.obj->style_node) {
                         set_inline_css_prop(obj.obj->style_node, k, val.to_string());
                     } else if (obj.obj->type == GcObject::Type::Canvas2D) {
@@ -1960,14 +2585,150 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                     bool ok = !ws_url.empty() && ws->ws_client->connect(ws_url, 3000, &ws_err);
                     ws->props["error"] = JsValue::make_string(ok ? "" : ws_err);
                     stack_.push_back(JsValue::make_obj(ws));
+                } else if (ctor.kind == JsValue::Kind::String && ctor.sval == "__builtin_RegExp__") {
+                    GcObject* re = alloc_object(GcObject::Type::RegExp);
+                    re->regex_pattern = args.size() >= 1 ? args[0].to_string() : "";
+                    re->regex_flags = args.size() >= 2 ? args[1].to_string() : "";
+                    stack_.push_back(JsValue::make_obj(re));
+                } else if (ctor.kind == JsValue::Kind::String && ctor.sval == "__builtin_Date__") {
+                    GcObject* dt = alloc_object(GcObject::Type::Date);
+                    if (args.empty()) {
+                        auto now = std::chrono::system_clock::now();
+                        dt->date_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+                    } else if (args[0].kind == JsValue::Kind::Number) {
+                        dt->date_ms = static_cast<int64_t>(args[0].nval);
+                    } else {
+                        // Parse ISO-8601 "YYYY-MM-DDTHH:MM:SSZ" or "YYYY-MM-DD"
+                        std::string iso = args[0].to_string();
+                        std::tm tm_v{};
+                        int Y = 1970, M = 1, D = 1, h = 0, m = 0, s = 0;
+                        if (std::sscanf(iso.c_str(), "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &s) >= 3 ||
+                            std::sscanf(iso.c_str(), "%d-%d-%d", &Y, &M, &D) >= 3) {
+                            tm_v.tm_year = Y - 1900;
+                            tm_v.tm_mon = M - 1;
+                            tm_v.tm_mday = D;
+                            tm_v.tm_hour = h;
+                            tm_v.tm_min = m;
+                            tm_v.tm_sec = s;
+                            time_t sec = ::timegm(&tm_v);
+                            dt->date_ms = static_cast<int64_t>(sec) * 1000LL;
+                        }
+                    }
+                    stack_.push_back(JsValue::make_obj(dt));
+                } else if (ctor.kind == JsValue::Kind::String && ctor.sval == "__builtin_Map__") {
+                    GcObject* mp = alloc_object(GcObject::Type::JsMap);
+                    if (!args.empty() && args[0].kind == JsValue::Kind::Object && args[0].obj &&
+                        args[0].obj->type == GcObject::Type::Array) {
+                        for (const auto& pair_v : args[0].obj->elements) {
+                            if (pair_v.kind == JsValue::Kind::Object && pair_v.obj &&
+                                pair_v.obj->type == GcObject::Type::Array && pair_v.obj->elements.size() >= 2) {
+                                mp->map_entries.emplace_back(pair_v.obj->elements[0], pair_v.obj->elements[1]);
+                            }
+                        }
+                    }
+                    stack_.push_back(JsValue::make_obj(mp));
+                } else if (ctor.kind == JsValue::Kind::String && ctor.sval == "__builtin_Set__") {
+                    GcObject* st_obj = alloc_object(GcObject::Type::JsSet);
+                    if (!args.empty() && args[0].kind == JsValue::Kind::Object && args[0].obj &&
+                        args[0].obj->type == GcObject::Type::Array) {
+                        for (const auto& item : args[0].obj->elements) {
+                            bool exists = false;
+                            for (const auto& ex : st_obj->set_entries) {
+                                if (ex.kind == item.kind && ex.to_string() == item.to_string()) { exists = true; break; }
+                            }
+                            if (!exists) st_obj->set_entries.push_back(item);
+                        }
+                    }
+                    stack_.push_back(JsValue::make_obj(st_obj));
+                } else if (ctor.kind == JsValue::Kind::String && ctor.sval == "__builtin_URLSearchParams__") {
+                    GcObject* sp = alloc_object(GcObject::Type::Map);
+                    sp->props["__is_url_search_params__"] = JsValue::make_bool(true);
+                    std::string qs = args.empty() ? "" : args[0].to_string();
+                    if (!qs.empty() && qs[0] == '?') qs.erase(0, 1);
+                    size_t p = 0;
+                    while (p < qs.size()) {
+                        size_t amp = qs.find('&', p);
+                        std::string seg = (amp == std::string::npos) ? qs.substr(p) : qs.substr(p, amp - p);
+                        if (!seg.empty()) {
+                            size_t eq = seg.find('=');
+                            std::string pk = (eq == std::string::npos) ? seg : seg.substr(0, eq);
+                            std::string pv = (eq == std::string::npos) ? "" : seg.substr(eq + 1);
+                            sp->map_entries.emplace_back(JsValue::make_string(pk), JsValue::make_string(pv));
+                        }
+                        if (amp == std::string::npos) break;
+                        p = amp + 1;
+                    }
+                    stack_.push_back(JsValue::make_obj(sp));
+                } else if (ctor.kind == JsValue::Kind::String && ctor.sval == "__builtin_URL__") {
+                    std::string raw_u = args.empty() ? "" : args[0].to_string();
+                    if (args.size() >= 2 && raw_u.find("://") == std::string::npos) {
+                        std::string base_u = args[1].to_string();
+                        ParsedUrl bp = parse_url(base_u);
+                        if (bp.valid) {
+                            if (!raw_u.empty() && raw_u[0] == '/') raw_u = bp.origin() + raw_u;
+                            else raw_u = bp.origin() + "/" + raw_u;
+                        }
+                    }
+                    ParsedUrl pu = parse_url(raw_u);
+                    GcObject* uo = alloc_object(GcObject::Type::Map);
+                    uo->props["__is_url__"] = JsValue::make_bool(true);
+                    uo->props["href"] = JsValue::make_string(pu.valid ? pu.rebuild() : raw_u);
+                    uo->props["origin"] = JsValue::make_string(pu.origin());
+                    uo->props["protocol"] = JsValue::make_string(pu.scheme.empty() ? "" : (pu.scheme + ":"));
+                    uo->props["hostname"] = JsValue::make_string(pu.host);
+                    uo->props["host"] = JsValue::make_string(pu.host);
+                    uo->props["port"] = JsValue::make_string(pu.port ? std::to_string(pu.port) : "");
+                    uo->props["pathname"] = JsValue::make_string(pu.path.empty() ? "/" : pu.path);
+                    uo->props["search"] = JsValue::make_string(pu.query.empty() ? "" : ("?" + pu.query));
+                    uo->props["hash"] = JsValue::make_string(pu.fragment.empty() ? "" : ("#" + pu.fragment));
+                    GcObject* sp = alloc_object(GcObject::Type::Map);
+                    sp->props["__is_url_search_params__"] = JsValue::make_bool(true);
+                    size_t p = 0;
+                    while (p < pu.query.size()) {
+                        size_t amp = pu.query.find('&', p);
+                        std::string seg = (amp == std::string::npos) ? pu.query.substr(p) : pu.query.substr(p, amp - p);
+                        if (!seg.empty()) {
+                            size_t eq = seg.find('=');
+                            std::string pk = (eq == std::string::npos) ? seg : seg.substr(0, eq);
+                            std::string pv = (eq == std::string::npos) ? "" : seg.substr(eq + 1);
+                            sp->map_entries.emplace_back(JsValue::make_string(pk), JsValue::make_string(pv));
+                        }
+                        if (amp == std::string::npos) break;
+                        p = amp + 1;
+                    }
+                    uo->props["searchParams"] = JsValue::make_obj(sp);
+                    stack_.push_back(JsValue::make_obj(uo));
+                } else if (ctor.kind == JsValue::Kind::String && (ctor.sval == "__builtin_Error__" || ctor.sval == "__builtin_TypeError__")) {
+                    GcObject* err = alloc_object(GcObject::Type::Map);
+                    err->props["name"] = JsValue::make_string(ctor.sval == "__builtin_TypeError__" ? "TypeError" : "Error");
+                    err->props["message"] = JsValue::make_string(args.empty() ? "" : args[0].to_string());
+                    stack_.push_back(JsValue::make_obj(err));
+                } else if (ctor.kind == JsValue::Kind::String && ctor.sval == "__builtin_Observer__") {
+                    GcObject* obs = alloc_object(GcObject::Type::Map);
+                    obs->props["__is_observer__"] = JsValue::make_bool(true);
+                    if (!args.empty()) obs->props["callback"] = args[0];
+                    stack_.push_back(JsValue::make_obj(obs));
+                } else if (ctor.kind == JsValue::Kind::String && ctor.sval == "__builtin_AbortController__") {
+                    GcObject* ac = alloc_object(GcObject::Type::Map);
+                    GcObject* sig = alloc_object(GcObject::Type::Map);
+                    sig->props["aborted"] = JsValue::make_bool(false);
+                    ac->props["__is_abort_controller__"] = JsValue::make_bool(true);
+                    ac->props["signal"] = JsValue::make_obj(sig);
+                    stack_.push_back(JsValue::make_obj(ac));
                 } else if (ctor.kind == JsValue::Kind::Object && ctor.obj &&
                            ctor.obj->type == GcObject::Type::Class) {
                     GcObject* inst = alloc_object(GcObject::Type::Map);
                     inst->proto_class = ctor.obj;
+                    inst->proto_obj = ctor.obj->fn_prototype ? ctor.obj->fn_prototype : ctor.obj;
                     JsValue inst_val = JsValue::make_obj(inst);
-                    auto cit = ctor.obj->props.find("constructor");
-                    if (cit != ctor.obj->props.end()) {
-                        invoke_callable(cit->second, args, doc, rep, inst_val);
+                    // Look up constructor on class or superclass chain
+                    JsValue ctor_fn = JsValue::make_undefined();
+                    for (GcObject* c = ctor.obj; c; c = c->proto_class) {
+                        auto cit = c->props.find("constructor");
+                        if (cit != c->props.end()) { ctor_fn = cit->second; break; }
+                    }
+                    if (ctor_fn.kind == JsValue::Kind::Object) {
+                        invoke_callable(ctor_fn, args, doc, rep, inst_val);
                         if (exception_active_) {
                             if (try_unwind()) break;
                             return JsValue::make_undefined();
@@ -1977,6 +2738,9 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                 } else if (ctor.kind == JsValue::Kind::Object && ctor.obj &&
                            ctor.obj->type == GcObject::Type::Function) {
                     GcObject* inst = alloc_object(GcObject::Type::Map);
+                    if (!ctor.obj->fn_prototype) ctor.obj->fn_prototype = alloc_object(GcObject::Type::Map);
+                    inst->proto_obj = ctor.obj->fn_prototype;
+                    inst->proto_class = ctor.obj;
                     JsValue inst_val = JsValue::make_obj(inst);
                     invoke_callable(ctor, args, doc, rep, inst_val);
                     if (exception_active_) {
@@ -1994,7 +2758,22 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                 std::vector<JsValue> args(static_cast<size_t>(argc));
                 for (int32_t i = argc - 1; i >= 0; --i) args[static_cast<size_t>(i)] = pop();
                 JsValue callee = pop();
-                JsValue res = invoke_callable(callee, args, doc, rep);
+                JsValue res = JsValue::make_undefined();
+                if (callee.kind == JsValue::Kind::String && callee.sval == "__builtin_super__") {
+                    if (this_val.kind == JsValue::Kind::Object && this_val.obj &&
+                        this_val.obj->proto_class && this_val.obj->proto_class->proto_class) {
+                        JsValue sctor = JsValue::make_undefined();
+                        for (GcObject* c = this_val.obj->proto_class->proto_class; c; c = c->proto_class) {
+                            auto cit = c->props.find("constructor");
+                            if (cit != c->props.end()) { sctor = cit->second; break; }
+                        }
+                        if (sctor.kind == JsValue::Kind::Object) {
+                            res = invoke_callable(sctor, args, doc, rep, this_val);
+                        }
+                    }
+                } else {
+                    res = invoke_callable(callee, args, doc, rep);
+                }
                 if (exception_active_) {
                     if (try_unwind()) break;
                     return JsValue::make_undefined();
@@ -2010,19 +2789,73 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                 JsValue recv = pop();
 
                 JsValue ret = JsValue::make_undefined();
-                if (recv.kind == JsValue::Kind::String && recv.sval == "__builtin_console__" && method == "log") {
+                if (recv.kind == JsValue::Kind::String && recv.sval == "__builtin_super__") {
+                    if (this_val.kind == JsValue::Kind::Object && this_val.obj &&
+                        this_val.obj->proto_class && this_val.obj->proto_class->proto_class) {
+                        JsValue sm = JsValue::make_undefined();
+                        for (GcObject* c = this_val.obj->proto_class->proto_class; c; c = c->proto_class) {
+                            auto mit = c->props.find(method);
+                            if (mit != c->props.end()) { sm = mit->second; break; }
+                        }
+                        if (sm.kind == JsValue::Kind::Object) {
+                            ret = invoke_callable(sm, args, doc, rep, this_val);
+                        }
+                    }
+                } else if (recv.kind == JsValue::Kind::String && recv.sval == "__builtin_console__" &&
+                           (method == "log" || method == "warn" || method == "error" || method == "info" || method == "debug")) {
                     std::string line;
                     for (size_t i = 0; i < args.size(); ++i) {
                         if (i) line.push_back(' ');
                         line += args[i].to_string();
                     }
                     rep.logs.push_back(std::move(line));
+                } else if (recv.kind == JsValue::Kind::String && recv.sval == "__builtin_window__") {
+                    if (method == "addEventListener" && args.size() >= 2) {
+                        listeners_[{doc.root(), args[0].to_string()}].push_back(args[1]);
+                    } else if (method == "matchMedia") {
+                        GcObject* mq = alloc_object(GcObject::Type::Map);
+                        mq->props["matches"] = JsValue::make_bool(false);
+                        mq->props["media"] = JsValue::make_string(args.empty() ? "" : args[0].to_string());
+                        ret = JsValue::make_obj(mq);
+                    } else if (method == "setTimeout" || method == "setInterval") {
+                        ret = invoke_callable(JsValue::make_string("__setTimeout__"), args, doc, rep);
+                    } else if (method == "requestAnimationFrame") {
+                        ret = invoke_callable(JsValue::make_string("__requestAnimationFrame__"), args, doc, rep);
+                    } else if (method == "fetch") {
+                        ret = invoke_callable(JsValue::make_string("__fetch__"), args, doc, rep);
+                    } else if (method == "atob") {
+                        ret = invoke_callable(JsValue::make_string("__atob__"), args, doc, rep);
+                    } else if (method == "btoa") {
+                        ret = invoke_callable(JsValue::make_string("__btoa__"), args, doc, rep);
+                    }
+                } else if (recv.kind == JsValue::Kind::String && recv.sval == "__builtin_performance__") {
+                    if (method == "now") {
+                        auto now = std::chrono::steady_clock::now().time_since_epoch();
+                        double ms = std::chrono::duration<double, std::milli>(now).count();
+                        ret = JsValue::make_number(ms);
+                    }
                 } else if (recv.kind == JsValue::Kind::String && recv.sval == "__builtin_document__") {
                     if (method == "querySelector" && !args.empty()) {
-                        ret = JsValue::make_dom(doc.query_selector(args[0].to_string()));
+                        DomNode* found = doc.query_selector(args[0].to_string());
+                        ret = found ? JsValue::make_dom(found) : JsValue::make_null();
+                    } else if (method == "getElementById" && !args.empty()) {
+                        DomNode* found = doc.query_selector("#" + args[0].to_string());
+                        ret = found ? JsValue::make_dom(found) : JsValue::make_null();
                     } else if (method == "querySelectorAll" && !args.empty()) {
                         GcObject* arr = alloc_object(GcObject::Type::Array);
                         for (DomNode* dn : doc.query_selector_all(args[0].to_string())) {
+                            arr->elements.push_back(JsValue::make_dom(dn));
+                        }
+                        ret = JsValue::make_obj(arr);
+                    } else if (method == "getElementsByTagName" && !args.empty()) {
+                        GcObject* arr = alloc_object(GcObject::Type::Array);
+                        for (DomNode* dn : doc.query_selector_all(args[0].to_string())) {
+                            arr->elements.push_back(JsValue::make_dom(dn));
+                        }
+                        ret = JsValue::make_obj(arr);
+                    } else if (method == "getElementsByClassName" && !args.empty()) {
+                        GcObject* arr = alloc_object(GcObject::Type::Array);
+                        for (DomNode* dn : doc.query_selector_all("." + args[0].to_string())) {
                             arr->elements.push_back(JsValue::make_dom(dn));
                         }
                         ret = JsValue::make_obj(arr);
@@ -2031,6 +2864,13 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                         el->type = NodeType::Element;
                         el->tag = args[0].to_string();
                         ret = JsValue::make_dom(el);
+                    } else if (method == "createTextNode" && !args.empty()) {
+                        DomNode* tn = doc.arena().create<DomNode>();
+                        tn->type = NodeType::Text;
+                        tn->text = args[0].to_string();
+                        ret = JsValue::make_dom(tn);
+                    } else if (method == "addEventListener" && args.size() >= 2) {
+                        listeners_[{doc.root(), args[0].to_string()}].push_back(args[1]);
                     }
                 } else if (recv.kind == JsValue::Kind::String && recv.sval == "__builtin_astra_storage__") {
                     if (method == "set" && args.size() >= 2 && storage_set_) {
@@ -2066,6 +2906,59 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                         }
                     } else if (method == "removeItem" && !args.empty()) {
                         local_storage_.erase(args[0].to_string());
+                    }
+                } else if (recv.kind == JsValue::Kind::String && recv.sval == "__builtin_sessionStorage__") {
+                    if (method == "setItem" && args.size() >= 2) {
+                        session_storage_[args[0].to_string()] = args[1].to_string();
+                    } else if (method == "getItem" && !args.empty()) {
+                        auto it = session_storage_.find(args[0].to_string());
+                        ret = (it != session_storage_.end()) ? JsValue::make_string(it->second) : JsValue::make_null();
+                    } else if (method == "removeItem" && !args.empty()) {
+                        session_storage_.erase(args[0].to_string());
+                    } else if (method == "clear") {
+                        session_storage_.clear();
+                    }
+                } else if (recv.kind == JsValue::Kind::String && recv.sval == "__builtin_history__") {
+                    if ((method == "pushState" || method == "replaceState") && args.size() >= 3) {
+                        JsValue st_val = args[0];
+                        std::string target_url = args[2].to_string();
+                        bool is_replace = (method == "replaceState");
+                        if (!target_url.empty()) {
+                            if (target_url[0] == '/' && current_url_.find("://") != std::string::npos) {
+                                ParsedUrl base = parse_url(current_url_);
+                                target_url = base.origin() + target_url;
+                            }
+                            current_url_ = target_url;
+                        }
+                        if (is_replace && history_index_ >= 0 && static_cast<size_t>(history_index_) < history_entries_.size()) {
+                            history_entries_[static_cast<size_t>(history_index_)] = {current_url_, st_val};
+                        } else {
+                            if (history_index_ >= 0 && static_cast<size_t>(history_index_ + 1) < history_entries_.size()) {
+                                history_entries_.resize(static_cast<size_t>(history_index_ + 1));
+                            }
+                            history_entries_.emplace_back(current_url_, st_val);
+                            history_index_ = static_cast<int>(history_entries_.size()) - 1;
+                        }
+                        if (history_fn_) history_fn_(current_url_, is_replace);
+                    } else if (method == "back" && history_index_ > 0) {
+                        --history_index_;
+                        current_url_ = history_entries_[static_cast<size_t>(history_index_)].first;
+                        if (history_fn_) history_fn_(current_url_, true);
+                    } else if (method == "forward" && history_index_ + 1 < static_cast<int>(history_entries_.size())) {
+                        ++history_index_;
+                        current_url_ = history_entries_[static_cast<size_t>(history_index_)].first;
+                        if (history_fn_) history_fn_(current_url_, true);
+                    }
+                } else if (recv.kind == JsValue::Kind::String && recv.sval == "__builtin_Date__") {
+                    if (method == "now") {
+                        auto now = std::chrono::system_clock::now();
+                        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+                        ret = JsValue::make_number(static_cast<double>(ms));
+                    }
+                } else if (recv.kind == JsValue::Kind::String && recv.sval == "__builtin_Array__") {
+                    if (method == "isArray" && !args.empty()) {
+                        ret = JsValue::make_bool(args[0].kind == JsValue::Kind::Object && args[0].obj &&
+                                                 args[0].obj->type == GcObject::Type::Array);
                     }
                 } else if (recv.kind == JsValue::Kind::String && recv.sval == "__builtin_JSON__") {
                     std::function<JsValue(const JsonValue&)> json_to_js = [&](const JsonValue& jv) -> JsValue {
@@ -2167,6 +3060,73 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                         ret = JsValue::make_obj(any_rej ? make_rejected_promise(rej_reason)
                                                         : make_resolved_promise(JsValue::make_obj(out_arr)));
                     }
+                } else if (recv.kind == JsValue::Kind::String && recv.sval == "__builtin_Object__") {
+                    if (method == "create") {
+                        GcObject* created = alloc_object(GcObject::Type::Map);
+                        if (!args.empty() && args[0].kind == JsValue::Kind::Object && args[0].obj) {
+                            created->proto_obj = args[0].obj;
+                        }
+                        ret = JsValue::make_obj(created);
+                    } else if (method == "getPrototypeOf" && !args.empty() && args[0].kind == JsValue::Kind::Object && args[0].obj) {
+                        GcObject* p = args[0].obj->proto_obj ? args[0].obj->proto_obj : args[0].obj->proto_class;
+                        ret = p ? JsValue::make_obj(p) : JsValue::make_null();
+                    } else if (method == "setPrototypeOf" && args.size() >= 2 && args[0].kind == JsValue::Kind::Object && args[0].obj) {
+                        args[0].obj->proto_obj = (args[1].kind == JsValue::Kind::Object) ? args[1].obj : nullptr;
+                        ret = args[0];
+                    } else if (method == "keys" && !args.empty() && args[0].kind == JsValue::Kind::Object && args[0].obj) {
+                        GcObject* arr = alloc_object(GcObject::Type::Array);
+                        std::vector<std::string> ks;
+                        for (const auto& [k, _] : args[0].obj->props) {
+                            if (k.rfind("__", 0) != 0) ks.push_back(k);
+                        }
+                        std::sort(ks.begin(), ks.end());
+                        for (const auto& k : ks) arr->elements.push_back(JsValue::make_string(k));
+                        ret = JsValue::make_obj(arr);
+                    } else if (method == "values" && !args.empty() && args[0].kind == JsValue::Kind::Object && args[0].obj) {
+                        GcObject* arr = alloc_object(GcObject::Type::Array);
+                        std::vector<std::string> ks;
+                        for (const auto& [k, _] : args[0].obj->props) {
+                            if (k.rfind("__", 0) != 0) ks.push_back(k);
+                        }
+                        std::sort(ks.begin(), ks.end());
+                        for (const auto& k : ks) arr->elements.push_back(args[0].obj->props[k]);
+                        ret = JsValue::make_obj(arr);
+                    } else if (method == "entries" && !args.empty() && args[0].kind == JsValue::Kind::Object && args[0].obj) {
+                        GcObject* arr = alloc_object(GcObject::Type::Array);
+                        std::vector<std::string> ks;
+                        for (const auto& [k, _] : args[0].obj->props) {
+                            if (k.rfind("__", 0) != 0) ks.push_back(k);
+                        }
+                        std::sort(ks.begin(), ks.end());
+                        for (const auto& k : ks) {
+                            GcObject* pair = alloc_object(GcObject::Type::Array);
+                            pair->elements.push_back(JsValue::make_string(k));
+                            pair->elements.push_back(args[0].obj->props[k]);
+                            arr->elements.push_back(JsValue::make_obj(pair));
+                        }
+                        ret = JsValue::make_obj(arr);
+                    } else if (method == "assign" && args.size() >= 2 &&
+                               args[0].kind == JsValue::Kind::Object && args[0].obj) {
+                        for (size_t ai = 1; ai < args.size(); ++ai) {
+                            if (args[ai].kind == JsValue::Kind::Object && args[ai].obj) {
+                                for (const auto& [k, v] : args[ai].obj->props) args[0].obj->props[k] = v;
+                            }
+                        }
+                        ret = args[0];
+                    } else if (method == "hasOwn" && args.size() >= 2 &&
+                               args[0].kind == JsValue::Kind::Object && args[0].obj) {
+                        ret = JsValue::make_bool(args[0].obj->props.count(args[1].to_string()) > 0);
+                    } else if (method == "freeze" && !args.empty()) {
+                        ret = args[0];
+                    } else if (method == "defineProperty" && args.size() >= 3 &&
+                               args[0].kind == JsValue::Kind::Object && args[0].obj &&
+                               args[2].kind == JsValue::Kind::Object && args[2].obj) {
+                        auto vit = args[2].obj->props.find("value");
+                        if (vit != args[2].obj->props.end()) {
+                            args[0].obj->props[args[1].to_string()] = vit->second;
+                        }
+                        ret = args[0];
+                    }
                 } else if (recv.kind == JsValue::Kind::String) {
                     const std::string& s = recv.sval;
                     if (method == "trim") {
@@ -2186,21 +3146,114 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                         ret = JsValue::make_string(std::move(u));
                     } else if (method == "includes" && !args.empty()) {
                         ret = JsValue::make_bool(s.find(args[0].to_string()) != std::string::npos);
-                    } else if (method == "split" && !args.empty()) {
-                        std::string sep = args[0].to_string();
-                        GcObject* arr = alloc_object(GcObject::Type::Array);
-                        if (sep.empty()) {
-                            for (char c : s) arr->elements.push_back(JsValue::make_string(std::string(1, c)));
-                        } else {
-                            size_t pos = 0;
-                            while (pos <= s.size()) {
-                                size_t hit = s.find(sep, pos);
-                                if (hit == std::string::npos) {
-                                    arr->elements.push_back(JsValue::make_string(s.substr(pos)));
-                                    break;
+                    } else if (method == "startsWith" && !args.empty()) {
+                        std::string p = args[0].to_string();
+                        ret = JsValue::make_bool(s.size() >= p.size() && s.compare(0, p.size(), p) == 0);
+                    } else if (method == "endsWith" && !args.empty()) {
+                        std::string p = args[0].to_string();
+                        ret = JsValue::make_bool(s.size() >= p.size() && s.compare(s.size() - p.size(), p.size(), p) == 0);
+                    } else if (method == "indexOf" && !args.empty()) {
+                        size_t hit = s.find(args[0].to_string());
+                        ret = JsValue::make_number(hit == std::string::npos ? -1.0 : static_cast<double>(hit));
+                    } else if (method == "match" && !args.empty()) {
+                        std::string pat = (args[0].kind == JsValue::Kind::Object && args[0].obj && args[0].obj->type == GcObject::Type::RegExp)
+                                              ? args[0].obj->regex_pattern
+                                              : args[0].to_string();
+                        std::string fl = (args[0].kind == JsValue::Kind::Object && args[0].obj && args[0].obj->type == GcObject::Type::RegExp)
+                                             ? args[0].obj->regex_flags
+                                             : "";
+                        try {
+                            auto syntax = std::regex::ECMAScript;
+                            if (fl.find('i') != std::string::npos) syntax |= std::regex::icase;
+                            std::regex rx(pat, syntax);
+                            if (fl.find('g') != std::string::npos) {
+                                GcObject* arr = alloc_object(GcObject::Type::Array);
+                                for (std::sregex_iterator it(s.begin(), s.end(), rx), end; it != end; ++it) {
+                                    arr->elements.push_back(JsValue::make_string((*it)[0].str()));
                                 }
-                                arr->elements.push_back(JsValue::make_string(s.substr(pos, hit - pos)));
-                                pos = hit + sep.size();
+                                ret = arr->elements.empty() ? JsValue::make_null() : JsValue::make_obj(arr);
+                            } else {
+                                std::smatch m;
+                                if (std::regex_search(s, m, rx)) {
+                                    GcObject* arr = alloc_object(GcObject::Type::Array);
+                                    for (size_t gi = 0; gi < m.size(); ++gi) {
+                                        arr->elements.push_back(JsValue::make_string(m[gi].str()));
+                                    }
+                                    arr->props["index"] = JsValue::make_number(static_cast<double>(m.position(0)));
+                                    ret = JsValue::make_obj(arr);
+                                } else {
+                                    ret = JsValue::make_null();
+                                }
+                            }
+                        } catch (...) {
+                            ret = JsValue::make_null();
+                        }
+                    } else if (method == "replace" && args.size() >= 2) {
+                        std::string to = args[1].to_string();
+                        if (args[0].kind == JsValue::Kind::Object && args[0].obj &&
+                            args[0].obj->type == GcObject::Type::RegExp) {
+                            try {
+                                auto syntax = std::regex::ECMAScript;
+                                if (args[0].obj->regex_flags.find('i') != std::string::npos) syntax |= std::regex::icase;
+                                std::regex rx(args[0].obj->regex_pattern, syntax);
+                                auto flags = (args[0].obj->regex_flags.find('g') != std::string::npos)
+                                                 ? std::regex_constants::format_default
+                                                 : std::regex_constants::format_first_only;
+                                ret = JsValue::make_string(std::regex_replace(s, rx, to, flags));
+                            } catch (...) {
+                                ret = JsValue::make_string(s);
+                            }
+                        } else {
+                            std::string from = args[0].to_string();
+                            std::string out = s;
+                            size_t hit = from.empty() ? std::string::npos : out.find(from);
+                            if (hit != std::string::npos) out.replace(hit, from.size(), to);
+                            ret = JsValue::make_string(std::move(out));
+                        }
+                    } else if (method == "slice" && !args.empty()) {
+                        int len = static_cast<int>(s.size());
+                        int st = static_cast<int>(args[0].to_number());
+                        int en = args.size() >= 2 ? static_cast<int>(args[1].to_number()) : len;
+                        if (st < 0) st = std::max(0, len + st);
+                        if (en < 0) en = std::max(0, len + en);
+                        st = std::clamp(st, 0, len);
+                        en = std::clamp(en, st, len);
+                        ret = JsValue::make_string(s.substr(static_cast<size_t>(st), static_cast<size_t>(en - st)));
+                    } else if (method == "repeat" && !args.empty()) {
+                        int n = std::clamp(static_cast<int>(args[0].to_number()), 0, 1024);
+                        std::string out;
+                        out.reserve(s.size() * static_cast<size_t>(n));
+                        for (int k = 0; k < n; ++k) out += s;
+                        ret = JsValue::make_string(std::move(out));
+                    } else if (method == "split" && !args.empty()) {
+                        GcObject* arr = alloc_object(GcObject::Type::Array);
+                        if (args[0].kind == JsValue::Kind::Object && args[0].obj &&
+                            args[0].obj->type == GcObject::Type::RegExp) {
+                            try {
+                                auto syntax = std::regex::ECMAScript;
+                                if (args[0].obj->regex_flags.find('i') != std::string::npos) syntax |= std::regex::icase;
+                                std::regex rx(args[0].obj->regex_pattern, syntax);
+                                for (std::sregex_token_iterator it(s.begin(), s.end(), rx, -1), end; it != end; ++it) {
+                                    arr->elements.push_back(JsValue::make_string(it->str()));
+                                }
+                            } catch (...) {
+                                arr->elements.push_back(JsValue::make_string(s));
+                            }
+                        } else {
+                            std::string sep = args[0].to_string();
+                            if (sep.empty()) {
+                                for (char c : s) arr->elements.push_back(JsValue::make_string(std::string(1, c)));
+                            } else {
+                                size_t pos = 0;
+                                while (pos <= s.size()) {
+                                    size_t hit = s.find(sep, pos);
+                                    if (hit == std::string::npos) {
+                                        arr->elements.push_back(JsValue::make_string(s.substr(pos)));
+                                        break;
+                                    }
+                                    arr->elements.push_back(JsValue::make_string(s.substr(pos, hit - pos)));
+                                    pos = hit + sep.size();
+                                }
                             }
                         }
                         ret = JsValue::make_obj(arr);
@@ -2210,14 +3263,37 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                         recv.node->set_attr(args[0].to_string(), args[1].to_string());
                     } else if (method == "getAttribute" && !args.empty()) {
                         ret = JsValue::make_string(recv.node->get_attr(args[0].to_string()));
+                    } else if (method == "hasAttribute" && !args.empty()) {
+                        ret = JsValue::make_bool(recv.node->has_attr(args[0].to_string()));
                     } else if (method == "removeAttribute" && !args.empty()) {
                         recv.node->remove_attr(args[0].to_string());
                     } else if (method == "appendChild" && !args.empty() && args[0].kind == JsValue::Kind::DomRef && args[0].node) {
                         args[0].node->parent = recv.node;
                         recv.node->children.push_back(args[0].node);
                         ret = args[0];
+                    } else if (method == "remove") {
+                        if (recv.node->parent) {
+                            auto& sibs = recv.node->parent->children;
+                            sibs.erase(std::remove(sibs.begin(), sibs.end(), recv.node), sibs.end());
+                            recv.node->parent = nullptr;
+                        }
                     } else if (method == "addEventListener" && args.size() >= 2) {
                         listeners_[{recv.node, args[0].to_string()}].push_back(args[1]);
+                    } else if ((recv.node->tag == "video" || recv.node->tag == "audio") && method == "play") {
+                        recv.node->set_attr("data-astra-paused", "0");
+                        ret = JsValue::make_obj(make_resolved_promise(JsValue::make_undefined()));
+                    } else if ((recv.node->tag == "video" || recv.node->tag == "audio") && method == "pause") {
+                        recv.node->set_attr("data-astra-paused", "1");
+                    } else if ((recv.node->tag == "video" || recv.node->tag == "audio") && method == "canPlayType" && !args.empty()) {
+                        std::string m = args[0].to_string();
+                        std::transform(m.begin(), m.end(), m.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                        if (m.find("mp4") != std::string::npos || m.find("webm") != std::string::npos ||
+                            m.find("mpegurl") != std::string::npos || m.find("wav") != std::string::npos ||
+                            m.find("ogg") != std::string::npos || m.find("mpeg") != std::string::npos) {
+                            ret = JsValue::make_string("probably");
+                        } else {
+                            ret = JsValue::make_string("");
+                        }
                     } else if (method == "getContext" && !args.empty() && args[0].to_string() == "2d") {
                         std::string cid = recv.node->get_attr("id");
                         if (cid.empty()) cid = "canvas";
@@ -2310,8 +3386,13 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                             ret = JsValue::make_obj(chain_promise(recv.obj, on_fin, JsValue::make_undefined(), true));
                         }
                     } else if (recv.obj->type == GcObject::Type::Array && method == "push" && !args.empty()) {
-                        recv.obj->elements.push_back(args[0]);
+                        for (const auto& a : args) recv.obj->elements.push_back(a);
                         ret = JsValue::make_number(static_cast<double>(recv.obj->elements.size()));
+                    } else if (recv.obj->type == GcObject::Type::Array && method == "pop") {
+                        if (!recv.obj->elements.empty()) {
+                            ret = recv.obj->elements.back();
+                            recv.obj->elements.pop_back();
+                        }
                     } else if (recv.obj->type == GcObject::Type::Array && method == "join") {
                         std::string sep = args.empty() ? "," : args[0].to_string();
                         std::string out;
@@ -2327,6 +3408,73 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                                 invoke_callable(args[0], {recv.obj->elements[i], JsValue::make_number(static_cast<double>(i))}, doc, rep));
                         }
                         ret = JsValue::make_obj(mapped);
+                    } else if (recv.obj->type == GcObject::Type::Array && method == "filter" && !args.empty()) {
+                        GcObject* out = alloc_object(GcObject::Type::Array);
+                        for (size_t i = 0; i < recv.obj->elements.size(); ++i) {
+                            JsValue keep = invoke_callable(args[0], {recv.obj->elements[i], JsValue::make_number(static_cast<double>(i))}, doc, rep);
+                            if (keep.truthy()) out->elements.push_back(recv.obj->elements[i]);
+                        }
+                        ret = JsValue::make_obj(out);
+                    } else if (recv.obj->type == GcObject::Type::Array && method == "reduce" && !args.empty()) {
+                        size_t start_i = 0;
+                        JsValue acc = JsValue::make_undefined();
+                        if (args.size() >= 2) {
+                            acc = args[1];
+                        } else if (!recv.obj->elements.empty()) {
+                            acc = recv.obj->elements[0];
+                            start_i = 1;
+                        }
+                        for (size_t i = start_i; i < recv.obj->elements.size(); ++i) {
+                            acc = invoke_callable(args[0], {acc, recv.obj->elements[i], JsValue::make_number(static_cast<double>(i))}, doc, rep);
+                        }
+                        ret = acc;
+                    } else if (recv.obj->type == GcObject::Type::Array && method == "find" && !args.empty()) {
+                        ret = JsValue::make_undefined();
+                        for (size_t i = 0; i < recv.obj->elements.size(); ++i) {
+                            JsValue hit = invoke_callable(args[0], {recv.obj->elements[i], JsValue::make_number(static_cast<double>(i))}, doc, rep);
+                            if (hit.truthy()) { ret = recv.obj->elements[i]; break; }
+                        }
+                    } else if (recv.obj->type == GcObject::Type::Array && method == "forEach" && !args.empty()) {
+                        for (size_t i = 0; i < recv.obj->elements.size(); ++i) {
+                            invoke_callable(args[0], {recv.obj->elements[i], JsValue::make_number(static_cast<double>(i))}, doc, rep);
+                        }
+                    } else if (recv.obj->type == GcObject::Type::Array && (method == "includes" || method == "indexOf") && !args.empty()) {
+                        int found_idx = -1;
+                        for (size_t i = 0; i < recv.obj->elements.size(); ++i) {
+                            const JsValue& el = recv.obj->elements[i];
+                            bool eq = (el.kind == args[0].kind) &&
+                                      ((el.kind == JsValue::Kind::Number && el.nval == args[0].nval) ||
+                                       (el.kind == JsValue::Kind::String && el.sval == args[0].sval) ||
+                                       (el.kind == JsValue::Kind::Bool && el.bval == args[0].bval));
+                            if (eq) { found_idx = static_cast<int>(i); break; }
+                        }
+                        ret = (method == "includes") ? JsValue::make_bool(found_idx >= 0)
+                                                     : JsValue::make_number(static_cast<double>(found_idx));
+                    } else if (recv.obj->type == GcObject::Type::Array && method == "slice") {
+                        int len = static_cast<int>(recv.obj->elements.size());
+                        int st = args.size() >= 1 ? static_cast<int>(args[0].to_number()) : 0;
+                        int en = args.size() >= 2 ? static_cast<int>(args[1].to_number()) : len;
+                        if (st < 0) st = std::max(0, len + st);
+                        if (en < 0) en = std::max(0, len + en);
+                        st = std::clamp(st, 0, len);
+                        en = std::clamp(en, st, len);
+                        GcObject* out = alloc_object(GcObject::Type::Array);
+                        for (int i = st; i < en; ++i) out->elements.push_back(recv.obj->elements[static_cast<size_t>(i)]);
+                        ret = JsValue::make_obj(out);
+                    } else if (recv.obj->type == GcObject::Type::Array && method == "concat") {
+                        GcObject* out = alloc_object(GcObject::Type::Array);
+                        out->elements = recv.obj->elements;
+                        for (const auto& a : args) {
+                            if (a.kind == JsValue::Kind::Object && a.obj && a.obj->type == GcObject::Type::Array) {
+                                for (const auto& el : a.obj->elements) out->elements.push_back(el);
+                            } else {
+                                out->elements.push_back(a);
+                            }
+                        }
+                        ret = JsValue::make_obj(out);
+                    } else if (recv.obj->type == GcObject::Type::Array && method == "reverse") {
+                        std::reverse(recv.obj->elements.begin(), recv.obj->elements.end());
+                        ret = recv;
                     } else if (recv.obj->props.count("__is_fetch_resp__") && method == "text") {
                         ret = recv.obj->props["body"];
                     } else if (recv.obj->props.count("__is_fetch_resp__") && method == "json") {
@@ -2398,10 +3546,200 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                                 invoke_callable(cit->second, {}, doc, rep, recv);
                             }
                         }
-                    } else if (recv.obj->props.count(method) > 0) {
-                        ret = invoke_callable(recv.obj->props[method], args, doc, rep, recv);
-                    } else if (recv.obj->proto_class && recv.obj->proto_class->props.count(method) > 0) {
-                        ret = invoke_callable(recv.obj->proto_class->props[method], args, doc, rep, recv);
+                    } else if (recv.obj->type == GcObject::Type::RegExp) {
+                        std::string input = args.empty() ? "" : args[0].to_string();
+                        try {
+                            auto syntax = std::regex::ECMAScript;
+                            if (recv.obj->regex_flags.find('i') != std::string::npos) syntax |= std::regex::icase;
+                            std::regex rx(recv.obj->regex_pattern, syntax);
+                            if (method == "test") {
+                                ret = JsValue::make_bool(std::regex_search(input, rx));
+                            } else if (method == "exec") {
+                                std::smatch m;
+                                if (std::regex_search(input, m, rx)) {
+                                    GcObject* arr = alloc_object(GcObject::Type::Array);
+                                    for (size_t gi = 0; gi < m.size(); ++gi) {
+                                        arr->elements.push_back(JsValue::make_string(m[gi].str()));
+                                    }
+                                    arr->props["index"] = JsValue::make_number(static_cast<double>(m.position(0)));
+                                    ret = JsValue::make_obj(arr);
+                                } else {
+                                    ret = JsValue::make_null();
+                                }
+                            }
+                        } catch (...) {
+                            ret = (method == "test") ? JsValue::make_bool(false) : JsValue::make_null();
+                        }
+                    } else if (recv.obj->type == GcObject::Type::Date) {
+                        time_t sec = static_cast<time_t>(recv.obj->date_ms / 1000LL);
+                        std::tm tm_utc{};
+                        gmtime_r(&sec, &tm_utc);
+                        if (method == "getTime") ret = JsValue::make_number(static_cast<double>(recv.obj->date_ms));
+                        else if (method == "getFullYear" || method == "getUTCFullYear") ret = JsValue::make_number(tm_utc.tm_year + 1900);
+                        else if (method == "getMonth" || method == "getUTCMonth") ret = JsValue::make_number(tm_utc.tm_mon);
+                        else if (method == "getDate" || method == "getUTCDate") ret = JsValue::make_number(tm_utc.tm_mday);
+                        else if (method == "getHours" || method == "getUTCHours") ret = JsValue::make_number(tm_utc.tm_hour);
+                        else if (method == "getMinutes" || method == "getUTCMinutes") ret = JsValue::make_number(tm_utc.tm_min);
+                        else if (method == "getSeconds" || method == "getUTCSeconds") ret = JsValue::make_number(tm_utc.tm_sec);
+                        else if (method == "toISOString") {
+                            int ms_rem = static_cast<int>(std::abs(recv.obj->date_ms % 1000LL));
+                            std::ostringstream oss;
+                            oss << std::setfill('0')
+                                << std::setw(4) << (tm_utc.tm_year + 1900) << "-"
+                                << std::setw(2) << (tm_utc.tm_mon + 1) << "-"
+                                << std::setw(2) << tm_utc.tm_mday << "T"
+                                << std::setw(2) << tm_utc.tm_hour << ":"
+                                << std::setw(2) << tm_utc.tm_min << ":"
+                                << std::setw(2) << tm_utc.tm_sec << "."
+                                << std::setw(3) << ms_rem << "Z";
+                            ret = JsValue::make_string(oss.str());
+                        }
+                    } else if (recv.obj->type == GcObject::Type::JsMap) {
+                        auto same_key = [](const JsValue& a, const JsValue& b) {
+                            if (a.kind != b.kind) return false;
+                            if (a.kind == JsValue::Kind::Number) return a.nval == b.nval;
+                            if (a.kind == JsValue::Kind::Object) return a.obj == b.obj;
+                            return a.to_string() == b.to_string();
+                        };
+                        if (method == "set" && args.size() >= 2) {
+                            bool updated = false;
+                            for (auto& kv : recv.obj->map_entries) {
+                                if (same_key(kv.first, args[0])) { kv.second = args[1]; updated = true; break; }
+                            }
+                            if (!updated) recv.obj->map_entries.emplace_back(args[0], args[1]);
+                            ret = recv;
+                        } else if (method == "get" && !args.empty()) {
+                            ret = JsValue::make_undefined();
+                            for (const auto& kv : recv.obj->map_entries) {
+                                if (same_key(kv.first, args[0])) { ret = kv.second; break; }
+                            }
+                        } else if (method == "has" && !args.empty()) {
+                            bool found = false;
+                            for (const auto& kv : recv.obj->map_entries) {
+                                if (same_key(kv.first, args[0])) { found = true; break; }
+                            }
+                            ret = JsValue::make_bool(found);
+                        } else if (method == "delete" && !args.empty()) {
+                            bool erased = false;
+                            for (auto it = recv.obj->map_entries.begin(); it != recv.obj->map_entries.end(); ++it) {
+                                if (same_key(it->first, args[0])) { recv.obj->map_entries.erase(it); erased = true; break; }
+                            }
+                            ret = JsValue::make_bool(erased);
+                        } else if (method == "clear") {
+                            recv.obj->map_entries.clear();
+                        } else if (method == "keys" || method == "values" || method == "entries") {
+                            GcObject* arr = alloc_object(GcObject::Type::Array);
+                            for (const auto& kv : recv.obj->map_entries) {
+                                if (method == "keys") arr->elements.push_back(kv.first);
+                                else if (method == "values") arr->elements.push_back(kv.second);
+                                else {
+                                    GcObject* p = alloc_object(GcObject::Type::Array);
+                                    p->elements.push_back(kv.first);
+                                    p->elements.push_back(kv.second);
+                                    arr->elements.push_back(JsValue::make_obj(p));
+                                }
+                            }
+                            ret = JsValue::make_obj(arr);
+                        } else if (method == "forEach" && !args.empty()) {
+                            for (const auto& kv : recv.obj->map_entries) {
+                                invoke_callable(args[0], {kv.second, kv.first, recv}, doc, rep);
+                            }
+                        }
+                    } else if (recv.obj->type == GcObject::Type::JsSet) {
+                        auto same_val = [](const JsValue& a, const JsValue& b) {
+                            if (a.kind != b.kind) return false;
+                            if (a.kind == JsValue::Kind::Number) return a.nval == b.nval;
+                            if (a.kind == JsValue::Kind::Object) return a.obj == b.obj;
+                            return a.to_string() == b.to_string();
+                        };
+                        if (method == "add" && !args.empty()) {
+                            bool exists = false;
+                            for (const auto& v : recv.obj->set_entries) {
+                                if (same_val(v, args[0])) { exists = true; break; }
+                            }
+                            if (!exists) recv.obj->set_entries.push_back(args[0]);
+                            ret = recv;
+                        } else if (method == "has" && !args.empty()) {
+                            bool found = false;
+                            for (const auto& v : recv.obj->set_entries) {
+                                if (same_val(v, args[0])) { found = true; break; }
+                            }
+                            ret = JsValue::make_bool(found);
+                        } else if (method == "delete" && !args.empty()) {
+                            bool erased = false;
+                            for (auto it = recv.obj->set_entries.begin(); it != recv.obj->set_entries.end(); ++it) {
+                                if (same_val(*it, args[0])) { recv.obj->set_entries.erase(it); erased = true; break; }
+                            }
+                            ret = JsValue::make_bool(erased);
+                        } else if (method == "clear") {
+                            recv.obj->set_entries.clear();
+                        } else if (method == "values" || method == "keys") {
+                            GcObject* arr = alloc_object(GcObject::Type::Array);
+                            arr->elements = recv.obj->set_entries;
+                            ret = JsValue::make_obj(arr);
+                        } else if (method == "forEach" && !args.empty()) {
+                            for (const auto& v : recv.obj->set_entries) {
+                                invoke_callable(args[0], {v, v, recv}, doc, rep);
+                            }
+                        }
+                    } else if (recv.obj->props.count("__is_url_search_params__")) {
+                        if (method == "get" && !args.empty()) {
+                            std::string tk = args[0].to_string();
+                            ret = JsValue::make_null();
+                            for (const auto& kv : recv.obj->map_entries) {
+                                if (kv.first.to_string() == tk) { ret = kv.second; break; }
+                            }
+                        } else if (method == "has" && !args.empty()) {
+                            std::string tk = args[0].to_string();
+                            bool found = false;
+                            for (const auto& kv : recv.obj->map_entries) {
+                                if (kv.first.to_string() == tk) { found = true; break; }
+                            }
+                            ret = JsValue::make_bool(found);
+                        } else if (method == "set" && args.size() >= 2) {
+                            std::string tk = args[0].to_string();
+                            bool upd = false;
+                            for (auto& kv : recv.obj->map_entries) {
+                                if (kv.first.to_string() == tk) { kv.second = JsValue::make_string(args[1].to_string()); upd = true; break; }
+                            }
+                            if (!upd) recv.obj->map_entries.emplace_back(JsValue::make_string(tk), JsValue::make_string(args[1].to_string()));
+                        } else if (method == "delete" && !args.empty()) {
+                            std::string tk = args[0].to_string();
+                            auto& ents = recv.obj->map_entries;
+                            ents.erase(std::remove_if(ents.begin(), ents.end(), [&](const auto& kv) { return kv.first.to_string() == tk; }), ents.end());
+                        } else if (method == "toString") {
+                            std::string out;
+                            for (size_t i = 0; i < recv.obj->map_entries.size(); ++i) {
+                                if (i) out.push_back('&');
+                                out += recv.obj->map_entries[i].first.to_string() + "=" + recv.obj->map_entries[i].second.to_string();
+                            }
+                            ret = JsValue::make_string(std::move(out));
+                        }
+                    } else if (recv.obj->props.count("__is_url__") && method == "toString") {
+                        ret = recv.obj->props["href"];
+                    } else if (recv.obj->props.count("__is_observer__")) {
+                        // Safe no-op shims for observe/unobserve/disconnect
+                    } else if (recv.obj->props.count("__is_abort_controller__") && method == "abort") {
+                        auto sit = recv.obj->props.find("signal");
+                        if (sit != recv.obj->props.end() && sit->second.kind == JsValue::Kind::Object && sit->second.obj) {
+                            sit->second.obj->props["aborted"] = JsValue::make_bool(true);
+                        }
+                    } else {
+                        // Prototype chain method resolution (own -> proto_obj -> proto_class up to 32 hops)
+                        JsValue fn_target = JsValue::make_undefined();
+                        GcObject* cur = recv.obj;
+                        for (int hop = 0; cur && hop < 32; ++hop) {
+                            auto it = cur->props.find(method);
+                            if (it != cur->props.end()) { fn_target = it->second; break; }
+                            if (cur->fn_prototype && cur->fn_prototype->props.count(method) > 0) {
+                                fn_target = cur->fn_prototype->props[method];
+                                break;
+                            }
+                            cur = cur->proto_obj ? cur->proto_obj : cur->proto_class;
+                        }
+                        if (fn_target.kind == JsValue::Kind::Object) {
+                            ret = invoke_callable(fn_target, args, doc, rep, recv);
+                        }
                     }
                 }
                 if (exception_active_) {

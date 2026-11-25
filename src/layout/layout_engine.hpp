@@ -37,7 +37,8 @@ enum class DisplayItemType : uint32_t {
     DropShadow = 8,
     EmbedAudio = 9,
     FillGradient = 10,
-    EmbedCanvas = 11
+    EmbedCanvas = 11,
+    EmbedSvg = 12
 };
 
 struct DisplayItem {
@@ -97,7 +98,8 @@ public:
                                      const HtmlDocument& doc,
                                      const CssStylesheet& sheet,
                                      float viewport_w,
-                                     float viewport_h);
+                                     float viewport_h,
+                                     bool light_web_default = false);
 
     static DisplayList build_display_list(const LayoutFrame* root,
                                           uint32_t viewport_w,

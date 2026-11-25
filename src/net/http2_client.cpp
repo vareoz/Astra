@@ -490,8 +490,8 @@ std::vector<Http2Response> Http2Client::execute_multiplexed_batch(
         hlist.emplace_back(":scheme", req.scheme.empty() ? "https" : req.scheme);
         hlist.emplace_back(":authority", req.authority);
         hlist.emplace_back(":path", req.path.empty() ? "/" : req.path);
-        hlist.emplace_back("accept", "text/html,text/css,image/jpeg,image/png,*/*;q=0.8");
-        hlist.emplace_back("accept-encoding", "gzip, deflate");
+        hlist.emplace_back("accept", "text/html,application/xhtml+xml,text/css,image/webp,image/svg+xml,image/jpeg,image/png,*/*;q=0.8");
+        hlist.emplace_back("accept-encoding", "gzip, deflate, br");
         for (const auto& [k, v] : req.extra_headers) {
             std::string lk = to_lower_ascii(k);
             if (lk == "host" || lk == "connection" || lk == "transfer-encoding" || lk == "keep-alive") continue;

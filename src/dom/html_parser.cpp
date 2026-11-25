@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <functional>
 #include <unordered_set>
 
 namespace astra {
@@ -112,6 +113,14 @@ std::string DomNode::get_attr(std::string_view name) const {
         if (a.name == low) return a.value;
     }
     return {};
+}
+
+bool DomNode::has_attr(std::string_view name) const {
+    std::string low = to_lower(name);
+    for (const auto& a : attrs) {
+        if (a.name == low) return true;
+    }
+    return false;
 }
 
 void DomNode::set_attr(std::string_view name, std::string_view value) {
@@ -284,6 +293,32 @@ std::vector<std::string> HtmlDocument::collect_scripts() const {
     std::vector<std::string> scripts;
     collect_tags_text(root_, "script", scripts);
     return scripts;
+}
+
+std::vector<ScriptEntry> HtmlDocument::collect_script_entries() const {
+    std::vector<ScriptEntry> out;
+    std::function<void(const DomNode*)> walk = [&](const DomNode* n) {
+        if (!n) return;
+        if (n->type == NodeType::Element && n->tag == "script") {
+            std::string type_attr = to_lower(n->get_attr("type"));
+            if (!type_attr.empty() && type_attr != "text/javascript" &&
+                type_attr != "application/javascript" && type_attr != "module") {
+                return; // Skip JSON-LD, importmap, template data scripts
+            }
+            ScriptEntry se;
+            se.src = n->get_attr("src");
+            se.inline_code = n->text_content();
+            se.is_module = (type_attr == "module");
+            se.defer = n->has_attr("defer");
+            if (!se.src.empty() || !se.inline_code.empty()) {
+                out.push_back(std::move(se));
+            }
+            return;
+        }
+        for (const DomNode* ch : n->children) walk(ch);
+    };
+    walk(root_);
+    return out;
 }
 
 DomNode* HtmlDocument::query_selector(std::string_view selector) const {

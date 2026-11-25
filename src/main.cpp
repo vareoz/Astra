@@ -8,17 +8,21 @@
 #include "gfx/font_engine.hpp"
 #include "gfx/image_decoder.hpp"
 #include "gfx/rasterizer.hpp"
+#include "gfx/svg_engine.hpp"
 #include "ipc/ipc_channel.hpp"
+#include "ipc/sandbox.hpp"
 #include "js/astra_js.hpp"
 #include "media/media_engine.hpp"
 #include "net/http2_client.hpp"
 #include "net/http_cache.hpp"
 #include "net/http_client.hpp"
 #include "net/websocket_client.hpp"
+#include "privacy/security_policy.hpp"
 #include "privacy/shield.hpp"
 
 #include <arpa/inet.h>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -51,7 +55,7 @@ void expect(bool cond, const std::string& label) {
 }
 
 int run_full_test_suite() {
-    std::cout << "=== Astra Browser Core v7 — Full Subsystem Verification Suite ===\n\n";
+    std::cout << "=== Astra Browser Core v10 — Full Open-Web & Media Verification Suite ===\n\n";
 
     // 1. SlabArena + OS Reclamation
     {
@@ -1020,6 +1024,1057 @@ int run_full_test_suite() {
                    "AstraJS v7 element.style.* camelCase proxy mutates inline CSS and reflects directly in LayoutEngine");
         }
 
+        // 39. AstraSVG v1: Native Inline <svg> Vector Parser, 2x2 AA Rasterizer & DisplayList ASD5 Pipeline
+        {
+            const std::string svg_xml =
+                "<svg width=\"120\" height=\"120\" viewBox=\"0 0 120 120\">"
+                "<rect x=\"4\" y=\"4\" width=\"112\" height=\"112\" rx=\"12\" fill=\"#0f172a\" stroke=\"#38bdf8\" stroke-width=\"4\"/>"
+                "<circle cx=\"60\" cy=\"60\" r=\"28\" fill=\"#10b981\"/>"
+                "<path d=\"M20 96 Q60 66 100 96\" stroke=\"#f59e0b\" stroke-width=\"4\" fill=\"none\"/>"
+                "</svg>";
+            SvgSurface surf = SvgEngine::render_svg(svg_xml, 120, 120);
+            uint32_t center_px = surf.valid ? surf.argb[60 * 120 + 60] : 0;
+            uint32_t bg_px = surf.valid ? surf.argb[20 * 120 + 20] : 0;
+            uint32_t corner_px = surf.valid ? surf.argb[0] : 0xFFFFFFFFu;
+            bool direct_ok = surf.valid && surf.width == 120 && surf.height == 120 &&
+                             center_px == 0xFF10B981u && bg_px == 0xFF0F172Au && (corner_px >> 24) == 0;
+
+            SlabArena svga;
+            HtmlDocument svgdoc = HtmlDocument::parse(
+                svga,
+                "<html><body style=\"margin:0;padding:0;background:#070b14;\">" + svg_xml + "</body></html>");
+            CssStylesheet svgsheet;
+            LayoutFrame* svgroot = LayoutEngine::build_layout(svga, svgdoc, svgsheet, 320.0f, 200.0f);
+            DisplayList dl = LayoutEngine::build_display_list(svgroot, 320, 200);
+            auto blob = dl.serialize();
+            DisplayList dl2;
+            bool deser_ok = DisplayList::deserialize(blob, dl2);
+            bool has_svg_item = false;
+            for (const auto& it : dl2.items) {
+                if (it.type == DisplayItemType::EmbedSvg && it.text.find("<circle") != std::string::npos) {
+                    has_svg_item = true;
+                }
+            }
+            Framebuffer fb(320, 200);
+            fb.composite_display_list(dl2, 0.0f);
+            uint32_t fb_center = fb.pixels()[60 * 320 + 60];
+            expect(direct_ok && deser_ok && has_svg_item && fb_center == 0xFF10B981u,
+                   "AstraSVG v1 renders <rect rx>, <circle>, and Bezier <path> through DisplayList ASD5 into Framebuffer");
+        }
+
+        // 40. AstraJS v8: ES6 Destructuring, Default Params, Array Spread, Object Shorthand & Functional Stdlib
+        {
+            SlabArena j8a;
+            HtmlDocument j8doc = HtmlDocument::parse(j8a, "<html><body><p id=\"j8\">init</p></body></html>");
+            AstraJsEngine j8vm;
+            std::string js =
+                "const cfg = { engine: \"Astra\", ver: 8, threads: 4 };\n"
+                "const { engine, ver: version } = cfg;\n"
+                "const nums = [1, 2, 3, 4, 5];\n"
+                "const [first, second] = nums;\n"
+                "const spread = [0, ...nums, 6];\n"
+                "function scale(x, factor = 10) { return x * factor; }\n"
+                "const evens = spread.filter((n) => n % 2 === 0 && n > 0);\n"
+                "const sum = evens.reduce((acc, n) => acc + n, 0);\n"
+                "const found = spread.find((n) => n > 4);\n"
+                "const sliced = spread.slice(1, 4).join(\"-\");\n"
+                "const rev = [\"a\", \"b\", \"c\"].reverse().join(\"\");\n"
+                "const shortObj = { engine, version };\n"
+                "const merged = Object.assign({}, shortObj, { ok: true });\n"
+                "const keysCount = Object.keys(merged).length;\n"
+                "const label = \"astra-core\".replace(\"core\", \"v8\");\n"
+                "const strChecks = label.startsWith(\"astra\") && label.endsWith(\"v8\") && (\"x\".repeat(3) === \"xxx\");\n"
+                "document.querySelector(\"#j8\").textContent = `${engine}:${version}|${first}+${second}|sum=${sum}|find=${found}|sl=${sliced}|rev=${rev}|sc=${scale(3)}|k=${keysCount}|${label}|${strChecks}`;\n";
+            auto rep = j8vm.execute(js, j8doc);
+            std::string got = j8doc.query_selector("#j8")->text_content();
+            expect(rep.ok && got == "Astra:8|1+2|sum=12|find=5|sl=1-2-3|rev=cba|sc=30|k=3|astra-v8|true",
+                   "AstraJS v8 executes ES6 destructuring, default params, array spread, shorthand objects, Object.* & Array/String stdlib");
+        }
+
+        // 41. AstraNet v7 + JS fetch(): General REST Methods (POST/PUT/DELETE) & Custom Request Headers
+        {
+            int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            int opt = 1;
+            if (listen_fd >= 0) ::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            addr.sin_port = 0;
+            bool bound = (listen_fd >= 0 &&
+                          ::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
+                          ::listen(listen_fd, 8) == 0);
+            socklen_t alen = sizeof(addr);
+            uint16_t port = 0;
+            if (bound && ::getsockname(listen_fd, reinterpret_cast<sockaddr*>(&addr), &alen) == 0) {
+                port = ntohs(addr.sin_port);
+            }
+
+            std::thread srv([&]() {
+                if (!bound) return;
+                // Handle 3 HTTP requests: JS fetch POST, HttpClient PUT, HttpClient DELETE
+                for (int i = 0; i < 3; ++i) {
+                    int cfd = ::accept(listen_fd, nullptr, nullptr);
+                    if (cfd < 0) break;
+                    std::string raw;
+                    char buf[2048];
+                    size_t header_end = std::string::npos;
+                    size_t content_len = 0;
+                    while (raw.size() < 16384) {
+                        ssize_t n = ::recv(cfd, buf, sizeof(buf), 0);
+                        if (n <= 0) break;
+                        raw.append(buf, static_cast<size_t>(n));
+                        if (header_end == std::string::npos) {
+                            header_end = raw.find("\r\n\r\n");
+                            if (header_end != std::string::npos) {
+                                std::string low = raw.substr(0, header_end);
+                                for (char& c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                                size_t clp = low.find("content-length:");
+                                if (clp != std::string::npos) {
+                                    content_len = static_cast<size_t>(std::strtoull(low.c_str() + clp + 15, nullptr, 10));
+                                }
+                            }
+                        }
+                        if (header_end != std::string::npos && raw.size() >= header_end + 4 + content_len) break;
+                    }
+                    std::string method = raw.substr(0, raw.find(' '));
+                    std::string body = (header_end != std::string::npos) ? raw.substr(header_end + 4) : "";
+                    std::string sess_hdr;
+                    size_t hp = raw.find("X-Astra-Session:");
+                    if (hp != std::string::npos) {
+                        size_t vs = hp + 16;
+                        while (vs < raw.size() && raw[vs] == ' ') ++vs;
+                        size_t ve = raw.find("\r\n", vs);
+                        if (ve != std::string::npos) sess_hdr = raw.substr(vs, ve - vs);
+                    }
+                    std::string json = "{\"method\":\"" + method + "\",\"session\":\"" + sess_hdr + "\",\"body\":\"" + body + "\"}";
+                    std::string resp =
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n"
+                        "Content-Length: " + std::to_string(json.size()) + "\r\n\r\n" + json;
+                    (void)::send(cfd, resp.data(), resp.size(), MSG_NOSIGNAL);
+                    ::close(cfd);
+                }
+            });
+
+            std::string endpoint = "http://127.0.0.1:" + std::to_string(port) + "/api/items";
+            std::string page_path = "/tmp/astra_v8_rest_test.html";
+            {
+                std::ofstream pf(page_path);
+                pf << "<html><body><p id=\"rest\">init</p><script>"
+                   << "const r = fetch(\"" << endpoint << "\", {"
+                   << "  method: \"POST\","
+                   << "  headers: { \"X-Astra-Session\": \"v8-alpha\", \"Content-Type\": \"text/plain\" },"
+                   << "  body: \"hello-v8\""
+                   << "});"
+                   << "const data = r.json();"
+                   << "document.querySelector(\"#rest\").textContent = `${r.status}|${data.method}|${data.session}|${data.body}`;"
+                   << "</script></body></html>";
+            }
+            uint32_t rest_tid = app.new_tab("file://" + page_path);
+            (void)rest_tid;
+            std::string rest_out;
+            for (const auto& t : app.tabs()) {
+                if (t.id == rest_tid && t.live_doc) {
+                    const DomNode* p = t.live_doc->query_selector("#rest");
+                    if (p) rest_out = p->text_content();
+                }
+            }
+
+            AstraShield rest_shield;
+            HttpClient raw_http(rest_shield);
+            auto put_resp = raw_http.request("PUT", endpoint, "upd=1", {{"X-Astra-Session", "v8-put"}}, "text/plain");
+            auto del_resp = raw_http.request("DELETE", endpoint, "", {{"X-Astra-Session", "v8-del"}}, "text/plain");
+
+            if (srv.joinable()) srv.join();
+            if (listen_fd >= 0) ::close(listen_fd);
+
+            bool ok_rest = bound &&
+                           rest_out == "200|POST|v8-alpha|hello-v8" &&
+                           put_resp.status_code == 200 && put_resp.body.find("\"method\":\"PUT\"") != std::string::npos &&
+                           put_resp.body.find("\"session\":\"v8-put\"") != std::string::npos &&
+                           del_resp.status_code == 200 && del_resp.body.find("\"method\":\"DELETE\"") != std::string::npos &&
+                           del_resp.body.find("\"session\":\"v8-del\"") != std::string::npos;
+            expect(ok_rest,
+                   "AstraNet v7 & JS fetch() deliver POST/PUT/DELETE methods, custom headers & request bodies end-to-end");
+        }
+
+        // 42. CSS3 Level 8: :first-child/:last-child/:focus, flex-wrap:wrap, border-left & transform:translate()
+        {
+            SlabArena c8a;
+            HtmlDocument c8doc = HtmlDocument::parse(
+                c8a,
+                "<html><head><style>"
+                "body { margin: 0; padding: 0; }"
+                ".wrap { display: flex; flex-wrap: wrap; gap: 10px; width: 250px; }"
+                ".chip { width: 110px; height: 40px; background: #1e293b; color: #cbd5e1; }"
+                ".chip:first-child { background: #0284c7; border-left: 4px solid #38bdf8; }"
+                ".chip:last-child { background: #065f46; transform: translate(15px, 10px); }"
+                "</style></head><body>"
+                "<div class=\"wrap\">"
+                "<div class=\"chip\">One</div>"
+                "<div class=\"chip\">Two</div>"
+                "<div class=\"chip\">Three</div>"
+                "</div></body></html>");
+            CssStylesheet c8sheet;
+            c8sheet.parse(c8doc.collect_stylesheets());
+            LayoutFrame* c8root = LayoutEngine::build_layout(c8a, c8doc, c8sheet, 400.0f, 300.0f);
+            bool ok_c8 = false;
+            if (c8root && !c8root->children.empty() && c8root->children[0]->children.size() == 3) {
+                const LayoutFrame* f0 = c8root->children[0]->children[0];
+                const LayoutFrame* f1 = c8root->children[0]->children[1];
+                const LayoutFrame* f2 = c8root->children[0]->children[2];
+                // Row 1: f0 (x=0, y=0) + f1 (x=120, y=0) = 230px <= 250px.
+                // Row 2: f2 wraps to y=50px, then transform:translate(15px, 10px) -> x=15px, y=60px.
+                DisplayList c8dl = LayoutEngine::build_display_list(c8root, 400, 300);
+                bool has_accent_bar = false;
+                for (const auto& it : c8dl.items) {
+                    if (it.type == DisplayItemType::FillRect && it.color_argb == 0xFF38BDF8u &&
+                        std::abs(it.rect.w - 4.0f) < 0.5f) {
+                        has_accent_bar = true;
+                    }
+                }
+                ok_c8 = f0->style.background.to_argb() == 0xFF0284C7u &&
+                        f1->style.background.to_argb() == 0xFF1E293Bu &&
+                        f2->style.background.to_argb() == 0xFF065F46u &&
+                        std::abs(f0->border_box.x - 0.0f) < 1.0f &&
+                        std::abs(f1->border_box.x - 120.0f) < 1.0f &&
+                        std::abs(f2->border_box.x - 15.0f) < 1.0f &&
+                        std::abs(f2->border_box.y - 60.0f) < 1.5f &&
+                        has_accent_bar;
+            }
+            expect(ok_c8,
+                   "CSS3 Level 8 resolves :first-child/:last-child, flex-wrap multi-row layout, border-left accent & transform:translate()");
+        }
+
+        // 43. End-to-End Session 8 Showcase (astra_session8.html): Inline SVG + Flex-Wrap + ES6 JS + Render
+        {
+            std::string showcase_path = "astra/examples/astra_session8.html";
+            if (!std::filesystem::exists(showcase_path)) showcase_path = "examples/astra_session8.html";
+            uint32_t s8_tid = app.new_tab("file://" + showcase_path);
+            bool has_svg = false;
+            std::string js_summary;
+            for (const auto& t : app.tabs()) {
+                if (t.id == s8_tid) {
+                    for (const auto& it : t.cached_display_list.items) {
+                        if (it.type == DisplayItemType::EmbedSvg) has_svg = true;
+                    }
+                    if (t.live_doc) {
+                        if (const DomNode* el = t.live_doc->query_selector("#s8-js-out")) {
+                            js_summary = el->text_content();
+                        }
+                    }
+                }
+            }
+            expect(has_svg && js_summary.find("v8") != std::string::npos && js_summary.find("48") != std::string::npos,
+                   "End-to-end astra_session8.html renders inline <svg>, flex-wrap CSS3 & ES6 AstraJS v8 pipeline");
+        }
+
+        // 44. Hito A — Real Web Layout v9: <table> + colspan, float/clear, inline-block, calc(), :nth-child, ::before/::after, <iframe srcdoc>
+        {
+            SlabArena a9;
+            HtmlDocument d9 = HtmlDocument::parse(
+                a9,
+                "<html><head><style>"
+                "body { margin: 0; padding: 0; }"
+                ".side { float: right; width: 200px; height: 80px; background: #1e293b; }"
+                ".main { width: calc(100% - 200px); background: #0f172a; }"
+                ".hdr::before { content: \"PRE \"; color: #38bdf8; }"
+                ".hdr::after { content: \" POST\"; color: #34d399; }"
+                ".ib { display: inline-block; width: 90px; height: 24px; background: #1d4ed8; }"
+                "table { width: 400px; }"
+                "tr:nth-child(even) { background: #132038; }"
+                ".after { clear: both; height: 20px; }"
+                "</style></head><body>"
+                "<div class=\"side\">FloatBox</div>"
+                "<div class=\"main\">"
+                "  <div class=\"hdr\">Title</div>"
+                "  <span class=\"ib\">A</span><span class=\"ib\">B</span>"
+                "  <table><tr><th>H1</th><th>H2</th></tr>"
+                "         <tr><td>R1C1</td><td>R1C2</td></tr>"
+                "         <tr><td colspan=\"2\">Span2</td></tr></table>"
+                "</div>"
+                "<div class=\"after\">Cleared</div>"
+                "<iframe srcdoc=\"<html><body><p>NestedDoc</p></body></html>\" style=\"width:240px;height:60px;\"></iframe>"
+                "</body></html>");
+            CssStylesheet s9;
+            s9.parse(d9.collect_stylesheets());
+            LayoutFrame* r9 = LayoutEngine::build_layout(a9, d9, s9, 800.0f, 600.0f);
+            DisplayList dl9 = LayoutEngine::build_display_list(r9, 800, 600);
+
+            bool ok_float_x = false, ok_calc_w = false, ok_clear_y = false;
+            bool ok_inline_block = false, ok_table_cols = false, ok_nth_even = false;
+            bool ok_before = false, ok_after = false, ok_iframe = false;
+
+            if (r9 && r9->children.size() >= 4) {
+                const LayoutFrame* f_side = r9->children[0];
+                const LayoutFrame* f_main = r9->children[1];
+                const LayoutFrame* f_after = r9->children[2];
+                ok_float_x = (f_side->border_box.x >= 595.0f && f_side->border_box.w >= 195.0f);
+                ok_calc_w = (std::abs(f_main->border_box.w - 600.0f) < 2.0f);
+                ok_clear_y = (f_after->border_box.y >= f_side->border_box.y + f_side->border_box.h - 1.0f);
+
+                // Check inline-block siblings side-by-side and table columns
+                const LayoutFrame* ib1 = nullptr;
+                const LayoutFrame* ib2 = nullptr;
+                const LayoutFrame* tbl = nullptr;
+                for (const LayoutFrame* ch : f_main->children) {
+                    if (ch->style.display == DisplayType::InlineBlock) {
+                        if (!ib1) ib1 = ch;
+                        else if (!ib2) ib2 = ch;
+                    }
+                    if (ch->node && ch->node->tag == "table") tbl = ch;
+                }
+                if (ib1 && ib2) {
+                    ok_inline_block = (ib2->border_box.x > ib1->border_box.x + 50.0f &&
+                                       std::abs(ib1->border_box.y - ib2->border_box.y) < 2.0f);
+                }
+                if (tbl) {
+                    std::vector<const LayoutFrame*> rows;
+                    std::function<void(const LayoutFrame*)> gather_rows = [&](const LayoutFrame* n) {
+                        if (!n) return;
+                        if (n->style.display == DisplayType::TableRow) rows.push_back(n);
+                        for (const LayoutFrame* c : n->children) gather_rows(c);
+                    };
+                    gather_rows(tbl);
+                    if (rows.size() == 3 && rows[1]->children.size() == 2 && rows[2]->children.size() == 1) {
+                        const LayoutFrame* c0 = rows[1]->children[0];
+                        const LayoutFrame* c1 = rows[1]->children[1];
+                        const LayoutFrame* span2 = rows[2]->children[0];
+                        ok_table_cols = (c1->border_box.x > c0->border_box.x + 80.0f) &&
+                                        (span2->border_box.w > c0->border_box.w * 1.5f);
+                        ok_nth_even = (rows[1]->style.background.to_argb() == 0xFF132038u);
+                    }
+                }
+            }
+            for (const auto& it : dl9.items) {
+                if (it.type == DisplayItemType::DrawText) {
+                    if (it.text.find("PRE") != std::string::npos) ok_before = true;
+                    if (it.text.find("POST") != std::string::npos) ok_after = true;
+                    if (it.text.find("NestedDoc") != std::string::npos) ok_iframe = true;
+                }
+            }
+            bool all44 = ok_float_x && ok_calc_w && ok_clear_y && ok_inline_block &&
+                         ok_table_cols && ok_nth_even && ok_before && ok_after && ok_iframe;
+            if (!all44) {
+                std::cerr << "    [diag44] float=" << ok_float_x << " calc=" << ok_calc_w
+                          << " clear=" << ok_clear_y << " ib=" << ok_inline_block
+                          << " tbl=" << ok_table_cols << " nth=" << ok_nth_even
+                          << " bef=" << ok_before << " aft=" << ok_after << " ifr=" << ok_iframe << "\n";
+            }
+            expect(all44,
+                   "Hito A: CSS3 Layout v9 handles <table>+colspan, float/clear, inline-block, calc(), :nth-child, ::before/::after & <iframe srcdoc>");
+        }
+
+        // 45. Hito A — AstraImage v3: Pure-C++20 GIF89a LZW Decoder (with Transparency) & WebP RIFF Probe
+        {
+            // Build a spec-valid 4x2 GIF89a image with 4-color GCT, transparent index=3, min_code_size=4 (5-bit codes)
+            std::vector<uint8_t> gif = {
+                'G','I','F','8','9','a',
+                4, 0, 2, 0, 0x91, 0, 0,
+                255, 0, 0,     // 0: Red
+                0, 255, 0,     // 1: Green
+                0, 0, 255,     // 2: Blue
+                255, 255, 0,   // 3: Transparent
+                0x21, 0xF9, 0x04, 0x01, 0x00, 0x00, 0x03, 0x00,
+                0x2C, 0, 0, 0, 0, 4, 0, 2, 0, 0x00,
+                4 // LZW minimum code size = 4 (clear=16, EOI=17, code width=5 bits)
+            };
+            const int codes[] = {16, 0, 1, 2, 3, 2, 1, 0, 3, 17};
+            std::vector<uint8_t> lzw_bytes;
+            uint32_t bitbuf = 0;
+            int bitcnt = 0;
+            for (int c : codes) {
+                bitbuf |= (static_cast<uint32_t>(c) << bitcnt);
+                bitcnt += 5;
+                while (bitcnt >= 8) {
+                    lzw_bytes.push_back(static_cast<uint8_t>(bitbuf & 0xFFu));
+                    bitbuf >>= 8;
+                    bitcnt -= 8;
+                }
+            }
+            if (bitcnt > 0) lzw_bytes.push_back(static_cast<uint8_t>(bitbuf & 0xFFu));
+            gif.push_back(static_cast<uint8_t>(lzw_bytes.size()));
+            gif.insert(gif.end(), lzw_bytes.begin(), lzw_bytes.end());
+            gif.push_back(0x00); // block terminator
+            gif.push_back(0x3B); // GIF trailer
+
+            DecodedImage gimg = ImageDecoder::decode_bytes(gif.data(), gif.size());
+            bool ok_gif = gimg.valid && gimg.width == 4 && gimg.height == 2 && gimg.argb.size() == 8 &&
+                          gimg.argb[0] == 0xFFFF0000u &&
+                          gimg.argb[1] == 0xFF00FF00u &&
+                          gimg.argb[2] == 0xFF0000FFu &&
+                          (gimg.argb[3] >> 24) == 0u &&
+                          gimg.argb[4] == 0xFF0000FFu &&
+                          gimg.argb[5] == 0xFF00FF00u &&
+                          gimg.argb[6] == 0xFFFF0000u &&
+                          (gimg.argb[7] >> 24) == 0u;
+
+            // Minimal RIFF WEBP VP8X header probe (16x8 canvas)
+            std::vector<uint8_t> webp = {
+                'R','I','F','F', 22, 0, 0, 0,
+                'W','E','B','P',
+                'V','P','8','X', 10, 0, 0, 0,
+                0, 0, 0, 0,
+                15, 0, 0, // width - 1 = 15 -> 16
+                7, 0, 0   // height - 1 = 7 -> 8
+            };
+            DecodedImage wimg = ImageDecoder::decode_bytes(webp.data(), webp.size());
+            bool ok_webp = wimg.format == "WEBP" && wimg.width == 16 && wimg.height == 8;
+            if (!ok_gif || !ok_webp) {
+                std::cerr << "    [diag45] gif=" << ok_gif << " (" << gimg.valid << "," << gimg.width << "x" << gimg.height << "," << gimg.error << ") webp=" << ok_webp << " (" << wimg.width << "x" << wimg.height << "," << wimg.error << ")\n";
+            }
+            expect(ok_gif && ok_webp,
+                   "Hito A: AstraImage v3 decodes GIF89a LZW (with transparency) & RIFF WebP frames");
+        }
+
+        // 46. Hito A — Native HTML <form method="GET"> Submission + URL-Encoding
+        {
+            std::string target_path = "/tmp/astra_v9_form_target.html";
+            std::string form_path = "/tmp/astra_v9_form_page.html";
+            {
+                std::ofstream tf(target_path);
+                tf << "<html><head><title>Search Results</title></head><body><h1>Results</h1></body></html>";
+            }
+            {
+                std::ofstream ff(form_path);
+                ff << "<html><head><title>Search Form</title></head><body>"
+                   << "<form action=\"file://" << target_path << "\" method=\"GET\">"
+                   << "<input id=\"q\" name=\"q\" value=\"\" style=\"width:240px;height:32px;\" />"
+                   << "<button id=\"sub\" type=\"submit\">Go</button>"
+                   << "</form></body></html>";
+            }
+            uint32_t ftid = app.new_tab("file://" + form_path);
+            app.switch_tab(ftid);
+            bool clicked_input = false;
+            if (const Tab* t = app.active_tab()) {
+                for (const auto& hr : t->cached_display_list.hit_regions) {
+                    if (hr.kind == HitRegionKind::Input) {
+                        int cx = static_cast<int>(hr.rect.x + hr.rect.w * 0.5f);
+                        int cy = Framebuffer::kChromeHeight + static_cast<int>(hr.rect.y + hr.rect.h * 0.5f);
+                        auto cr = app.click_at(cx, cy);
+                        clicked_input = cr.handled && cr.action == "focus_input";
+                        break;
+                    }
+                }
+            }
+            app.type_text("astra v9");
+            bool entered = app.press_enter();
+            std::string final_u = app.active_tab() ? app.active_tab()->url : "";
+            expect(clicked_input && entered &&
+                   final_u == ("file://" + target_path + "?q=astra%20v9"),
+                   "Hito A: HTML <form method=\"GET\"> collects <input name>, URL-encodes query & navigates on Enter");
+        }
+
+        // 47. Hito B — AstraJS v9: Real [[Prototype]] Chain, class extends, instanceof, RegExp, Date, Map & Set
+        {
+            SlabArena j9a;
+            HtmlDocument j9doc = HtmlDocument::parse(j9a, "<html><body><div id=\"out\"></div></body></html>");
+            AstraJsEngine vm9;
+            auto rep = vm9.execute(
+                "function Animal(n) { this.name = n; }\n"
+                "Animal.prototype.speak = function() { return this.name + '!'; };\n"
+                "const a = new Animal('Fox');\n"
+                "const child = Object.create(a);\n"
+                "const pOk = (Object.getPrototypeOf(child) === a) && (child.speak() === 'Fox!') && (a instanceof Animal);\n"
+                "class Base { constructor(x) { this.x = x; } baseVal() { return this.x * 2; } }\n"
+                "class Sub extends Base { constructor(x) { super(x); } subVal() { return this.baseVal() + 7; } }\n"
+                "const s = new Sub(10);\n"
+                "const cOk = (s instanceof Sub) && (s instanceof Base) && (s.subVal() === 27);\n"
+                "const re = /([a-z]+)-(\\d+)/i;\n"
+                "const m = re.exec('Core ASTRA-900 ok');\n"
+                "const rOk = re.test('foo-42') && m[1] === 'ASTRA' && m[2] === '900' && "
+                "  'x1y2z3'.replace(/\\d/g, '_') === 'x_y_z_' && 'a,b;c'.split(/[,;]/).join('|') === 'a|b|c';\n"
+                "const dt = new Date('2026-11-25T10:30:45Z');\n"
+                "const dOk = dt.getUTCFullYear() === 2026 && dt.getUTCMonth() === 10 && dt.getUTCDate() === 25 && "
+                "  dt.toISOString() === '2026-11-25T10:30:45.000Z' && Date.now() > 1700000000000;\n"
+                "const mp = new Map();\n"
+                "mp.set('k1', 10); mp.set('k2', 20); mp.set('k1', 30);\n"
+                "let msum = 0; for (const v of mp.values()) { msum = msum + v; }\n"
+                "const st = new Set(); st.add('a'); st.add('b'); st.add('a');\n"
+                "let sjoin = ''; for (const v of st) { sjoin = sjoin + v; }\n"
+                "const collOk = mp.size === 2 && mp.get('k1') === 30 && msum === 50 && st.size === 2 && st.has('b') && sjoin === 'ab';\n"
+                "document.querySelector('#out').textContent = `${pOk}|${cOk}|${rOk}|${dOk}|${collOk}`;\n",
+                j9doc);
+            std::string out = j9doc.query_selector("#out") ? j9doc.query_selector("#out")->text_content() : "";
+            if (!rep.ok || out != "true|true|true|true|true") {
+                std::cerr << "    [diag47] rep.ok=" << rep.ok << " err=" << rep.error << " out='" << out << "'\n";
+            }
+            expect(rep.ok && out == "true|true|true|true|true",
+                   "Hito B: AstraJS v9 executes [[Prototype]] chains, class extends, instanceof, RegExp, Date, Map & Set");
+        }
+
+        // 48. Hito B — SPA Runtime: history.pushState/replaceState, location.* & sessionStorage
+        {
+            std::string spa_path = "/tmp/astra_v9_spa_test.html";
+            {
+                std::ofstream sf(spa_path);
+                sf << "<html><body><div id=\"spa\">init</div><script>"
+                   << "sessionStorage.setItem('token', 'spa-ok');"
+                   << "history.pushState({ page: 2 }, '', '/docs/v9?tab=api#top');"
+                   << "const st = history.state;"
+                   << "document.querySelector('#spa').textContent = "
+                   << "  location.pathname + '|' + location.search + '|' + location.hash + '|' + "
+                   << "  history.length + '|' + st.page + '|' + sessionStorage.getItem('token');"
+                   << "</script></body></html>";
+            }
+            uint32_t stid = app.new_tab("file://" + spa_path);
+            app.switch_tab(stid);
+            std::string spa_out, tab_url;
+            if (const Tab* t = app.active_tab()) {
+                tab_url = t->url;
+                if (t->live_doc && t->live_doc->query_selector("#spa")) {
+                    spa_out = t->live_doc->query_selector("#spa")->text_content();
+                }
+            }
+            expect(spa_out == "/docs/v9|?tab=api|#top|2|2|spa-ok" &&
+                   tab_url.find("/docs/v9?tab=api#top") != std::string::npos,
+                   "Hito B: SPA history.pushState, location.*, and sessionStorage update VM and BrowserApp tab URL");
+        }
+
+        // 49. Hito C — Real Kernel seccomp-BPF Sandbox + CSP + Mixed Content + SOP/CORS + SameSite Cookies + Site Isolation
+        {
+            std::string seccomp_detail;
+            bool ok_seccomp = ProcessSandbox::self_verify_seccomp(&seccomp_detail);
+
+            // CSP inline-script & connect-src enforcement
+            ContentSecurityPolicy csp;
+            csp.parse("default-src 'self'; script-src 'self'; connect-src 'self' https://*.trusted.example");
+            SecurityOrigin doc_org = SecurityOrigin::from_url("https://app.example.com/index.html");
+            bool ok_csp = !csp.allows_inline_script() &&
+                          csp.allows_url(ResourceKind::Connect, "https://app.example.com/api", doc_org) &&
+                          csp.allows_url(ResourceKind::Connect, "https://api.trusted.example/v1", doc_org) &&
+                          !csp.allows_url(ResourceKind::Connect, "https://evil.attacker.org/exfil", doc_org);
+
+            // CSP <meta> enforcement inside BrowserApp tab (blocks inline script)
+            std::string csp_page = "/tmp/astra_v9_csp_test.html";
+            {
+                std::ofstream cf(csp_page);
+                cf << "<html><head><meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'none'\"></head>"
+                   << "<body><p id=\"v\">SAFE</p><script>document.querySelector('#v').textContent='PWNED';</script></body></html>";
+            }
+            uint32_t csp_tid = app.new_tab("file://" + csp_page);
+            std::string csp_text;
+            size_t csp_blocks = 0;
+            for (const auto& t : app.tabs()) {
+                if (t.id == csp_tid) {
+                    csp_blocks = t.csp_blocks;
+                    if (t.live_doc && t.live_doc->query_selector("#v")) {
+                        csp_text = t.live_doc->query_selector("#v")->text_content();
+                    }
+                }
+            }
+            bool ok_csp_dom = (csp_text == "SAFE" && csp_blocks >= 1);
+
+            // Mixed Content blocking (blocks http:// & ws:// active resources on https://)
+            bool ok_mixed = MixedContentBlocker::is_blocked(doc_org, "http://insecure.example/script.js", ResourceKind::Script) &&
+                            MixedContentBlocker::is_blocked(doc_org, "ws://insecure.example/live", ResourceKind::Connect) &&
+                            !MixedContentBlocker::is_blocked(doc_org, "https://cdn.example/script.js", ResourceKind::Script);
+
+            // SOP / CORS Access-Control-Allow-Origin enforcement
+            std::map<std::string, std::string> no_cors_hdrs{{"content-type", "application/json"}};
+            std::map<std::string, std::string> ok_cors_hdrs{{"Access-Control-Allow-Origin", "https://app.example.com"}};
+            bool ok_cors = !CorsEnforcer::allows_response(doc_org, "https://other.example.net/data", no_cors_hdrs) &&
+                           CorsEnforcer::allows_response(doc_org, "https://other.example.net/data", ok_cors_hdrs) &&
+                           CorsEnforcer::allows_response(doc_org, "https://app.example.com/same", no_cors_hdrs);
+
+            // SameSite=Strict / Lax / None cookie enforcement in AstraShield
+            AstraShield ss_shield;
+            ss_shield.store_cookie("bank.example", "https://bank.example", "sid=strict1; SameSite=Strict");
+            ss_shield.store_cookie("bank.example", "https://bank.example", "bad=none_no_sec; SameSite=None");
+            ss_shield.store_cookie("evil.example", "https://bank.example", "sid=strict1; SameSite=Strict");
+            ss_shield.store_cookie("evil.example", "https://bank.example", "lax=lax1; SameSite=Lax");
+            ss_shield.store_cookie("evil.example", "https://bank.example", "none=ok1; SameSite=None; Secure");
+            std::string same_site_hdr = ss_shield.cookie_header_for("bank.example", "https://bank.example", true, true);
+            std::string cross_top_hdr = ss_shield.cookie_header_for("evil.example", "https://bank.example", true, true);
+            std::string cross_sub_hdr = ss_shield.cookie_header_for("evil.example", "https://bank.example", true, false);
+            bool ok_samesite = (same_site_hdr.find("sid=strict1") != std::string::npos) &&
+                               (same_site_hdr.find("bad=") == std::string::npos) &&
+                               (cross_top_hdr.find("sid=strict1") == std::string::npos) &&
+                               (cross_top_hdr.find("lax=lax1") != std::string::npos) &&
+                               (cross_sub_hdr.find("lax=lax1") == std::string::npos) &&
+                               (cross_sub_hdr.find("none=ok1") != std::string::npos);
+
+            // Per-origin Site Isolation worker spawning for distinct sites
+            WorkerProcess* w_a = app.acquire_content_worker_for_origin(SecurityOrigin::from_url("https://alpha.example/"));
+            WorkerProcess* w_b = app.acquire_content_worker_for_origin(SecurityOrigin::from_url("https://beta.example/"));
+            bool ok_site_iso = (w_a != nullptr && w_b != nullptr && w_a->pid() != w_b->pid() &&
+                                app.site_isolated_worker_count() >= 3);
+
+            bool all49 = ok_seccomp && ok_csp && ok_csp_dom && ok_mixed && ok_cors && ok_samesite && ok_site_iso;
+            if (!all49) {
+                std::cerr << "    [diag49] seccomp=" << ok_seccomp << "(" << seccomp_detail << ")"
+                          << " csp=" << ok_csp << " csp_dom=" << ok_csp_dom
+                          << " mixed=" << ok_mixed << " cors=" << ok_cors
+                          << " samesite=" << ok_samesite << " site_iso=" << ok_site_iso << "\n";
+            }
+            expect(all49,
+                   "Hito C: Kernel seccomp-BPF sandbox (EPERM verified), CSP, Mixed Content, CORS/SOP, SameSite & Site Isolation");
+        }
+
+        // 50. Hito C — Adversarial Parser Fuzz-Resistance Harness + End-to-End astra_session9.html
+        {
+            // Hammer HTML, CSS, Image (PNG/JPEG/GIF/WebP), SVG, and HPACK parsers with hostile/truncated payloads
+            const std::vector<std::string> hostile_inputs = {
+                "",
+                std::string(2048, '<'),
+                "<table><tr><td colspan=\"999999999\"><div><span><iframe srcdoc=\"<iframe srcdoc='<iframe srcdoc=x>'>\">",
+                "@media ((((((( { .a:nth-child(999999n-999999)::before { width: calc((((100% / 0) + 1e38px)); content: \"unterminated",
+                std::string("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\xff\xff\xff\xff\xff\xff\xff\xff", 24),
+                std::string("\xff\xd8\xff\xc0\x00\x11\x08\xff\xff\xff\xff\x03\x01\x22\x00", 15),
+                std::string("GIF89a\xff\xff\xff\xff\xf7\x00\x00\x2c\x00\x00\x00\x00\xff\xff\xff\xff\x00\x0c\x04\xff\xff\xff\xff", 29),
+                std::string("RIFF\x10\x00\x00\x00WEBPVP8X\x0a\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff\xff\xff", 30),
+                "<svg viewBox=\"0 0 0 0\"><path d=\"M 1e99 1e99 C 0 0 0 0 0 0 Q Z L H V 9999999\" /><circle r=\"-50\"/></svg>"
+            };
+            uint32_t rng = 0xDEADBEEFu;
+            for (int iter = 0; iter < 40; ++iter) {
+                std::string rnd(96, '\0');
+                for (char& c : rnd) {
+                    rng = rng * 1664525u + 1013904223u;
+                    c = static_cast<char>(rng >> 24);
+                }
+                SlabArena fa(16 * 1024);
+                (void)HtmlDocument::parse(fa, rnd);
+                CssStylesheet fs;
+                fs.parse(rnd);
+                (void)ImageDecoder::decode_bytes(reinterpret_cast<const uint8_t*>(rnd.data()), rnd.size());
+                (void)SvgEngine::render_svg(rnd, 32, 32);
+                HpackCodec hp;
+                std::vector<std::pair<std::string, std::string>> h_out;
+                (void)hp.decode_headers(reinterpret_cast<const uint8_t*>(rnd.data()), rnd.size(), h_out);
+            }
+            for (const auto& payload : hostile_inputs) {
+                SlabArena fa(32 * 1024);
+                HtmlDocument fd = HtmlDocument::parse(fa, payload);
+                CssStylesheet fs;
+                fs.parse(payload);
+                (void)LayoutEngine::build_layout(fa, fd, fs, 800.0f, 600.0f);
+                (void)ImageDecoder::decode_bytes(reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+                (void)SvgEngine::render_svg(payload, 64, 64);
+                HpackCodec hp;
+                std::vector<std::pair<std::string, std::string>> h_out;
+                (void)hp.decode_headers(reinterpret_cast<const uint8_t*>(payload.data()), payload.size(), h_out);
+            }
+
+            // End-to-end verification of astra_session9.html
+            std::string s9_path = "astra/examples/astra_session9.html";
+            if (!std::filesystem::exists(s9_path)) s9_path = "examples/astra_session9.html";
+            uint32_t s9_tid = app.new_tab("file://" + s9_path);
+            std::string s9_proto, s9_regex, s9_colls, s9_route;
+            bool has_pseudo = false, has_iframe_txt = false;
+            for (const auto& t : app.tabs()) {
+                if (t.id == s9_tid) {
+                    if (t.live_doc) {
+                        if (auto* n = t.live_doc->query_selector("#spa-proto")) s9_proto = n->text_content();
+                        if (auto* n = t.live_doc->query_selector("#spa-regex")) s9_regex = n->text_content();
+                        if (auto* n = t.live_doc->query_selector("#spa-colls")) s9_colls = n->text_content();
+                        if (auto* n = t.live_doc->query_selector("#spa-route")) s9_route = n->text_content();
+                    }
+                    for (const auto& it : t.cached_display_list.items) {
+                        if (it.type == DisplayItemType::DrawText) {
+                            if (it.text.find("SECCOMP-BPF") != std::string::npos) has_pseudo = true;
+                            if (it.text.find("Embedded srcdoc") != std::string::npos) has_iframe_txt = true;
+                        }
+                    }
+                }
+            }
+            bool ok_s9 = s9_proto.find("astra-core@v9") != std::string::npos &&
+                         s9_proto.find("instanceof=true") != std::string::npos &&
+                         s9_regex.find("v9 (a#b#c#)") != std::string::npos &&
+                         s9_regex.find("2026-11-25") != std::string::npos &&
+                         s9_colls.find("Map(3)") != std::string::npos &&
+                         s9_colls.find("Set(2)=true") != std::string::npos &&
+                         s9_route.find("/wiki/astra-v9?milestone=all") != std::string::npos &&
+                         s9_route.find("v9-verified") != std::string::npos &&
+                         has_pseudo && has_iframe_txt;
+
+            if (!ok_s9) {
+                std::cerr << "    [diag50] proto='" << s9_proto << "' regex='" << s9_regex
+                          << "' colls='" << s9_colls << "' route='" << s9_route
+                          << "' pseudo=" << has_pseudo << " ifr=" << has_iframe_txt << "\n";
+            }
+            expect(ok_s9,
+                   "Hito C + E2E: Fuzz harness survives 49 hostile HTML/CSS/Image/SVG/HPACK payloads & astra_session9.html renders cleanly");
+        }
+
+        // 51. Open-Web CSS3 v10 ([attr], :not(), :is(), @layer, @supports, unknown pseudo = false, IFC horizontal inline flow)
+        {
+            SlabArena arena(128 * 1024);
+            std::string html = R"HTML(
+                <html><head><style>
+                    @layer base {
+                        .chip[data-role="author"] { color: #1d4ed8; font-weight: bold; }
+                        .chip[data-tag^="vid"] { color: #059669; }
+                    }
+                    @supports (display: grid) {
+                        p:not(.muted) { color: #111827; }
+                        :is(h1, h2).lead { font-size: 24px; }
+                    }
+                    .ghost:unknown-pseudo-v10 { display: none; }
+                </style></head>
+                <body bgcolor="#ffffff">
+                    <h2 class="lead">Open Web</h2>
+                    <div class="ghost" id="visible-ghost">Visible</div>
+                    <p id="main-p">Body</p>
+                    <div id="inline-row">
+                        <span class="chip" data-role="author">Alice</span>
+                        <span class="chip" data-tag="video-hd">HD</span>
+                        <a href="https://example.com">Watch</a>
+                    </div>
+                </body></html>
+            )HTML";
+            HtmlDocument doc = HtmlDocument::parse(arena, html);
+            CssStylesheet sheet;
+            sheet.parse(doc.collect_stylesheets());
+            LayoutFrame* root = LayoutEngine::build_layout(arena, doc, sheet, 800.0f, 600.0f, true);
+            DisplayList dl = LayoutEngine::build_display_list(root, 800, 600);
+
+            DomNode* ghost = doc.query_selector("#visible-ghost");
+            DomNode* lead = doc.query_selector("h2");
+            DomNode* author = doc.query_selector(".chip");
+            ComputedStyle ghost_st = StyleEngine::compute_style(ghost, sheet, nullptr, 800.0f, true);
+            ComputedStyle lead_st = StyleEngine::compute_style(lead, sheet, nullptr, 800.0f, true);
+            ComputedStyle author_st = StyleEngine::compute_style(author, sheet, nullptr, 800.0f, true);
+
+            // Verify horizontal IFC flow: "Alice" and "HD" share the same line (similar y, increasing x)
+            float alice_x = -1, alice_y = -1, hd_x = -1, hd_y = -1;
+            for (const auto& it : dl.items) {
+                if (it.type == DisplayItemType::DrawText) {
+                    if (it.text == "Alice") { alice_x = it.rect.x; alice_y = it.rect.y; }
+                    if (it.text == "HD") { hd_x = it.rect.x; hd_y = it.rect.y; }
+                }
+            }
+            bool ok51 = (ghost_st.display != DisplayType::None) &&
+                        (lead_st.font_size >= 23.5f) &&
+                        (author_st.color.r == 0x1d && author_st.color.b == 0xd8) &&
+                        (alice_x >= 0.0f && hd_x > alice_x && std::fabs(hd_y - alice_y) < 6.0f);
+            expect(ok51,
+                   "CSS3 v10: [attr], :not(), :is(), @layer/@supports, unknown-pseudo safety & horizontal IFC inline flow");
+        }
+
+        // 52. AstraImage v4 — SVG-in-<img> + data:image/svg+xml & data:image/png;base64 subresource decoding
+        {
+            std::string svg_xml = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"32\" height=\"32\"><circle cx=\"16\" cy=\"16\" r=\"14\" fill=\"#2563eb\"/></svg>";
+            DecodedImage img_svg = ImageDecoder::decode_bytes(
+                reinterpret_cast<const uint8_t*>(svg_xml.data()), svg_xml.size());
+
+            DecodedImage img_data_svg;
+            std::string data_svg_uri = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24'><rect width='24' height='24' fill='%23059669'/></svg>";
+            bool ok_data_svg = app.load_image_subresource("astra://home", data_svg_uri, img_data_svg);
+
+            // Minimal valid 1x1 red PNG in base64
+            DecodedImage img_data_png;
+            std::string data_png_uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+            bool ok_data_png = app.load_image_subresource("astra://home", data_png_uri, img_data_png);
+
+            expect(img_svg.valid && img_svg.format == "SVG" && img_svg.width == 32 &&
+                       ok_data_svg && img_data_svg.valid && img_data_svg.width == 24 &&
+                       ok_data_png && img_data_png.valid && img_data_png.width == 1 && img_data_png.height == 1,
+                   "AstraImage v4: Native SVG-in-<img> decoding + data:image/svg+xml & data:image/png;base64 URIs");
+        }
+
+        // 53. AstraNet v8 — Brotli (RFC 7932) Decompression + External <script src> + Remote <iframe src> over Loopback HTTP
+        {
+            static const uint8_t kBrotliHello[] = {
+                0x0b, 0x0b, 0x80, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x41, 0x73, 0x74, 0x72, 0x61,
+                0x20, 0x42, 0x72, 0x6f, 0x74, 0x6c, 0x69, 0x20, 0x76, 0x31, 0x30, 0x21, 0x03
+            };
+            std::string br_out;
+            bool ok_br = HttpClient::brotli_available() &&
+                         HttpClient::decompress_brotli(kBrotliHello, sizeof(kBrotliHello), br_out) &&
+                         br_out == "Hello Astra Brotli v10!";
+
+            // Spin up an ephemeral loopback HTTP server serving an HTML page with external <script src> + <iframe src> + Brotli body
+            int srv = ::socket(AF_INET, SOCK_STREAM, 0);
+            int opt = 1;
+            setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            addr.sin_port = 0;
+            bool srv_ok = (srv >= 0 && ::bind(srv, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 && ::listen(srv, 8) == 0);
+            uint16_t port = 0;
+            if (srv_ok) {
+                socklen_t alen = sizeof(addr);
+                getsockname(srv, reinterpret_cast<sockaddr*>(&addr), &alen);
+                port = ntohs(addr.sin_port);
+            }
+
+            std::thread srv_thread([srv, srv_ok]() {
+                if (!srv_ok) return;
+                for (int r = 0; r < 4; ++r) {
+                    int cfd = ::accept(srv, nullptr, nullptr);
+                    if (cfd < 0) break;
+                    char buf[2048]{};
+                    ssize_t n = ::recv(cfd, buf, sizeof(buf) - 1, 0);
+                    std::string req(buf, n > 0 ? static_cast<size_t>(n) : 0);
+                    std::string body, ctype = "text/html", extra;
+                    if (req.find("GET /app.js ") != std::string::npos) {
+                        ctype = "application/javascript";
+                        body = "const el = document.getElementById('ext-out'); if (el) el.textContent = 'EXT_JS_OK';";
+                    } else if (req.find("GET /frame.html ") != std::string::npos) {
+                        body = "<html><body><p>REMOTE_IFRAME_OK</p></body></html>";
+                    } else if (req.find("GET /br ") != std::string::npos) {
+                        ctype = "text/plain";
+                        extra = "Content-Encoding: br\r\n";
+                        body.assign(reinterpret_cast<const char*>(kBrotliHello), sizeof(kBrotliHello));
+                    } else {
+                        body = "<!doctype html><html><head><title>Loopback v10</title></head><body>"
+                               "<div id='ext-out'>pending</div>"
+                               "<iframe src='/frame.html' width='300' height='80'></iframe>"
+                               "<script src='/app.js'></script></body></html>";
+                    }
+                    std::ostringstream resp;
+                    resp << "HTTP/1.1 200 OK\r\nContent-Type: " << ctype << "\r\n" << extra
+                         << "Content-Length: " << body.size() << "\r\nConnection: close\r\n\r\n" << body;
+                    std::string raw = resp.str();
+                    ::send(cfd, raw.data(), raw.size(), MSG_NOSIGNAL);
+                    ::close(cfd);
+                }
+                ::close(srv);
+            });
+
+            std::string br_http_body;
+            std::string ext_js_text;
+            bool has_iframe_text = false;
+            if (srv_ok) {
+                HttpResponse br_resp = app.http_client().get("http://127.0.0.1:" + std::to_string(port) + "/br", "", false);
+                br_http_body = br_resp.body;
+
+                uint32_t lb_tid = app.new_tab("http://127.0.0.1:" + std::to_string(port) + "/");
+                for (const auto& t : app.tabs()) {
+                    if (t.id == lb_tid) {
+                        if (t.live_doc) {
+                            if (auto* n = t.live_doc->query_selector("#ext-out")) ext_js_text = n->text_content();
+                        }
+                        for (const auto& it : t.cached_display_list.items) {
+                            if (it.type == DisplayItemType::DrawText && it.text.find("REMOTE_IFRAME_OK") != std::string::npos) {
+                                has_iframe_text = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if (srv_thread.joinable()) srv_thread.join();
+
+            expect(ok_br && br_http_body == "Hello Astra Brotli v10!" &&
+                       ext_js_text == "EXT_JS_OK" && has_iframe_text,
+                   "AstraNet v8: Native Brotli (RFC 7932) HTTP decompression + external <script src> + remote <iframe src>");
+        }
+
+        // 54. AstraMedia v5 — HLS (.m3u8) Master/Media Parser + Remote HTTP <video><source> RDD Decode
+        {
+            std::string master_m3u8 =
+                "#EXTM3U\n"
+                "#EXT-X-STREAM-INF:BANDWIDTH=1280000,RESOLUTION=640x360\n"
+                "streams/low.m3u8\n"
+                "#EXT-X-STREAM-INF:BANDWIDTH=2560000,RESOLUTION=1280x720\n"
+                "streams/hd.m3u8\n";
+            HlsPlaylist mpl = MediaEngine::parse_hls_playlist(master_m3u8, "https://cdn.example.com/live/master.m3u8");
+
+            std::string media_m3u8 =
+                "#EXTM3U\n"
+                "#EXT-X-TARGETDURATION:4\n"
+                "#EXTINF:4.0,\n"
+                "seg001.ts\n"
+                "#EXTINF:4.0,\n"
+                "seg002.ts\n";
+            HlsPlaylist spl = MediaEngine::parse_hls_playlist(media_m3u8, "https://cdn.example.com/live/streams/low.m3u8");
+
+            bool ok_hls = mpl.valid && mpl.is_master && mpl.variant_urls.size() == 2 &&
+                          mpl.variant_urls[0] == "https://cdn.example.com/live/streams/low.m3u8" &&
+                          spl.valid && !spl.is_master && spl.target_duration_sec == 4.0 &&
+                          spl.segment_urls.size() == 2 &&
+                          spl.segment_urls[0] == "https://cdn.example.com/live/streams/seg001.ts";
+
+            // Serve astra_demo.mp4 over loopback HTTP and verify <video><source src="http://..."> decodes via RDD worker
+            std::string mp4_path = "astra/examples/astra_demo.mp4";
+            if (!std::filesystem::exists(mp4_path)) mp4_path = "examples/astra_demo.mp4";
+            std::string mp4_bytes;
+            {
+                std::ifstream mf(mp4_path, std::ios::binary);
+                std::ostringstream oss;
+                oss << mf.rdbuf();
+                mp4_bytes = oss.str();
+            }
+
+            bool ok_remote_vid = false;
+            if (!mp4_bytes.empty()) {
+                int srv = ::socket(AF_INET, SOCK_STREAM, 0);
+                int opt = 1;
+                setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+                sockaddr_in addr{};
+                addr.sin_family = AF_INET;
+                addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                addr.sin_port = 0;
+                if (srv >= 0 && ::bind(srv, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 && ::listen(srv, 4) == 0) {
+                    socklen_t alen = sizeof(addr);
+                    getsockname(srv, reinterpret_cast<sockaddr*>(&addr), &alen);
+                    uint16_t port = ntohs(addr.sin_port);
+                    std::thread vt([srv, &mp4_bytes]() {
+                        for (int r = 0; r < 2; ++r) {
+                            int cfd = ::accept(srv, nullptr, nullptr);
+                            if (cfd < 0) break;
+                            char buf[1024]{};
+                            ssize_t n = ::recv(cfd, buf, sizeof(buf) - 1, 0);
+                            std::string req(buf, n > 0 ? static_cast<size_t>(n) : 0);
+                            std::string body, ctype;
+                            if (req.find("GET /clip.mp4 ") != std::string::npos) {
+                                ctype = "video/mp4";
+                                body = mp4_bytes;
+                            } else {
+                                ctype = "text/html";
+                                body = "<html><body><video controls style='height:200px;'><source src='/clip.mp4' type='video/mp4'></video></body></html>";
+                            }
+                            std::ostringstream resp;
+                            resp << "HTTP/1.1 200 OK\r\nContent-Type: " << ctype
+                                 << "\r\nContent-Length: " << body.size() << "\r\nConnection: close\r\n\r\n";
+                            std::string hdr = resp.str();
+                            ::send(cfd, hdr.data(), hdr.size(), MSG_NOSIGNAL);
+                            size_t sent = 0;
+                            while (sent < body.size()) {
+                                ssize_t s = ::send(cfd, body.data() + sent, body.size() - sent, MSG_NOSIGNAL);
+                                if (s <= 0) break;
+                                sent += static_cast<size_t>(s);
+                            }
+                            ::close(cfd);
+                        }
+                        ::close(srv);
+                    });
+
+                    uint32_t vtid = app.new_tab("http://127.0.0.1:" + std::to_string(port) + "/player");
+                    app.switch_tab(vtid);
+                    Framebuffer vfb(640, 420);
+                    ok_remote_vid = app.paint_active_tab(vfb) &&
+                                    std::filesystem::exists("/tmp/astra_media_cache");
+                    if (vt.joinable()) vt.join();
+                }
+            }
+            expect(ok_hls && ok_remote_vid,
+                   "AstraMedia v5: HLS (.m3u8) Master/Media playlist parser + remote HTTP <video><source> RDD decode");
+        }
+
+        // 55. AstraJS v10 — Web, Social & HTMLMediaElement APIs (window, navigator, URL, URLSearchParams, btoa/atob, DOM, video.play)
+        {
+            SlabArena arena(128 * 1024);
+            HtmlDocument doc = HtmlDocument::parse(arena,
+                "<html><body><div id='root'></div><video id='vid' src='demo.mp4'></video></body></html>");
+            AstraJsEngine vm;
+            auto rep = vm.execute(R"JS(
+                window.APP_VER = "v10";
+                const u = new URL("https://social.astra.dev/watch?v=42&hd=1#top");
+                const sp = u.searchParams;
+                sp.set("lang", "es");
+                const enc = encodeURIComponent("hola mundo!");
+                const dec = decodeURIComponent(enc);
+                const b64 = btoa("Astra10");
+                const raw = atob(b64);
+                const obs = new MutationObserver(() => {});
+                obs.observe(document.body);
+                obs.disconnect();
+                const ac = new AbortController();
+                ac.abort();
+                const vid = document.getElementById("vid");
+                const can = vid.canPlayType("video/mp4");
+                vid.play();
+                vid.currentTime = 7.5;
+                const playing = !vid.paused;
+                vid.pause();
+                const pausedAfter = vid.paused;
+                const badge = document.createElement("span");
+                badge.textContent = window.APP_VER + "|" + u.hostname + "|" + sp.get("v") + "|" + sp.get("lang") +
+                                    "|" + dec + "|" + raw + "|" + can + "|" + playing + "|" + pausedAfter + "|" +
+                                    ac.signal.aborted + "|" + navigator.onLine;
+                document.getElementById("root").appendChild(badge);
+                console.log(document.getElementById("root").textContent);
+            )JS", doc);
+            std::string out = rep.logs.empty() ? "" : rep.logs[0];
+            bool ok55 = rep.ok &&
+                        out == "v10|social.astra.dev|42|es|hola mundo!|Astra10|probably|true|true|true|true";
+            if (!ok55) std::cerr << "    [diag55] ok=" << rep.ok << " err='" << rep.error << "' out='" << out << "'\n";
+            expect(ok55,
+                   "AstraJS v10: window/navigator/URL/URLSearchParams/btoa/atob/MutationObserver/AbortController/<video>.play()");
+        }
+
+        // 56. E2E Showcase (astra_session10.html) + Live Open-Internet Pages (Wikipedia, Hacker News, GitHub)
+        {
+            std::string s10_path = "astra/examples/astra_session10.html";
+            if (!std::filesystem::exists(s10_path)) s10_path = "examples/astra_session10.html";
+            uint32_t s10_tid = app.new_tab("file://" + s10_path);
+            std::string p_status, u_info;
+            for (const auto& t : app.tabs()) {
+                if (t.id == s10_tid && t.live_doc) {
+                    if (auto* n = t.live_doc->query_selector("#player-status")) p_status = n->text_content();
+                    if (auto* n = t.live_doc->query_selector("#url-info")) u_info = n->text_content();
+                }
+            }
+            bool ok_s10 = p_status.find("Playing=true") != std::string::npos &&
+                          p_status.find("mp4=probably") != std::string::npos &&
+                          p_status.find("hls=probably") != std::string::npos &&
+                          u_info.find("stream.astra.dev/watch") != std::string::npos;
+
+            // Live open-internet navigation verification (Wikipedia + Hacker News + GitHub)
+            uint32_t web_tid = app.new_tab("");
+            auto nav_hn = app.navigate(web_tid, "https://news.ycombinator.com/");
+            auto nav_wiki = app.navigate(web_tid, "https://en.wikipedia.org/wiki/Web_browser");
+            auto nav_gh = app.navigate(web_tid, "https://github.com/explore");
+            bool ok_live = nav_hn.ok && nav_hn.display_items > 40 &&
+                           nav_wiki.ok && nav_wiki.display_items > 80 &&
+                           nav_gh.ok && nav_gh.display_items > 20;
+            if (!ok_s10 || !ok_live) {
+                std::cerr << "    [diag56] s10=" << ok_s10 << " p='" << p_status << "' u='" << u_info << "'"
+                          << " hn=(" << nav_hn.ok << "," << nav_hn.display_items << ")"
+                          << " wiki=(" << nav_wiki.ok << "," << nav_wiki.display_items << ")"
+                          << " gh=(" << nav_gh.ok << "," << nav_gh.display_items << ")\n";
+            }
+            expect(ok_s10 && ok_live,
+                   "E2E v10: astra_session10.html + Live Open-Internet HTTPS/H2 (Hacker News, Wikipedia, GitHub Explore)");
+        }
+
+        // 57. YouTube Watch Page extractor + Live Remote HTTPS MP4/WebM/HLS multi-frame playback
+        {
+            bool ids_ok =
+                BrowserApp::extract_youtube_video_id("https://www.youtube.com/watch?v=jNQXAC9IVRw") == "jNQXAC9IVRw" &&
+                BrowserApp::extract_youtube_video_id("https://youtu.be/aqz-KE-bpKQ?t=10") == "aqz-KE-bpKQ" &&
+                BrowserApp::extract_youtube_video_id("https://www.youtube.com/shorts/dQw4w9WgXcQ") == "dQw4w9WgXcQ" &&
+                BrowserApp::extract_youtube_video_id("https://www.youtube.com/embed/YE7VzlLtp-4") == "YE7VzlLtp-4";
+
+            std::string sample_yt_html =
+                "<html><script>var ytInitialPlayerResponse = {"
+                "\"playabilityStatus\":{\"status\":\"OK\"},"
+                "\"videoDetails\":{\"title\":\"Big Buck Bunny\",\"author\":\"Blender\",\"lengthSeconds\":\"634\",\"viewCount\":\"12345\"},"
+                "\"streamingData\":{\"formats\":[{\"mimeType\":\"video/mp4; codecs=\\\"avc1.42001E, mp4a.40.2\\\"\",\"qualityLabel\":\"360p\",\"url\":\"https://rr1.googlevideo.com/videoplayback?id=123\"}]}"
+                "};</script></html>";
+            YouTubeWatchInfo yt_ok = BrowserApp::parse_youtube_player_response(sample_yt_html, "aqz-KE-bpKQ");
+            bool parse_ok = yt_ok.playability_status == "OK" &&
+                            yt_ok.title == "Big Buck Bunny" &&
+                            yt_ok.author == "Blender" &&
+                            yt_ok.stream_quality == "360p" &&
+                            yt_ok.stream_url == "https://rr1.googlevideo.com/videoplayback?id=123";
+
+            std::string bot_yt_html =
+                "<html><script>var ytInitialPlayerResponse = {"
+                "\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"Sign in to confirm you're not a bot\"}"
+                "};</script></html>";
+            YouTubeWatchInfo yt_bot = BrowserApp::parse_youtube_player_response(bot_yt_html, "jNQXAC9IVRw");
+            bool bot_ok = yt_bot.playability_status == "LOGIN_REQUIRED" &&
+                          yt_bot.playability_reason.find("bot") != std::string::npos &&
+                          yt_bot.stream_url.empty();
+
+            // Verify live YouTube watch page loads cleanly (never blank) with real oEmbed title/thumbnail
+            uint32_t yt_tid = app.new_tab("https://www.youtube.com/watch?v=jNQXAC9IVRw");
+            bool yt_rendered = false;
+            for (const auto& t : app.tabs()) {
+                if (t.id == yt_tid && t.title.find("Me at the zoo") != std::string::npos &&
+                    t.cached_display_list.items.size() >= 6) {
+                    yt_rendered = true;
+                }
+            }
+
+            expect(ids_ok && parse_ok && bot_ok && yt_rendered,
+                   "YouTube Watch v10: videoId + ytInitialPlayerResponse (OK & LOGIN_REQUIRED) + live YouTube page render");
+        }
+
         app.stop_workers();
     }
 
@@ -1028,7 +2083,7 @@ int run_full_test_suite() {
 }
 
 int run_stress_test(int tab_count, uint64_t ceiling_mb) {
-    std::cout << "=== Astra v7 Multi-Tab Stress Test (" << tab_count << " tabs, ceiling " << ceiling_mb << " MB) ===\n";
+    std::cout << "=== Astra v9 Multi-Tab Stress Test (" << tab_count << " tabs, ceiling " << ceiling_mb << " MB) ===\n";
     BrowserApp app(ceiling_mb * 1024ULL * 1024ULL);
     app.start_workers();
 
@@ -1087,9 +2142,9 @@ int run_stress_test(int tab_count, uint64_t ceiling_mb) {
 
 void print_help() {
     std::cout
-        << "Astra Browser Core v7 (Native C++20 Multi-Process Engine)\n"
+        << "Astra Browser Core v10 (Native C++20 Multi-Process Open-Web Engine)\n"
         << "Usage:\n"
-        << "  astra --test                                Run full Session 7 subsystem suite (43 tests)\n"
+        << "  astra --test                                Run full Session 10 subsystem suite (61 tests)\n"
         << "  astra --url <URL> [--out <file.png>]        Load URL & render PNG\n"
         << "        [--download <URL>]                    Download URL to /tmp/astra_downloads/ with SHA-256\n"
         << "        [--ext <extension_dir>]               Load Manifest V3 WebExtension (repeatable)\n"
@@ -1237,7 +2292,7 @@ int main(int argc, char** argv) {
     }
 
     if (run_repl) {
-        std::cout << "Astra v7 Interactive Shell (open <url>, download <url>, downloads, back, forward, reload, close <id>, tabs, switch <id>, scroll <px>, click <x> <y>, type <text>, enter, raf [N], mem, shield, cache, render <file.png>, quit)\n";
+        std::cout << "Astra v9 Interactive Shell (open <url>, download <url>, downloads, back, forward, reload, close <id>, tabs, switch <id>, scroll <px>, click <x> <y>, type <text>, enter, raf [N], mem, shield, cache, render <file.png>, quit)\n";
         app.new_tab("astra://home");
         std::string line;
         while (std::cout << "astra> " && std::getline(std::cin, line)) {

@@ -1,5 +1,6 @@
 #include "gfx/rasterizer.hpp"
 #include "gfx/font_engine.hpp"
+#include "gfx/svg_engine.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -520,19 +521,30 @@ void Framebuffer::composite_display_list(const DisplayList& dl,
                 int ch = std::min(height_, iy + ih) - cy;
                 if (ch > 0) {
                     int rad = static_cast<int>(item.radius);
-                    fill_rounded_rect(ix, cy, iw, ch, rad, item.focused ? 0xFF0F1B2Eu : 0xFF0B1120u);
-                    stroke_rounded_rect(ix, cy, iw, ch, rad, item.focused ? 2 : 1,
-                                        item.focused ? 0xFF38BDF8u : 0xFF334155u);
-                    int ty = iy + std::max(4, (ih - static_cast<int>(item.font_size)) / 2 - 1);
-                    if (ty >= y_offset && ty < height_ - 4) {
-                        draw_text(ix + 12, ty, item.text, item.color_argb, item.font_size, false, false);
-                        if (item.focused) {
+                    uint32_t bg = (item.color2_argb != 0)
+                                      ? item.color2_argb
+                                      : (item.focused ? 0xFF0F1B2Eu : 0xFF0B1120u);
+                    uint8_t br_r = static_cast<uint8_t>((bg >> 16) & 0xFF);
+                    uint8_t br_g = static_cast<uint8_t>((bg >> 8) & 0xFF);
+                    uint8_t br_b = static_cast<uint8_t>(bg & 0xFF);
+                    bool light_bg = (static_cast<int>(br_r) + br_g + br_b) > 384;
+                    uint32_t border = item.focused
+                                          ? (light_bg ? 0xFF2563EBu : 0xFF38BDF8u)
+                                          : (light_bg ? 0xFF94A3B8u : 0xFF334155u);
+                    fill_rounded_rect(ix, cy, iw, ch, rad, bg);
+                    stroke_rounded_rect(ix, cy, iw, ch, rad, item.focused ? 2 : 1, border);
+                    int ty = iy + std::max(2, (ih - static_cast<int>(item.font_size)) / 2 - 1);
+                    if (ty >= y_offset && ty < height_ - 4 && !item.text.empty()) {
+                        int pad_x = (iw <= 20) ? 3 : 12;
+                        draw_text(ix + pad_x, ty, item.text, item.color_argb, item.font_size, false, false);
+                        if (item.focused && iw > 20) {
                             float tw = (item.color_argb == 0xFF64748Bu)
                                            ? 0.0f
                                            : FontEngine::instance().measure_text(item.text, item.font_size, false, false);
-                            int caret_x = ix + 13 + static_cast<int>(std::round(tw));
+                            int caret_x = ix + pad_x + 1 + static_cast<int>(std::round(tw));
                             if (caret_x < ix + iw - 6) {
-                                fill_rect(caret_x, ty, 2, static_cast<int>(item.font_size) + 2, 0xFF38BDF8u);
+                                fill_rect(caret_x, ty, 2, static_cast<int>(item.font_size) + 2,
+                                          light_bg ? 0xFF2563EBu : 0xFF38BDF8u);
                             }
                         }
                     }
@@ -671,6 +683,23 @@ void Framebuffer::composite_display_list(const DisplayList& dl,
                     fill_rounded_rect(cx, cy, cw, ch, 6, 0xFF0B1324u);
                     stroke_rounded_rect(cx, cy, cw, ch, 6, 1, 0xFF334155u);
                     draw_text(cx + 12, cy + ch / 2 - 6, "[CANVAS] #" + item.text, 0xFF64748Bu, 12.0f, false, true);
+                }
+                break;
+            }
+            case DisplayItemType::EmbedSvg: {
+                int sw = std::max(8, iw);
+                int sh = std::max(8, ih);
+                SvgSurface surf = SvgEngine::render_svg(item.text, sw, sh);
+                if (surf.valid && surf.width > 0 && surf.height > 0) {
+                    for (int sy = 0; sy < surf.height; ++sy) {
+                        int dy = iy + sy;
+                        if (dy < y_offset || dy >= height_) continue;
+                        for (int sx = 0; sx < surf.width; ++sx) {
+                            uint32_t c = surf.argb[static_cast<size_t>(sy) * static_cast<size_t>(surf.width) +
+                                                   static_cast<size_t>(sx)];
+                            if ((c >> 24) > 0) blend_pixel(ix + sx, dy, c);
+                        }
+                    }
                 }
                 break;
             }

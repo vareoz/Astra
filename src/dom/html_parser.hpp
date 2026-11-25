@@ -29,6 +29,7 @@ struct DomNode {
     std::vector<DomNode*> children;
 
     std::string get_attr(std::string_view name) const;
+    bool has_attr(std::string_view name) const;
     void set_attr(std::string_view name, std::string_view value);
     void remove_attr(std::string_view name);
     bool has_class(std::string_view cls) const;
@@ -42,6 +43,13 @@ struct DomNode {
     void set_inner_html(SlabArena& arena, std::string_view html);
 };
 
+struct ScriptEntry {
+    std::string src;
+    std::string inline_code;
+    bool is_module = false;
+    bool defer = false;
+};
+
 class HtmlDocument {
 public:
     explicit HtmlDocument(SlabArena& arena);
@@ -51,6 +59,7 @@ public:
     std::string title() const;
     std::string collect_stylesheets() const;
     std::vector<std::string> collect_scripts() const;
+    std::vector<ScriptEntry> collect_script_entries() const;
 
     DomNode* query_selector(std::string_view selector) const;
     std::vector<DomNode*> query_selector_all(std::string_view selector) const;

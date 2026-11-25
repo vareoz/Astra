@@ -81,13 +81,23 @@ struct AudioPlaybackReport {
     std::string status; // "played", "headless_no_soundcard", "alsa_not_installed"
 };
 
-// AstraMedia v4: Firefox RDD-inspired isolated media container parser,
-// native BT.709 YUV420p -> ARGB32 converter, real multi-frame video decoder,
-// bounded PCM audio decoder (WAV native + MP4/AAC via isolated RDD pipe),
-// waveform peak analyzer, and native Linux ALSA playback (dlopen libasound.so.2).
+struct HlsPlaylist {
+    bool valid = false;
+    bool is_master = false;
+    double target_duration_sec = 0.0;
+    std::vector<std::string> variant_urls;
+    std::vector<std::string> segment_urls;
+};
+
+// AstraMedia v5: Firefox RDD-inspired isolated media container parser (MP4/WebM/Y4M/WAV/MPEG-TS/MP3/OGG/FLAC),
+// HLS (.m3u8) Master & Media playlist parser, native BT.709 YUV420p -> ARGB32 converter,
+// real multi-frame video decoder, bounded PCM audio decoder, waveform peak analyzer,
+// and native Linux ALSA playback (dlopen libasound.so.2).
 class MediaEngine {
 public:
     static VideoContainerInfo probe_container(const std::string& path);
+
+    static HlsPlaylist parse_hls_playlist(std::string_view m3u8_text, const std::string& base_url);
 
     static void yuv420p_to_argb(const uint8_t* y_plane,
                                 const uint8_t* u_plane,

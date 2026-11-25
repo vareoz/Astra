@@ -303,6 +303,15 @@ void AstraShield::store_cookie(std::string_view top_level_site,
     std::string lower_hdr = to_lower(set_cookie_header);
     entry.secure = lower_hdr.find("secure") != std::string::npos;
     entry.http_only = lower_hdr.find("httponly") != std::string::npos;
+    entry.same_site = SameSiteMode::Lax; // RFC 6265bis default
+    if (lower_hdr.find("samesite=strict") != std::string::npos) {
+        entry.same_site = SameSiteMode::Strict;
+    } else if (lower_hdr.find("samesite=none") != std::string::npos) {
+        if (!entry.secure) return; // Reject insecure SameSite=None cookies per spec
+        entry.same_site = SameSiteMode::None;
+    } else if (lower_hdr.find("samesite=lax") != std::string::npos) {
+        entry.same_site = SameSiteMode::Lax;
+    }
     entry.domain = std::string(request_origin);
 
     // Total Cookie Protection partition key: (top_level_site, request_origin)
@@ -313,14 +322,24 @@ void AstraShield::store_cookie(std::string_view top_level_site,
 
 std::string AstraShield::cookie_header_for(std::string_view top_level_site,
                                            std::string_view request_origin,
-                                           bool is_https) const {
+                                           bool is_https,
+                                           bool is_top_level_get) const {
     std::string partition_key = to_lower(top_level_site) + "|" + to_lower(request_origin);
     auto it = cookie_jars_.find(partition_key);
     if (it == cookie_jars_.end()) return {};
 
+    ParsedUrl req_u = parse_url(request_origin);
+    std::string req_site = req_u.valid ? req_u.registrable_domain() : to_lower(request_origin);
+    std::string top_site = to_lower(top_level_site);
+    bool is_cross_site = !top_site.empty() && !req_site.empty() && (top_site != req_site);
+
     std::string out;
     for (const auto& [name, entry] : it->second) {
         if (entry.secure && !is_https) continue;
+        if (is_cross_site) {
+            if (entry.same_site == SameSiteMode::Strict) continue;
+            if (entry.same_site == SameSiteMode::Lax && !is_top_level_get) continue;
+        }
         if (!out.empty()) out += "; ";
         out += name + "=" + entry.value;
     }
@@ -341,7 +360,7 @@ std::vector<std::pair<std::string, std::string>> AstraShield::hardened_headers()
         return {{"User-Agent", "Astra/1.0 (Linux x86_64)"}};
     }
     return {
-        {"User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Astra/1.0"},
+        {"User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0"},
         {"Accept-Language", "en-US,en;q=0.9"},
         {"Sec-GPC", "1"},
         {"DNT", "1"}
