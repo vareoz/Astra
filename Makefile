@@ -11,6 +11,7 @@ SRCS := \
 	src/net/http_cache.cpp \
 	src/net/http2_client.cpp \
 	src/net/http_client.cpp \
+	src/net/websocket_client.cpp \
 	src/dom/html_parser.cpp \
 	src/style/css_engine.cpp \
 	src/layout/layout_engine.cpp \

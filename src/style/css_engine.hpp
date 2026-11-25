@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace astra {
@@ -43,6 +44,26 @@ enum class DisplayType : uint8_t {
 enum class FlexDirection : uint8_t {
     Row,
     Column
+};
+
+enum class JustifyContent : uint8_t {
+    FlexStart,
+    Center,
+    FlexEnd,
+    SpaceBetween
+};
+
+enum class AlignItems : uint8_t {
+    Stretch,
+    FlexStart,
+    Center,
+    FlexEnd
+};
+
+enum class TextAlign : uint8_t {
+    Left,
+    Center,
+    Right
 };
 
 struct GridTrack {
@@ -92,13 +113,18 @@ struct EdgeSizes {
 struct ComputedStyle {
     DisplayType display = DisplayType::Block;
     FlexDirection flex_direction = FlexDirection::Row;
+    JustifyContent justify_content = JustifyContent::FlexStart;
+    AlignItems align_items = AlignItems::Stretch;
+    TextAlign text_align = TextAlign::Left;
     PositionType position = PositionType::Static;
     OverflowMode overflow = OverflowMode::Visible;
     BoxSizing box_sizing = BoxSizing::ContentBox;
     std::vector<GridTrack> grid_columns;
     float gap = 0.0f;
-    float width = -1.0f;   // < 0 means auto
-    float height = -1.0f;  // < 0 means auto
+    float width = -1.0f;      // < 0 means auto
+    float height = -1.0f;     // < 0 means auto
+    float min_width = -1.0f;
+    float max_width = -1.0f;
     bool has_top = false;
     bool has_left = false;
     bool has_right = false;
@@ -122,6 +148,7 @@ struct ComputedStyle {
     bool bold = false;
     bool monospace = false;
     float line_height = 1.48f;
+    std::unordered_map<std::string, std::string> css_vars;
 };
 
 struct CssDeclaration {
@@ -151,6 +178,11 @@ class StyleEngine {
 public:
     static Color parse_color(std::string_view val, Color fallback);
     static float parse_px(std::string_view val, float fallback = 0.0f);
+    static std::string resolve_var_expr(std::string_view val,
+                                        const std::unordered_map<std::string, std::string>& vars,
+                                        int depth = 0);
+    static std::unordered_map<std::string, std::string> collect_root_vars(const CssStylesheet& sheet,
+                                                                          float viewport_w = 1280.0f);
 
     static ComputedStyle compute_style(const DomNode* node,
                                        const CssStylesheet& sheet,

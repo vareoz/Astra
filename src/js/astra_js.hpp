@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dom/html_parser.hpp"
+#include "net/websocket_client.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -37,13 +38,14 @@ struct JsValue {
     double to_number() const;
 };
 
-// Bytecode instruction set for AstraJS v6 Stack VM
+// Bytecode instruction set for AstraJS v7 Stack VM
 enum class OpCode : uint8_t {
     PushConst,
     LoadLocal,
     StoreLocal,
     LoadGlobal,
     StoreGlobal,
+    LoadThis,
     Pop,
     Add,
     Sub,
@@ -66,6 +68,7 @@ enum class OpCode : uint8_t {
     SetProp,
     Call,
     CallMethod,
+    Construct,
     Await,
     MakeClosure,
     PushTry,
@@ -127,9 +130,9 @@ struct CanvasSurface {
     static uint32_t parse_css_color(std::string_view s, uint32_t fallback);
 };
 
-// Mark-and-Sweep GC-managed heap object (Array, Map, Function, Promise, Canvas2D)
+// Mark-and-Sweep GC-managed heap object (Array, Map, Function, Class, Promise, Canvas2D, StyleProxy, WebSocket)
 struct GcObject {
-    enum class Type { Array, Map, Function, Promise, Canvas2D };
+    enum class Type { Array, Map, Function, Class, Promise, Canvas2D, StyleProxy, WebSocket };
     enum class PromiseState : uint8_t { Pending, Fulfilled, Rejected };
     struct PromiseReaction {
         GcObject* next = nullptr;
@@ -143,17 +146,20 @@ struct GcObject {
 
     std::vector<JsValue> elements;
     std::unordered_map<std::string, JsValue> props;
+    GcObject* proto_class = nullptr;
 
-    // Function fields
+    // Function / Class fields
     std::string fn_name;
     std::vector<std::string> params;
     BytecodeChunk chunk;
     bool is_async = false;
     std::shared_ptr<std::unordered_map<std::string, JsValue>> closure_env;
 
-    // DOM classList proxy target & Canvas2D binding
+    // DOM proxies & native bindings
     DomNode* classlist_node = nullptr;
+    DomNode* style_node = nullptr;
     std::string canvas_id;
+    std::shared_ptr<WebSocketClient> ws_client;
 
     // Promise fields
     PromiseState promise_state = PromiseState::Pending;
@@ -258,11 +264,13 @@ private:
                       std::vector<JsValue>& locals,
                       HtmlDocument& doc,
                       JsExecutionReport& rep,
-                      const std::shared_ptr<std::unordered_map<std::string, JsValue>>& closure_env = nullptr);
+                      const std::shared_ptr<std::unordered_map<std::string, JsValue>>& closure_env = nullptr,
+                      const JsValue& this_val = JsValue::make_undefined());
     JsValue invoke_callable(const JsValue& fn,
                             const std::vector<JsValue>& args,
                             HtmlDocument& doc,
-                            JsExecutionReport& rep);
+                            JsExecutionReport& rep,
+                            const JsValue& this_val = JsValue::make_undefined());
     void drain_microtasks_only(HtmlDocument& doc, JsExecutionReport& rep);
     void drain_event_loop(HtmlDocument& doc, JsExecutionReport& rep);
 

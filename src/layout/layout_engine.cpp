@@ -143,6 +143,14 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
                                     : (st.width + horiz_extra);
         box_w = std::min(target_border_w, max_avail);
     }
+    if (st.max_width > 0.0f) {
+        float max_bw = (st.box_sizing == BoxSizing::BorderBox) ? st.max_width : (st.max_width + horiz_extra);
+        box_w = std::min(box_w, max_bw);
+    }
+    if (st.min_width > 0.0f) {
+        float min_bw = (st.box_sizing == BoxSizing::BorderBox) ? st.min_width : (st.min_width + horiz_extra);
+        box_w = std::min(max_avail, std::max(box_w, min_bw));
+    }
 
     float inner_w = std::max(16.0f, box_w - horiz_extra);
 
@@ -260,14 +268,103 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
     } else if (st.display == DisplayType::Flex && st.flex_direction == FlexDirection::Row && !flow_children.empty()) {
         size_t count = flow_children.size();
         float total_gap = st.gap * static_cast<float>(count > 0 ? count - 1 : 0);
-        float item_w = std::max(40.0f, (inner_w - total_gap) / static_cast<float>(count));
-        float cur_x = frame->content_box.x;
-        float max_h = 0.0f;
+        bool has_explicit_w = false;
         for (LayoutFrame* ch : flow_children) {
-            layout_node(ch, cur_x, cur_y, item_w, next_cb, viewport);
-            float ch_total_h = ch->border_box.h + ch->style.margin.top + ch->style.margin.bottom;
-            max_h = std::max(max_h, ch_total_h);
-            cur_x += item_w + st.gap;
+            if (ch->style.width > 0.0f) { has_explicit_w = true; break; }
+        }
+        bool custom_justify = (st.justify_content != JustifyContent::FlexStart) || has_explicit_w;
+        float max_h = 0.0f;
+
+        if (!custom_justify) {
+            float item_w = std::max(40.0f, (inner_w - total_gap) / static_cast<float>(count));
+            float cur_x = frame->content_box.x;
+            for (LayoutFrame* ch : flow_children) {
+                layout_node(ch, cur_x, cur_y, item_w, next_cb, viewport);
+                float ch_total_h = ch->border_box.h + ch->style.margin.top + ch->style.margin.bottom;
+                max_h = std::max(max_h, ch_total_h);
+                cur_x += item_w + st.gap;
+            }
+        } else {
+            // Measure each child's intrinsic or explicit width
+            std::vector<float> child_w(count, 0.0f);
+            float used_w = 0.0f;
+            size_t auto_count = 0;
+            for (size_t i = 0; i < count; ++i) {
+                const ComputedStyle& cs = flow_children[i]->style;
+                float extra = cs.padding.left + cs.padding.right + cs.border_width * 2.0f;
+                if (cs.width > 0.0f) {
+                    float bw = (cs.box_sizing == BoxSizing::BorderBox) ? cs.width : (cs.width + extra);
+                    child_w[i] = bw + cs.margin.left + cs.margin.right;
+                    used_w += child_w[i];
+                } else if (st.justify_content != JustifyContent::FlexStart &&
+                           flow_children[i]->children.empty() &&
+                           flow_children[i]->node && !flow_children[i]->node->text_content().empty()) {
+                    float tw = FontEngine::instance().measure_text(
+                        flow_children[i]->node->text_content(), cs.font_size, cs.bold, cs.monospace);
+                    child_w[i] = std::min(inner_w, tw + extra + cs.margin.left + cs.margin.right + 12.0f);
+                    used_w += child_w[i];
+                } else {
+                    ++auto_count;
+                }
+            }
+            if (auto_count > 0) {
+                float rem = std::max(40.0f * static_cast<float>(auto_count), inner_w - total_gap - used_w);
+                float share = rem / static_cast<float>(auto_count);
+                for (size_t i = 0; i < count; ++i) {
+                    if (child_w[i] <= 0.0f) {
+                        child_w[i] = share;
+                        used_w += share;
+                    }
+                }
+            }
+            float avail_items_w = std::max(40.0f, inner_w - total_gap);
+            if (used_w > avail_items_w && used_w > 0.0f) {
+                float scale = avail_items_w / used_w;
+                used_w = 0.0f;
+                for (size_t i = 0; i < count; ++i) {
+                    child_w[i] *= scale;
+                    used_w += child_w[i];
+                }
+            }
+
+            float free_space = std::max(0.0f, inner_w - used_w - total_gap);
+            float start_x = frame->content_box.x;
+            float item_gap = st.gap;
+            if (st.justify_content == JustifyContent::Center) {
+                start_x += free_space * 0.5f;
+            } else if (st.justify_content == JustifyContent::FlexEnd) {
+                start_x += free_space;
+            } else if (st.justify_content == JustifyContent::SpaceBetween && count > 1) {
+                item_gap = st.gap + free_space / static_cast<float>(count - 1);
+            }
+
+            float cur_x = start_x;
+            for (size_t i = 0; i < count; ++i) {
+                LayoutFrame* ch = flow_children[i];
+                layout_node(ch, cur_x, cur_y, child_w[i], next_cb, viewport);
+                float ch_total_h = ch->border_box.h + ch->style.margin.top + ch->style.margin.bottom;
+                max_h = std::max(max_h, ch_total_h);
+                cur_x += child_w[i] + item_gap;
+            }
+        }
+
+        // Cross-axis align-items adjustment (respecting explicit container height)
+        float cross_h = max_h;
+        if (st.height > 0.0f) {
+            float target_h = (st.box_sizing == BoxSizing::BorderBox)
+                                 ? std::max(0.0f, st.height - vert_extra)
+                                 : st.height;
+            cross_h = std::max(cross_h, target_h);
+        }
+        if (st.align_items == AlignItems::Center || st.align_items == AlignItems::FlexEnd) {
+            for (LayoutFrame* ch : flow_children) {
+                float ch_h = ch->border_box.h + ch->style.margin.top + ch->style.margin.bottom;
+                float diff = std::max(0.0f, cross_h - ch_h);
+                if (diff > 0.5f) {
+                    float dy = (st.align_items == AlignItems::Center) ? (diff * 0.5f) : diff;
+                    offset_subtree(ch, 0.0f, dy);
+                }
+            }
         }
         cur_y += max_h;
     } else {
@@ -530,10 +627,17 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
     if (f->node && f->node->type == NodeType::Text && !f->wrapped_lines.empty()) {
         float lh = line_height_for_size(st.font_size);
         float ty = f->content_box.y;
+        auto& fe = FontEngine::instance();
         for (const auto& line : f->wrapped_lines) {
+            float tx = f->content_box.x;
+            if (st.text_align == TextAlign::Center || st.text_align == TextAlign::Right) {
+                float lw = fe.measure_text(line, st.font_size, st.bold, st.monospace);
+                float spare = std::max(0.0f, f->content_box.w - lw);
+                tx += (st.text_align == TextAlign::Center) ? (spare * 0.5f) : spare;
+            }
             DisplayItem item;
             item.type = DisplayItemType::DrawText;
-            item.rect = Rect{f->content_box.x, ty, f->content_box.w, lh};
+            item.rect = Rect{tx, ty, f->content_box.w, lh};
             item.color_argb = apply_opacity(st.color.to_argb(), eff_opacity);
             item.font_size = st.font_size;
             item.z_index = eff_z;
@@ -694,7 +798,10 @@ LayoutFrame* LayoutEngine::build_layout(SlabArena& arena,
                                         float viewport_w,
                                         float viewport_h) {
     const DomNode* body = doc.body();
-    LayoutFrame* root = build_frame_tree(arena, body, sheet, nullptr, viewport_w);
+    ComputedStyle root_seed;
+    root_seed.css_vars = StyleEngine::collect_root_vars(sheet, viewport_w);
+    const ComputedStyle* seed_ptr = root_seed.css_vars.empty() ? nullptr : &root_seed;
+    LayoutFrame* root = build_frame_tree(arena, body, sheet, seed_ptr, viewport_w);
     if (!root) return nullptr;
     Rect viewport{0.0f, 0.0f, viewport_w, viewport_h};
     layout_node(root, 0.0f, 0.0f, viewport_w, viewport, viewport);

@@ -43,7 +43,8 @@ std::vector<CssDeclaration> parse_declarations(std::string_view block) {
         std::string_view item = (semi == std::string_view::npos) ? block.substr(start) : block.substr(start, semi - start);
         size_t colon = item.find(':');
         if (colon != std::string_view::npos) {
-            std::string prop = to_lower(trim(item.substr(0, colon)));
+            std::string raw_prop = trim(item.substr(0, colon));
+            std::string prop = (raw_prop.rfind("--", 0) == 0) ? raw_prop : to_lower(raw_prop);
             std::string val = trim(item.substr(colon + 1));
             // Strip !important suffix
             size_t bang = val.find("!important");
@@ -61,10 +62,18 @@ std::vector<CssDeclaration> parse_declarations(std::string_view block) {
 bool match_compound_selector(const DomNode* node, std::string_view part, int& specificity) {
     if (!node || node->type != NodeType::Element || part.empty()) return false;
     if (part == "*") return true;
+    if (to_lower(part) == ":root") {
+        if (node->tag == "html" || node->tag == "body") {
+            specificity += 10;
+            return true;
+        }
+        return false;
+    }
 
     std::string tag;
     std::string id;
     std::vector<std::string> classes;
+    bool has_root_pseudo = false;
 
     size_t i = 0;
     while (i < part.size()) {
@@ -79,8 +88,10 @@ bool match_compound_selector(const DomNode* node, std::string_view part, int& sp
             while (i < part.size() && part[i] != '.' && part[i] != '#' && part[i] != ':') ++i;
             classes.emplace_back(part.substr(st, i - st));
         } else if (part[i] == ':') {
-            // Skip pseudo-classes for static matching
+            size_t st = i;
             while (i < part.size() && part[i] != '.' && part[i] != '#') ++i;
+            std::string pseudo = to_lower(part.substr(st, i - st));
+            if (pseudo == ":root") has_root_pseudo = true;
         } else {
             size_t st = i;
             while (i < part.size() && part[i] != '.' && part[i] != '#' && part[i] != ':') ++i;
@@ -88,6 +99,7 @@ bool match_compound_selector(const DomNode* node, std::string_view part, int& sp
         }
     }
 
+    if (has_root_pseudo && node->tag != "html" && node->tag != "body") return false;
     if (!tag.empty() && node->tag != tag) return false;
     if (!id.empty() && node->id() != id) return false;
     for (const auto& c : classes) {
@@ -96,30 +108,64 @@ bool match_compound_selector(const DomNode* node, std::string_view part, int& sp
 
     if (!id.empty()) specificity += 100;
     specificity += static_cast<int>(classes.size()) * 10;
+    if (has_root_pseudo) specificity += 10;
     if (!tag.empty()) specificity += 1;
     return true;
 }
 
 bool match_selector(const DomNode* node, std::string_view selector, int& specificity) {
-    auto parts = split_ws(selector);
+    // Tokenize selector supporting both descendant (' ') and direct-child ('>') combinators
+    std::vector<std::string> parts;
+    std::vector<bool> direct_child; // direct_child[i] applies between parts[i] and parts[i+1]
+    size_t i = 0;
+    bool pending_child = false;
+    while (i < selector.size()) {
+        while (i < selector.size() && std::isspace(static_cast<unsigned char>(selector[i]))) ++i;
+        if (i >= selector.size()) break;
+        if (selector[i] == '>') {
+            pending_child = true;
+            ++i;
+            continue;
+        }
+        size_t st = i;
+        while (i < selector.size() && !std::isspace(static_cast<unsigned char>(selector[i])) && selector[i] != '>') {
+            ++i;
+        }
+        if (i > st) {
+            if (!parts.empty()) direct_child.push_back(pending_child);
+            parts.emplace_back(selector.substr(st, i - st));
+            pending_child = false;
+        }
+    }
     if (parts.empty()) return false;
     specificity = 0;
     if (!match_compound_selector(node, parts.back(), specificity)) return false;
 
-    const DomNode* ancestor = node->parent;
+    const DomNode* cur = node;
     for (int idx = static_cast<int>(parts.size()) - 2; idx >= 0; --idx) {
-        bool found = false;
-        while (ancestor && ancestor->type == NodeType::Element) {
+        bool is_direct = direct_child[static_cast<size_t>(idx)];
+        if (is_direct) {
+            const DomNode* p = cur ? cur->parent : nullptr;
+            if (!p || p->type != NodeType::Element) return false;
             int sub_spec = 0;
-            if (match_compound_selector(ancestor, parts[static_cast<size_t>(idx)], sub_spec)) {
-                specificity += sub_spec;
-                found = true;
+            if (!match_compound_selector(p, parts[static_cast<size_t>(idx)], sub_spec)) return false;
+            specificity += sub_spec;
+            cur = p;
+        } else {
+            const DomNode* ancestor = cur ? cur->parent : nullptr;
+            bool found = false;
+            while (ancestor && ancestor->type == NodeType::Element) {
+                int sub_spec = 0;
+                if (match_compound_selector(ancestor, parts[static_cast<size_t>(idx)], sub_spec)) {
+                    specificity += sub_spec;
+                    found = true;
+                    cur = ancestor;
+                    break;
+                }
                 ancestor = ancestor->parent;
-                break;
             }
-            ancestor = ancestor->parent;
+            if (!found) return false;
         }
-        if (!found) return false;
     }
     return true;
 }
@@ -204,12 +250,30 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
         else st.display = DisplayType::Block;
     } else if (p == "flex-direction") {
         st.flex_direction = (vl == "column") ? FlexDirection::Column : FlexDirection::Row;
+    } else if (p == "justify-content") {
+        if (vl == "center") st.justify_content = JustifyContent::Center;
+        else if (vl == "flex-end" || vl == "end" || vl == "right") st.justify_content = JustifyContent::FlexEnd;
+        else if (vl == "space-between") st.justify_content = JustifyContent::SpaceBetween;
+        else st.justify_content = JustifyContent::FlexStart;
+    } else if (p == "align-items") {
+        if (vl == "center") st.align_items = AlignItems::Center;
+        else if (vl == "flex-start" || vl == "start") st.align_items = AlignItems::FlexStart;
+        else if (vl == "flex-end" || vl == "end") st.align_items = AlignItems::FlexEnd;
+        else st.align_items = AlignItems::Stretch;
+    } else if (p == "text-align") {
+        if (vl == "center") st.text_align = TextAlign::Center;
+        else if (vl == "right" || vl == "end") st.text_align = TextAlign::Right;
+        else st.text_align = TextAlign::Left;
     } else if (p == "grid-template-columns") {
         st.grid_columns = parse_grid_tracks(v);
     } else if (p == "gap" || p == "grid-gap") {
         st.gap = StyleEngine::parse_px(v, 0.0f);
     } else if (p == "width") {
         if (vl != "auto" && vl.find('%') == std::string::npos) st.width = StyleEngine::parse_px(v, -1.0f);
+    } else if (p == "min-width") {
+        if (vl != "auto" && vl.find('%') == std::string::npos) st.min_width = StyleEngine::parse_px(v, -1.0f);
+    } else if (p == "max-width") {
+        if (vl != "none" && vl.find('%') == std::string::npos) st.max_width = StyleEngine::parse_px(v, -1.0f);
     } else if (p == "height") {
         if (vl != "auto" && vl.find('%') == std::string::npos) st.height = StyleEngine::parse_px(v, -1.0f);
     } else if (p == "margin") {
@@ -301,7 +365,7 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
         st.box_sizing = (vl == "border-box") ? BoxSizing::BorderBox : BoxSizing::ContentBox;
     } else if (p == "color") {
         st.color = StyleEngine::parse_color(v, st.color);
-    } else if (p == "border") {
+    } else if (p == "border" || p == "border-left" || p == "border-top" || p == "border-right" || p == "border-bottom") {
         auto toks = split_ws(v);
         for (const auto& t : toks) {
             if (std::isdigit(static_cast<unsigned char>(t[0]))) {
@@ -624,18 +688,95 @@ float StyleEngine::parse_px(std::string_view val, float fallback) {
     return num;
 }
 
+std::string StyleEngine::resolve_var_expr(std::string_view val,
+                                          const std::unordered_map<std::string, std::string>& vars,
+                                          int depth) {
+    if (depth > 8 || val.find("var(") == std::string_view::npos) {
+        return std::string(val);
+    }
+    std::string out;
+    out.reserve(val.size());
+    size_t pos = 0;
+    while (pos < val.size()) {
+        size_t vp = val.find("var(", pos);
+        if (vp == std::string_view::npos) {
+            out.append(val.substr(pos));
+            break;
+        }
+        out.append(val.substr(pos, vp - pos));
+        size_t inner_start = vp + 4;
+        int pdepth = 1;
+        size_t cur = inner_start;
+        while (cur < val.size() && pdepth > 0) {
+            if (val[cur] == '(') ++pdepth;
+            else if (val[cur] == ')') --pdepth;
+            if (pdepth > 0) ++cur;
+        }
+        if (pdepth != 0) {
+            out.append(val.substr(vp));
+            break;
+        }
+        std::string_view inner = val.substr(inner_start, cur - inner_start);
+        // Split at top-level comma for optional fallback
+        int cdepth = 0;
+        size_t comma = std::string_view::npos;
+        for (size_t k = 0; k < inner.size(); ++k) {
+            if (inner[k] == '(') ++cdepth;
+            else if (inner[k] == ')') --cdepth;
+            else if (inner[k] == ',' && cdepth == 0) { comma = k; break; }
+        }
+        std::string var_name = trim(comma == std::string_view::npos ? inner : inner.substr(0, comma));
+        std::string fallback = (comma == std::string_view::npos) ? "" : trim(inner.substr(comma + 1));
+
+        auto it = vars.find(var_name);
+        if (it != vars.end() && !it->second.empty()) {
+            out.append(resolve_var_expr(it->second, vars, depth + 1));
+        } else if (!fallback.empty()) {
+            out.append(resolve_var_expr(fallback, vars, depth + 1));
+        }
+        pos = cur + 1;
+    }
+    return out;
+}
+
+std::unordered_map<std::string, std::string> StyleEngine::collect_root_vars(const CssStylesheet& sheet,
+                                                                            float viewport_w) {
+    std::unordered_map<std::string, std::string> vars;
+    for (const auto& rule : sheet.rules()) {
+        if (rule.media_min_width >= 0.0f && viewport_w < rule.media_min_width) continue;
+        if (rule.media_max_width >= 0.0f && viewport_w > rule.media_max_width) continue;
+        bool is_root = false;
+        for (const auto& sel : rule.selectors) {
+            std::string sl = to_lower(trim(sel));
+            if (sl == ":root" || sl == "html") {
+                is_root = true;
+                break;
+            }
+        }
+        if (!is_root) continue;
+        for (const auto& decl : rule.declarations) {
+            if (decl.property.rfind("--", 0) == 0) {
+                vars[decl.property] = decl.value;
+            }
+        }
+    }
+    return vars;
+}
+
 ComputedStyle StyleEngine::compute_style(const DomNode* node,
                                          const CssStylesheet& sheet,
                                          const ComputedStyle* parent_style,
                                          float viewport_w) {
     ComputedStyle st;
-    // Inherit text properties from parent
+    // Inherit text properties & CSS custom properties from parent
     if (parent_style) {
         st.color = parent_style->color;
         st.font_size = parent_style->font_size;
         st.bold = parent_style->bold;
         st.monospace = parent_style->monospace;
         st.line_height = parent_style->line_height;
+        st.text_align = parent_style->text_align;
+        st.css_vars = parent_style->css_vars;
     }
 
     apply_ua_defaults(node, st);
@@ -668,18 +809,44 @@ ComputedStyle StyleEngine::compute_style(const DomNode* node,
         return a.order < b.order;
     });
 
+    std::vector<CssDeclaration> inline_decls;
+    std::string inline_css = node->get_attr("style");
+    if (!inline_css.empty()) {
+        inline_decls = parse_declarations(inline_css);
+    }
+
+    // Pass 1: collect all CSS custom property (--*) definitions in cascade order
     for (const auto& m : matched) {
         for (const auto& decl : m.rule->declarations) {
-            apply_declaration(st, decl);
+            if (decl.property.rfind("--", 0) == 0) {
+                st.css_vars[decl.property] = resolve_var_expr(decl.value, st.css_vars);
+            }
+        }
+    }
+    for (const auto& decl : inline_decls) {
+        if (decl.property.rfind("--", 0) == 0) {
+            st.css_vars[decl.property] = resolve_var_expr(decl.value, st.css_vars);
         }
     }
 
-    // Inline style="..." overrides stylesheet rules (specificity = 1000)
-    std::string inline_css = node->get_attr("style");
-    if (!inline_css.empty()) {
-        for (const auto& decl : parse_declarations(inline_css)) {
+    // Pass 2: resolve var(...) and apply standard declarations in cascade order
+    auto apply_resolved = [&](const CssDeclaration& decl) {
+        if (decl.property.rfind("--", 0) == 0) return;
+        if (decl.value.find("var(") != std::string::npos) {
+            CssDeclaration resolved{decl.property, resolve_var_expr(decl.value, st.css_vars)};
+            if (!resolved.value.empty()) apply_declaration(st, resolved);
+        } else {
             apply_declaration(st, decl);
         }
+    };
+
+    for (const auto& m : matched) {
+        for (const auto& decl : m.rule->declarations) {
+            apply_resolved(decl);
+        }
+    }
+    for (const auto& decl : inline_decls) {
+        apply_resolved(decl);
     }
 
     return st;

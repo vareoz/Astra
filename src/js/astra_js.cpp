@@ -17,6 +17,7 @@ enum class TokKind {
     Eof, Number, String, Ident,
     KwLet, KwConst, KwVar, KwFunction, KwAsync, KwAwait, KwReturn, KwIf, KwElse, KwWhile, KwFor,
     KwTry, KwCatch, KwFinally, KwThrow,
+    KwClass, KwNew, KwThis,
     KwTrue, KwFalse, KwNull,
     LParen, RParen, LBrace, RBrace, LBracket, RBracket,
     Comma, Semi, Dot, Colon, Question, Arrow,
@@ -29,6 +30,84 @@ struct Token {
     std::string text;
     double num = 0.0;
 };
+
+std::string camel_to_kebab(std::string_view s) {
+    std::string out;
+    out.reserve(s.size() + 4);
+    for (char c : s) {
+        if (std::isupper(static_cast<unsigned char>(c))) {
+            out.push_back('-');
+            out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        } else {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
+void set_inline_css_prop(DomNode* node, std::string_view prop, std::string_view val) {
+    if (!node) return;
+    std::string kebab = camel_to_kebab(prop);
+    std::string cur = node->get_attr("style");
+    std::vector<std::pair<std::string, std::string>> entries;
+    bool updated = false;
+    size_t st = 0;
+    while (st < cur.size()) {
+        size_t semi = cur.find(';', st);
+        std::string item = (semi == std::string::npos) ? cur.substr(st) : cur.substr(st, semi - st);
+        size_t col = item.find(':');
+        if (col != std::string::npos) {
+            auto trim_s = [](std::string s) {
+                while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+                while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+                return s;
+            };
+            std::string k = trim_s(item.substr(0, col));
+            std::string v = trim_s(item.substr(col + 1));
+            if (!k.empty()) {
+                if (k == kebab) {
+                    entries.emplace_back(kebab, std::string(val));
+                    updated = true;
+                } else {
+                    entries.emplace_back(std::move(k), std::move(v));
+                }
+            }
+        }
+        if (semi == std::string::npos) break;
+        st = semi + 1;
+    }
+    if (!updated) entries.emplace_back(kebab, std::string(val));
+    std::string rebuilt;
+    for (const auto& [k, v] : entries) {
+        if (!v.empty()) rebuilt += k + ": " + v + "; ";
+    }
+    node->set_attr("style", rebuilt);
+}
+
+std::string get_inline_css_prop(const DomNode* node, std::string_view prop) {
+    if (!node) return {};
+    std::string kebab = camel_to_kebab(prop);
+    std::string cur = node->get_attr("style");
+    size_t st = 0;
+    while (st < cur.size()) {
+        size_t semi = cur.find(';', st);
+        std::string item = (semi == std::string::npos) ? cur.substr(st) : cur.substr(st, semi - st);
+        size_t col = item.find(':');
+        if (col != std::string::npos) {
+            auto trim_s = [](std::string s) {
+                while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+                while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+                return s;
+            };
+            if (trim_s(item.substr(0, col)) == kebab) {
+                return trim_s(item.substr(col + 1));
+            }
+        }
+        if (semi == std::string::npos) break;
+        st = semi + 1;
+    }
+    return {};
+}
 
 std::vector<Token> tokenize(std::string_view src) {
     std::vector<Token> out;
@@ -43,6 +122,62 @@ std::vector<Token> tokenize(std::string_view src) {
         if (c == '/' && i + 1 < n && src[i + 1] == '*') {
             size_t end = src.find("*/", i + 2);
             i = (end == std::string_view::npos) ? n : end + 2;
+            continue;
+        }
+        if (c == '`') {
+            // ES6 Template Literal: desugar `a ${expr} b` into ("a " + (expr) + " b")
+            ++i;
+            out.push_back({TokKind::LParen, "(", 0.0});
+            std::string seg;
+            bool emitted_any = false;
+            auto flush_seg = [&]() {
+                if (emitted_any) out.push_back({TokKind::Plus, "+", 0.0});
+                out.push_back({TokKind::String, seg, 0.0});
+                seg.clear();
+                emitted_any = true;
+            };
+            while (i < n && src[i] != '`') {
+                if (src[i] == '\\' && i + 1 < n) {
+                    char esc = src[++i];
+                    if (esc == 'n') seg.push_back('\n');
+                    else if (esc == 't') seg.push_back('\t');
+                    else seg.push_back(esc);
+                    ++i;
+                } else if (src[i] == '$' && i + 1 < n && src[i + 1] == '{') {
+                    flush_seg();
+                    i += 2;
+                    size_t expr_start = i;
+                    int depth = 1;
+                    while (i < n && depth > 0) {
+                        if (src[i] == '"' || src[i] == '\'' || src[i] == '`') {
+                            char q = src[i++];
+                            while (i < n && src[i] != q) {
+                                if (src[i] == '\\' && i + 1 < n) i += 2;
+                                else ++i;
+                            }
+                            if (i < n) ++i;
+                            continue;
+                        }
+                        if (src[i] == '{') ++depth;
+                        else if (src[i] == '}') --depth;
+                        if (depth > 0) ++i;
+                    }
+                    std::string_view expr_src = src.substr(expr_start, i - expr_start);
+                    if (i < n && src[i] == '}') ++i;
+                    auto sub_toks = tokenize(expr_src);
+                    out.push_back({TokKind::Plus, "+", 0.0});
+                    out.push_back({TokKind::LParen, "(", 0.0});
+                    for (const auto& st : sub_toks) {
+                        if (st.kind != TokKind::Eof) out.push_back(st);
+                    }
+                    out.push_back({TokKind::RParen, ")", 0.0});
+                } else {
+                    seg.push_back(src[i++]);
+                }
+            }
+            if (i < n && src[i] == '`') ++i;
+            if (!seg.empty() || !emitted_any) flush_seg();
+            out.push_back({TokKind::RParen, ")", 0.0});
             continue;
         }
         if (c == '"' || c == '\'') {
@@ -91,6 +226,9 @@ std::vector<Token> tokenize(std::string_view src) {
             else if (id == "catch") k = TokKind::KwCatch;
             else if (id == "finally") k = TokKind::KwFinally;
             else if (id == "throw") k = TokKind::KwThrow;
+            else if (id == "class") k = TokKind::KwClass;
+            else if (id == "new") k = TokKind::KwNew;
+            else if (id == "this") k = TokKind::KwThis;
             else if (id == "true") k = TokKind::KwTrue;
             else if (id == "false") k = TokKind::KwFalse;
             else if (id == "null") k = TokKind::KwNull;
@@ -229,6 +367,38 @@ private:
                 emit(OpCode::StoreLocal, slot);
             } else {
                 emit(OpCode::StoreGlobal, add_name(name));
+            }
+            emit(OpCode::Pop);
+            return true;
+        }
+        if (match(TokKind::KwClass)) {
+            if (!check(TokKind::Ident)) { err = "Expected class name"; return false; }
+            std::string cname = advance().text;
+            match(TokKind::LBrace);
+            GcObject* cls = alloc_(GcObject::Type::Class);
+            cls->fn_name = cname;
+            while (!check(TokKind::RBrace) && !check(TokKind::Eof)) {
+                if (match(TokKind::Semi)) continue;
+                bool is_async = false;
+                if (check(TokKind::KwAsync) && is_ident_or_keyword(peek(1).kind)) {
+                    advance();
+                    is_async = true;
+                }
+                if (!is_ident_or_keyword(peek().kind)) { err = "Expected class method name"; return false; }
+                std::string mname = advance().text;
+                GcObject* mfn = compile_function_body(cname + "." + mname, is_async, err);
+                if (!mfn) return false;
+                cls->props[mname] = JsValue::make_obj(mfn);
+            }
+            match(TokKind::RBrace);
+            int32_t cidx = add_const(JsValue::make_obj(cls));
+            emit(OpCode::PushConst, cidx);
+            if (in_function_) {
+                int32_t slot = static_cast<int32_t>(locals_.size());
+                locals_.push_back(cname);
+                emit(OpCode::StoreLocal, slot);
+            } else {
+                emit(OpCode::StoreGlobal, add_name(cname));
             }
             emit(OpCode::Pop);
             return true;
@@ -726,6 +896,33 @@ private:
             emit(OpCode::PushConst, add_const(JsValue::make_null()));
             return true;
         }
+        if (match(TokKind::KwThis)) {
+            emit(OpCode::LoadThis);
+            return true;
+        }
+        if (match(TokKind::KwNew)) {
+            if (!check(TokKind::Ident)) { err = "Expected constructor name after new"; return false; }
+            std::string cname = advance().text;
+            int32_t slot = in_function_ ? find_local(cname) : -1;
+            if (slot >= 0) emit(OpCode::LoadLocal, slot);
+            else emit(OpCode::LoadGlobal, add_name(cname));
+            while (match(TokKind::Dot)) {
+                if (!is_ident_or_keyword(peek().kind)) { err = "Expected property name"; return false; }
+                emit(OpCode::PushConst, add_const(JsValue::make_string(advance().text)));
+                emit(OpCode::GetProp);
+            }
+            int32_t argc = 0;
+            if (match(TokKind::LParen)) {
+                while (!check(TokKind::RParen) && !check(TokKind::Eof)) {
+                    if (!compile_expr(err)) return false;
+                    ++argc;
+                    if (!match(TokKind::Comma)) break;
+                }
+                match(TokKind::RParen);
+            }
+            emit(OpCode::Construct, argc);
+            return true;
+        }
         if (check(TokKind::KwAsync) && peek(1).kind == TokKind::KwFunction) {
             advance(); advance();
             std::string fname = check(TokKind::Ident) ? advance().text : "<async>";
@@ -1138,7 +1335,10 @@ std::string JsValue::to_string() const {
             if (!obj) return "null";
             if (obj->type == GcObject::Type::Array) return "[Array(" + std::to_string(obj->elements.size()) + ")]";
             if (obj->type == GcObject::Type::Function) return "[Function " + obj->fn_name + "]";
+            if (obj->type == GcObject::Type::Class) return "[Class " + obj->fn_name + "]";
             if (obj->type == GcObject::Type::Canvas2D) return "[CanvasRenderingContext2D #" + obj->canvas_id + "]";
+            if (obj->type == GcObject::Type::StyleProxy) return "[CSSStyleDeclaration]";
+            if (obj->type == GcObject::Type::WebSocket) return "[WebSocket " + (obj->ws_client ? obj->ws_client->url() : "") + "]";
             return "[Object]";
     }
     return {};
@@ -1197,6 +1397,7 @@ void AstraJsEngine::mark_value(const JsValue& v) {
 void AstraJsEngine::mark_object(GcObject* o) {
     if (!o || o->marked) return;
     o->marked = true;
+    if (o->proto_class) mark_object(o->proto_class);
     for (const auto& e : o->elements) mark_value(e);
     for (const auto& [k, v] : o->props) mark_value(v);
     for (const auto& c : o->chunk.constants) mark_value(c);
@@ -1328,7 +1529,8 @@ GcStats AstraJsEngine::gc_stats() const {
 JsValue AstraJsEngine::invoke_callable(const JsValue& fn,
                                        const std::vector<JsValue>& args,
                                        HtmlDocument& doc,
-                                       JsExecutionReport& rep) {
+                                       JsExecutionReport& rep,
+                                       const JsValue& this_val) {
     if (fn.kind == JsValue::Kind::String) {
         // Built-in global functions
         if (fn.sval == "__queueMicrotask__" && !args.empty()) {
@@ -1387,7 +1589,7 @@ JsValue AstraJsEngine::invoke_callable(const JsValue& fn,
     for (size_t i = 0; i < std::min(locals.size(), args.size()); ++i) {
         locals[i] = args[i];
     }
-    JsValue out = run_chunk(fn.obj->chunk, locals, doc, rep, fn.obj->closure_env);
+    JsValue out = run_chunk(fn.obj->chunk, locals, doc, rep, fn.obj->closure_env, this_val);
     if (fn.obj->is_async) {
         if (exception_active_) {
             JsValue reason = exception_value_;
@@ -1407,7 +1609,8 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                                  std::vector<JsValue>& locals,
                                  HtmlDocument& doc,
                                  JsExecutionReport& rep,
-                                 const std::shared_ptr<std::unordered_map<std::string, JsValue>>& closure_env) {
+                                 const std::shared_ptr<std::unordered_map<std::string, JsValue>>& closure_env,
+                                 const JsValue& this_val) {
     size_t ip = 0;
     const size_t n = chunk.code.size();
     const size_t kMaxSteps = 200000;
@@ -1495,11 +1698,15 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                 }
                 break;
             }
+            case OpCode::LoadThis:
+                stack_.push_back(this_val);
+                break;
             case OpCode::LoadGlobal: {
                 const std::string& name = chunk.names[static_cast<size_t>(ins.operand)];
                 if (name == "document" || name == "console" || name == "astra" ||
                     name == "Math" || name == "JSON" || name == "localStorage" ||
-                    name == "Promise" || name == "chrome" || name == "browser") {
+                    name == "Promise" || name == "chrome" || name == "browser" ||
+                    name == "WebSocket") {
                     stack_.push_back(JsValue::make_string("__builtin_" + name + "__"));
                 } else if (name == "queueMicrotask") {
                     stack_.push_back(JsValue::make_string("__queueMicrotask__"));
@@ -1625,6 +1832,10 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                         GcObject* cl = alloc_object(GcObject::Type::Map);
                         cl->classlist_node = obj.node;
                         stack_.push_back(JsValue::make_obj(cl));
+                    } else if (k == "style") {
+                        GcObject* sp = alloc_object(GcObject::Type::StyleProxy);
+                        sp->style_node = obj.node;
+                        stack_.push_back(JsValue::make_obj(sp));
                     } else stack_.push_back(JsValue::make_string(obj.node->get_attr(k)));
                 } else if (obj.kind == JsValue::Kind::Object && obj.obj) {
                     if (obj.obj->type == GcObject::Type::Array) {
@@ -1633,6 +1844,20 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                         } else {
                             size_t idx = static_cast<size_t>(std::max(0.0, key.to_number()));
                             stack_.push_back(idx < obj.obj->elements.size() ? obj.obj->elements[idx] : JsValue::make_undefined());
+                        }
+                    } else if (obj.obj->type == GcObject::Type::StyleProxy && obj.obj->style_node) {
+                        stack_.push_back(JsValue::make_string(get_inline_css_prop(obj.obj->style_node, k)));
+                    } else if (obj.obj->type == GcObject::Type::WebSocket) {
+                        if (k == "readyState") {
+                            int rs = (obj.obj->ws_client && obj.obj->ws_client->is_open()) ? 1 : 3;
+                            stack_.push_back(JsValue::make_number(static_cast<double>(rs)));
+                        } else if (k == "url") {
+                            stack_.push_back(JsValue::make_string(obj.obj->ws_client ? obj.obj->ws_client->url() : ""));
+                        } else if (k == "tlsVerified") {
+                            stack_.push_back(JsValue::make_bool(obj.obj->ws_client && obj.obj->ws_client->tls_verified()));
+                        } else {
+                            auto it = obj.obj->props.find(k);
+                            stack_.push_back(it != obj.obj->props.end() ? it->second : JsValue::make_undefined());
                         }
                     } else if (obj.obj->type == GcObject::Type::Canvas2D) {
                         auto cit = canvases_.find(obj.obj->canvas_id);
@@ -1646,7 +1871,13 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                         }
                     } else {
                         auto it = obj.obj->props.find(k);
-                        stack_.push_back(it != obj.obj->props.end() ? it->second : JsValue::make_undefined());
+                        if (it != obj.obj->props.end()) {
+                            stack_.push_back(it->second);
+                        } else if (obj.obj->proto_class && obj.obj->proto_class->props.count(k) > 0) {
+                            stack_.push_back(obj.obj->proto_class->props[k]);
+                        } else {
+                            stack_.push_back(JsValue::make_undefined());
+                        }
                     }
                 } else if (obj.kind == JsValue::Kind::String) {
                     if (k == "length") {
@@ -1678,6 +1909,8 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                         size_t idx = static_cast<size_t>(std::max(0.0, key.to_number()));
                         if (idx >= obj.obj->elements.size()) obj.obj->elements.resize(idx + 1, JsValue::make_undefined());
                         obj.obj->elements[idx] = val;
+                    } else if (obj.obj->type == GcObject::Type::StyleProxy && obj.obj->style_node) {
+                        set_inline_css_prop(obj.obj->style_node, k, val.to_string());
                     } else if (obj.obj->type == GcObject::Type::Canvas2D) {
                         obj.obj->props[k] = val;
                         auto cit = canvases_.find(obj.obj->canvas_id);
@@ -1712,6 +1945,48 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                     }
                 }
                 stack_.push_back(val);
+                break;
+            }
+            case OpCode::Construct: {
+                int32_t argc = ins.operand;
+                std::vector<JsValue> args(static_cast<size_t>(argc));
+                for (int32_t i = argc - 1; i >= 0; --i) args[static_cast<size_t>(i)] = pop();
+                JsValue ctor = pop();
+                if (ctor.kind == JsValue::Kind::String && ctor.sval == "__builtin_WebSocket__") {
+                    GcObject* ws = alloc_object(GcObject::Type::WebSocket);
+                    ws->ws_client = std::make_shared<WebSocketClient>();
+                    std::string ws_err;
+                    std::string ws_url = args.empty() ? "" : args[0].to_string();
+                    bool ok = !ws_url.empty() && ws->ws_client->connect(ws_url, 3000, &ws_err);
+                    ws->props["error"] = JsValue::make_string(ok ? "" : ws_err);
+                    stack_.push_back(JsValue::make_obj(ws));
+                } else if (ctor.kind == JsValue::Kind::Object && ctor.obj &&
+                           ctor.obj->type == GcObject::Type::Class) {
+                    GcObject* inst = alloc_object(GcObject::Type::Map);
+                    inst->proto_class = ctor.obj;
+                    JsValue inst_val = JsValue::make_obj(inst);
+                    auto cit = ctor.obj->props.find("constructor");
+                    if (cit != ctor.obj->props.end()) {
+                        invoke_callable(cit->second, args, doc, rep, inst_val);
+                        if (exception_active_) {
+                            if (try_unwind()) break;
+                            return JsValue::make_undefined();
+                        }
+                    }
+                    stack_.push_back(inst_val);
+                } else if (ctor.kind == JsValue::Kind::Object && ctor.obj &&
+                           ctor.obj->type == GcObject::Type::Function) {
+                    GcObject* inst = alloc_object(GcObject::Type::Map);
+                    JsValue inst_val = JsValue::make_obj(inst);
+                    invoke_callable(ctor, args, doc, rep, inst_val);
+                    if (exception_active_) {
+                        if (try_unwind()) break;
+                        return JsValue::make_undefined();
+                    }
+                    stack_.push_back(inst_val);
+                } else {
+                    stack_.push_back(JsValue::make_undefined());
+                }
                 break;
             }
             case OpCode::Call: {
@@ -2092,8 +2367,41 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                                              : make_resolved_promise(recv);
                         JsValue on_r = args.size() >= 1 ? args[0] : JsValue::make_undefined();
                         ret = JsValue::make_obj(chain_promise(p, JsValue::make_undefined(), on_r, false));
+                    } else if (recv.obj->type == GcObject::Type::WebSocket && recv.obj->ws_client) {
+                        if (method == "send" && !args.empty()) {
+                            std::string err;
+                            ret = JsValue::make_bool(recv.obj->ws_client->send_text(args[0].to_string(), &err));
+                        } else if (method == "ping") {
+                            std::string err;
+                            std::string d = args.empty() ? "astra" : args[0].to_string();
+                            ret = JsValue::make_bool(recv.obj->ws_client->send_ping(d, &err));
+                        } else if (method == "recv") {
+                            int tmo = args.empty() ? 2000 : static_cast<int>(args[0].to_number());
+                            WsMessage wm = recv.obj->ws_client->recv(tmo);
+                            if (wm.ok) {
+                                ret = JsValue::make_string(wm.payload);
+                                if (wm.opcode == WsOpcode::Text || wm.opcode == WsOpcode::Binary) {
+                                    auto oit = recv.obj->props.find("onmessage");
+                                    if (oit != recv.obj->props.end() && oit->second.kind == JsValue::Kind::Object) {
+                                        GcObject* ev = alloc_object(GcObject::Type::Map);
+                                        ev->props["data"] = JsValue::make_string(wm.payload);
+                                        invoke_callable(oit->second, {JsValue::make_obj(ev)}, doc, rep, recv);
+                                    }
+                                }
+                            } else {
+                                ret = JsValue::make_null();
+                            }
+                        } else if (method == "close") {
+                            recv.obj->ws_client->close();
+                            auto cit = recv.obj->props.find("onclose");
+                            if (cit != recv.obj->props.end() && cit->second.kind == JsValue::Kind::Object) {
+                                invoke_callable(cit->second, {}, doc, rep, recv);
+                            }
+                        }
                     } else if (recv.obj->props.count(method) > 0) {
-                        ret = invoke_callable(recv.obj->props[method], args, doc, rep);
+                        ret = invoke_callable(recv.obj->props[method], args, doc, rep, recv);
+                    } else if (recv.obj->proto_class && recv.obj->proto_class->props.count(method) > 0) {
+                        ret = invoke_callable(recv.obj->proto_class->props[method], args, doc, rep, recv);
                     }
                 }
                 if (exception_active_) {

@@ -14,16 +14,23 @@
 #include "net/http2_client.hpp"
 #include "net/http_cache.hpp"
 #include "net/http_client.hpp"
+#include "net/websocket_client.hpp"
 #include "privacy/shield.hpp"
 
+#include <arpa/inet.h>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <netinet/in.h>
 #include <sstream>
 #include <string>
+#include <sys/socket.h>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 
 using namespace astra;
@@ -44,7 +51,7 @@ void expect(bool cond, const std::string& label) {
 }
 
 int run_full_test_suite() {
-    std::cout << "=== Astra Browser Core v6 — Full Subsystem Verification Suite ===\n\n";
+    std::cout << "=== Astra Browser Core v7 — Full Subsystem Verification Suite ===\n\n";
 
     // 1. SlabArena + OS Reclamation
     {
@@ -781,6 +788,238 @@ int run_full_test_suite() {
                    "CSS linear-gradient(90deg) roundtrips in ASD5 DisplayList and rasterizes smooth per-pixel RGB interpolation");
         }
 
+        // 34. AstraNet v6: RFC 6455 WebSocket SHA-1/Base64 Handshake + Real Loopback Echo Server + JS new WebSocket()
+        {
+            // Canonical RFC 6455 Section 1.3 vector
+            std::string canonical_accept = WebSocketClient::compute_accept_key("dGhlIHNhbXBsZSBub25jZQ==");
+            bool rfc_vector_ok = (canonical_accept == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+
+            int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            int opt = 1;
+            if (listen_fd >= 0) setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            addr.sin_port = 0; // ephemeral port
+            bool bound = (listen_fd >= 0 &&
+                          ::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
+                          ::listen(listen_fd, 4) == 0);
+            socklen_t alen = sizeof(addr);
+            uint16_t port = 0;
+            if (bound && ::getsockname(listen_fd, reinterpret_cast<sockaddr*>(&addr), &alen) == 0) {
+                port = ntohs(addr.sin_port);
+            }
+
+            bool srv_saw_masked_frame = false;
+            std::thread srv_thread([&]() {
+                if (!bound) return;
+                int cfd = ::accept(listen_fd, nullptr, nullptr);
+                if (cfd < 0) return;
+                std::string req;
+                char buf[1024];
+                while (req.find("\r\n\r\n") == std::string::npos && req.size() < 4096) {
+                    ssize_t n = ::recv(cfd, buf, sizeof(buf), 0);
+                    if (n <= 0) break;
+                    req.append(buf, static_cast<size_t>(n));
+                }
+                std::string ws_key;
+                size_t kp = req.find("Sec-WebSocket-Key:");
+                if (kp != std::string::npos) {
+                    size_t vs = kp + 18;
+                    while (vs < req.size() && req[vs] == ' ') ++vs;
+                    size_t ve = req.find("\r\n", vs);
+                    if (ve != std::string::npos) ws_key = req.substr(vs, ve - vs);
+                }
+                std::string accept_val = WebSocketClient::compute_accept_key(ws_key);
+                std::string resp =
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    "Sec-WebSocket-Accept: " + accept_val + "\r\n\r\n";
+                (void)::send(cfd, resp.data(), resp.size(), MSG_NOSIGNAL);
+
+                // Serve up to 3 masked client frames (Text -> Echo Text, Ping -> Pong, Close -> exit)
+                for (int iter = 0; iter < 4; ++iter) {
+                    uint8_t fh[2];
+                    if (::recv(cfd, fh, 2, MSG_WAITALL) != 2) break;
+                    uint8_t op = fh[0] & 0x0Fu;
+                    bool masked = (fh[1] & 0x80u) != 0;
+                    size_t plen = fh[1] & 0x7Fu;
+                    if (plen >= 126) break;
+                    uint8_t mask[4] = {0, 0, 0, 0};
+                    if (masked && ::recv(cfd, mask, 4, MSG_WAITALL) != 4) break;
+                    std::string pl(plen, '\0');
+                    if (plen > 0 && ::recv(cfd, pl.data(), plen, MSG_WAITALL) != static_cast<ssize_t>(plen)) break;
+                    if (masked) {
+                        srv_saw_masked_frame = true;
+                        for (size_t i = 0; i < plen; ++i) pl[i] = static_cast<char>(static_cast<uint8_t>(pl[i]) ^ mask[i & 3u]);
+                    }
+                    if (op == 0x8) break; // Close
+                    std::vector<uint8_t> out;
+                    if (op == 0x1) { // Text -> echo prefixed
+                        std::string reply = "echo:" + pl;
+                        out.push_back(0x81u);
+                        out.push_back(static_cast<uint8_t>(reply.size()));
+                        out.insert(out.end(), reply.begin(), reply.end());
+                    } else if (op == 0x9) { // Ping -> Pong
+                        out.push_back(0x8Au);
+                        out.push_back(static_cast<uint8_t>(pl.size()));
+                        out.insert(out.end(), pl.begin(), pl.end());
+                    }
+                    if (!out.empty()) (void)::send(cfd, out.data(), out.size(), MSG_NOSIGNAL);
+                }
+                ::close(cfd);
+            });
+
+            SlabArena wsa;
+            HtmlDocument wsdoc = HtmlDocument::parse(wsa, "<html><body><p id=\"wsout\">init</p></body></html>");
+            AstraJsEngine wsvm;
+            std::string ws_script =
+                "let sock = new WebSocket(\"ws://127.0.0.1:" + std::to_string(port) + "/stream\");\n"
+                "let stateOpen = sock.readyState;\n"
+                "let cbMsg = \"\";\n"
+                "let closedFlag = false;\n"
+                "sock.onmessage = (ev) => { cbMsg = ev.data; };\n"
+                "sock.onclose = () => { closedFlag = true; };\n"
+                "let sent = sock.send(\"AstraV7\");\n"
+                "let r1 = sock.recv(2000);\n"
+                "sock.ping(\"hb\");\n"
+                "let pong = sock.recv(2000);\n"
+                "sock.close();\n"
+                "let stateClosed = sock.readyState;\n"
+                "document.querySelector(\"#wsout\").textContent = stateOpen + \"|\" + sent + \"|\" + r1 + \"|\" + cbMsg + \"|\" + pong + \"|\" + closedFlag + \"|\" + stateClosed;\n";
+            auto wsrep = wsvm.execute(ws_script, wsdoc);
+            if (srv_thread.joinable()) srv_thread.join();
+            if (listen_fd >= 0) ::close(listen_fd);
+            std::string wsout = wsdoc.query_selector("#wsout")->text_content();
+            expect(rfc_vector_ok && bound && wsrep.ok && srv_saw_masked_frame &&
+                   wsout == "1|true|echo:AstraV7|echo:AstraV7|hb|true|3",
+                   "AstraNet v6 RFC 6455 WebSocket handshake, masked framing, ping/pong & JS new WebSocket() work end-to-end");
+        }
+
+        // 35. CSS3 Custom Properties (--*/var()), :root Inheritance, Fallback & Direct-Child Combinator (>)
+        {
+            SlabArena va;
+            HtmlDocument vdoc = HtmlDocument::parse(
+                va,
+                "<html><head><style>"
+                ":root { --accent: #38bdf8; --pad: 18px; }"
+                ".parent > .item { color: var(--accent); padding: var(--pad); background: var(--missing, #1e293b); }"
+                ".scope { --accent: #10b981; }"
+                ".scope > .item { color: var(--accent); }"
+                "</style></head><body>"
+                "<div class=\"parent\"><div class=\"item\" id=\"direct\">Direct</div>"
+                "<div class=\"wrap\"><div class=\"item\" id=\"nested\">Nested</div></div></div>"
+                "<div class=\"scope\"><div class=\"item\" id=\"scoped\">Scoped</div></div>"
+                "</body></html>");
+            CssStylesheet vsheet;
+            vsheet.parse(vdoc.collect_stylesheets());
+            LayoutFrame* vroot = LayoutEngine::build_layout(va, vdoc, vsheet, 800.0f, 400.0f);
+            const LayoutFrame* f_direct = nullptr;
+            const LayoutFrame* f_nested = nullptr;
+            const LayoutFrame* f_scoped = nullptr;
+            std::function<void(const LayoutFrame*)> find_frames = [&](const LayoutFrame* f) {
+                if (!f) return;
+                if (f->node) {
+                    std::string id = f->node->get_attr("id");
+                    if (id == "direct") f_direct = f;
+                    else if (id == "nested") f_nested = f;
+                    else if (id == "scoped") f_scoped = f;
+                }
+                for (const LayoutFrame* c : f->children) find_frames(c);
+            };
+            find_frames(vroot);
+            bool ok_vars = f_direct && f_nested && f_scoped &&
+                           f_direct->style.color.to_argb() == 0xFF38BDF8u &&
+                           f_direct->style.background.to_argb() == 0xFF1E293Bu &&
+                           std::abs(f_direct->style.padding.left - 18.0f) < 0.5f &&
+                           f_nested->style.color.to_argb() != 0xFF38BDF8u &&
+                           f_scoped->style.color.to_argb() == 0xFF10B981u;
+            expect(ok_vars,
+                   "CSS3 :root variables (--*/var() with fallback), scoped cascade, and direct-child combinator (>) resolve accurately");
+        }
+
+        // 36. CSS3 Flexbox justify-content (space-between/center), align-items:center, text-align & min/max-width
+        {
+            SlabArena fa;
+            HtmlDocument fdoc = HtmlDocument::parse(
+                fa,
+                "<html><head><style>"
+                "body { margin: 0; padding: 0; }"
+                ".bar { display: flex; justify-content: space-between; align-items: center; width: 600px; height: 100px; background: #0f172a; }"
+                ".a { width: 100px; height: 40px; background: #0ea5e9; }"
+                ".b { width: 100px; height: 80px; background: #10b981; }"
+                ".clamped { width: 500px; max-width: 260px; min-width: 120px; height: 30px; text-align: center; }"
+                "</style></head><body>"
+                "<div class=\"bar\"><div class=\"a\">A</div><div class=\"b\">B</div></div>"
+                "<div class=\"clamped\">Centered</div>"
+                "</body></html>");
+            CssStylesheet fsheet;
+            fsheet.parse(fdoc.collect_stylesheets());
+            LayoutFrame* froot = LayoutEngine::build_layout(fa, fdoc, fsheet, 800.0f, 400.0f);
+            bool ok_flex = froot && froot->children.size() == 2 &&
+                           froot->children[0]->children.size() == 2 &&
+                           std::abs(froot->children[0]->children[0]->border_box.x - 0.0f) < 1.0f &&
+                           std::abs(froot->children[0]->children[1]->border_box.x - 500.0f) < 1.0f &&
+                           std::abs(froot->children[0]->children[0]->border_box.y - 30.0f) < 1.5f &&
+                           std::abs(froot->children[1]->border_box.w - 260.0f) < 1.0f &&
+                           froot->children[1]->style.text_align == TextAlign::Center;
+            expect(ok_flex,
+                   "CSS3 Flexbox justify-content:space-between, align-items:center, text-align & min/max-width compute exact geometry");
+        }
+
+        // 37. AstraJS v7: ES6 class / constructor / this / new Instantiation & Template Literals (`...${expr}...`)
+        {
+            SlabArena cla;
+            HtmlDocument cldoc = HtmlDocument::parse(cla, "<html><body><p id=\"cl\">init</p></body></html>");
+            AstraJsEngine clvm;
+            std::string js =
+                "class EngineNode {\n"
+                "  constructor(name, threads) {\n"
+                "    this.name = name;\n"
+                "    this.threads = threads;\n"
+                "  }\n"
+                "  summary(ver) {\n"
+                "    return `${this.name}:v${ver}(${this.threads * 2}q)`;\n"
+                "  }\n"
+                "}\n"
+                "const n1 = new EngineNode(\"AstraNet\", 4);\n"
+                "const n2 = new EngineNode(\"AstraJS\", 2);\n"
+                "const tag = `${n1.summary(7)} | ${n2.summary(7)}`;\n"
+                "document.querySelector(\"#cl\").textContent = tag;\n";
+            auto rep = clvm.execute(js, cldoc);
+            std::string got = cldoc.query_selector("#cl")->text_content();
+            expect(rep.ok && got == "AstraNet:v7(8q) | AstraJS:v7(4q)",
+                   "AstraJS v7 compiles and executes ES6 class/constructor/this/new and template literal interpolation cleanly");
+        }
+
+        // 38. AstraJS v7: Dynamic element.style.* Inline CSS Proxy -> Layout Engine Reflection
+        {
+            SlabArena sa;
+            HtmlDocument sdoc = HtmlDocument::parse(
+                sa, "<html><body><div id=\"dyn\">Dynamic</div></body></html>");
+            AstraJsEngine svm;
+            std::string js =
+                "const el = document.querySelector(\"#dyn\");\n"
+                "el.style.backgroundColor = \"#0ea5e9\";\n"
+                "el.style.borderRadius = \"14px\";\n"
+                "el.style.width = \"320px\";\n"
+                "el.style.color = \"#ffffff\";\n"
+                "const readBack = el.style.backgroundColor + \"|\" + el.style.width;\n";
+            auto rep = svm.execute(js, sdoc);
+            std::string rb = svm.globals().count("readBack") ? svm.globals().at("readBack").to_string() : "";
+            CssStylesheet ssheet;
+            LayoutFrame* sroot = LayoutEngine::build_layout(sa, sdoc, ssheet, 800.0f, 300.0f);
+            bool ok_style = rep.ok && rb == "#0ea5e9|320px" &&
+                            sroot && !sroot->children.empty() &&
+                            sroot->children[0]->style.background.to_argb() == 0xFF0EA5E9u &&
+                            sroot->children[0]->style.color.to_argb() == 0xFFFFFFFFu &&
+                            std::abs(sroot->children[0]->style.border_radius - 14.0f) < 0.5f &&
+                            std::abs(sroot->children[0]->border_box.w - 320.0f) < 1.0f;
+            expect(ok_style,
+                   "AstraJS v7 element.style.* camelCase proxy mutates inline CSS and reflects directly in LayoutEngine");
+        }
+
         app.stop_workers();
     }
 
@@ -789,7 +1028,7 @@ int run_full_test_suite() {
 }
 
 int run_stress_test(int tab_count, uint64_t ceiling_mb) {
-    std::cout << "=== Astra v6 Multi-Tab Stress Test (" << tab_count << " tabs, ceiling " << ceiling_mb << " MB) ===\n";
+    std::cout << "=== Astra v7 Multi-Tab Stress Test (" << tab_count << " tabs, ceiling " << ceiling_mb << " MB) ===\n";
     BrowserApp app(ceiling_mb * 1024ULL * 1024ULL);
     app.start_workers();
 
@@ -848,9 +1087,9 @@ int run_stress_test(int tab_count, uint64_t ceiling_mb) {
 
 void print_help() {
     std::cout
-        << "Astra Browser Core v6 (Native C++20 Multi-Process Engine)\n"
+        << "Astra Browser Core v7 (Native C++20 Multi-Process Engine)\n"
         << "Usage:\n"
-        << "  astra --test                                Run full Session 6 subsystem suite (38 tests)\n"
+        << "  astra --test                                Run full Session 7 subsystem suite (43 tests)\n"
         << "  astra --url <URL> [--out <file.png>]        Load URL & render PNG\n"
         << "        [--download <URL>]                    Download URL to /tmp/astra_downloads/ with SHA-256\n"
         << "        [--ext <extension_dir>]               Load Manifest V3 WebExtension (repeatable)\n"
@@ -998,7 +1237,7 @@ int main(int argc, char** argv) {
     }
 
     if (run_repl) {
-        std::cout << "Astra v6 Interactive Shell (open <url>, download <url>, downloads, back, forward, reload, close <id>, tabs, switch <id>, scroll <px>, click <x> <y>, type <text>, enter, raf [N], mem, shield, cache, render <file.png>, quit)\n";
+        std::cout << "Astra v7 Interactive Shell (open <url>, download <url>, downloads, back, forward, reload, close <id>, tabs, switch <id>, scroll <px>, click <x> <y>, type <text>, enter, raf [N], mem, shield, cache, render <file.png>, quit)\n";
         app.new_tab("astra://home");
         std::string line;
         while (std::cout << "astra> " && std::getline(std::cin, line)) {
