@@ -1,6 +1,22 @@
-CXX      := g++
-CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Wno-unused-parameter -pthread -Isrc
-LDFLAGS  := -pthread -ldl
+# `CXX ?= g++` no bastaría: make predefine CXX como `c++`, así que `?=` nunca
+# se aplicaría. Esto mantiene g++ como valor por defecto documentado y, a la
+# vez, respeta un CXX exportado o pasado en la línea de órdenes.
+CXX      := $(if $(filter default,$(origin CXX)),g++,$(CXX))
+CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Wno-unused-parameter -pthread -Isrc -MMD -MP
+LDFLAGS  := -pthread
+
+# -----------------------------------------------------------------------------
+# Detección de plataforma (Session 8): el mismo árbol de código compila en
+# Linux (glibc) y macOS/Darwin. Las divergencias de SO viven en
+# src/core/platform.hpp; aquí solo cambian las banderas del enlazador, porque
+# en Darwin dl*() forma parte de libSystem y no existe -ldl.
+# -----------------------------------------------------------------------------
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+  LDFLAGS += -Wl,-dead_strip
+else
+  LDFLAGS += -ldl
+endif
 
 SRCS := \
 	src/core/arena.cpp \
@@ -16,6 +32,7 @@ SRCS := \
 	src/net/websocket_client.cpp \
 	src/dom/html_parser.cpp \
 	src/style/css_engine.cpp \
+	src/style/animation_engine.cpp \
 	src/layout/layout_engine.cpp \
 	src/js/astra_js.cpp \
 	src/ext/extension_runtime.cpp \
@@ -30,6 +47,7 @@ SRCS := \
 	src/main.cpp
 
 OBJS := $(patsubst src/%.cpp,build/%.o,$(SRCS))
+DEPS := $(OBJS:.o=.d)
 TARGET := build/astra
 
 .PHONY: all clean test
@@ -49,3 +67,5 @@ test: $(TARGET)
 
 clean:
 	rm -rf build
+
+-include $(DEPS)

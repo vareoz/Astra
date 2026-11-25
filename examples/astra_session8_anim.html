@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Astra Sesión 8 (animaciones) — Animaciones CSS, transform 2D, eventos DOM nivel 2 y revalidación HTTP</title>
+  <style>
+    :root {
+      --bg-canvas: #070b14;
+      --bg-surface: #0f172a;
+      --border-subtle: #1e293b;
+      --accent-sky: #38bdf8;
+      --accent-emerald: #10b981;
+      --accent-violet: #8b5cf6;
+      --accent-amber: #f59e0b;
+      --text-primary: #f8fafc;
+      --text-muted: #94a3b8;
+      --radius-lg: 12px;
+      --pad-card: 16px;
+    }
+
+    body {
+      background: var(--bg-canvas);
+      color: var(--text-primary);
+      padding: 18px 26px;
+      margin: 0;
+    }
+
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: linear-gradient(90deg, #0b1324, #131d33);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: 14px 18px;
+      margin-bottom: 18px;
+    }
+
+    .brand { font-size: 20px; font-weight: bold; color: var(--accent-sky); }
+    .version { font-size: 13px; color: var(--text-muted); }
+
+    h2 {
+      font-size: 16px;
+      color: var(--accent-sky);
+      margin: 22px 0 10px 0;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 14px;
+    }
+
+    .card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: var(--pad-card);
+      box-sizing: border-box;
+    }
+
+    .card > h3 { font-size: 14px; margin: 0 0 8px 0; color: var(--text-primary); }
+    .card > p { font-size: 12px; color: var(--text-muted); margin: 0; line-height: 1.5; }
+
+    /* ------------------------------------------------------------------
+       1. @keyframes + animation: la barra crece y cambia de color en bucle
+          alternando el sentido, con la curva de temporización de CSS.
+       ------------------------------------------------------------------ */
+    @keyframes pulse-bar {
+      from { width: 90px;  background: #1d4ed8; }
+      50%  { width: 240px; background: #8b5cf6; }
+      to   { width: 360px; background: #10b981; }
+    }
+
+    .anim-bar {
+      height: 26px;
+      border-radius: 6px;
+      animation: pulse-bar 1800ms ease-in-out 0ms infinite alternate;
+    }
+
+    @keyframes fade-rise {
+      from { opacity: 0.15; margin-top: 18px; }
+      to   { opacity: 1;    margin-top: 0; }
+    }
+
+    .rising {
+      animation: fade-rise 1200ms ease-out 200ms 1 forwards;
+    }
+
+    /* ------------------------------------------------------------------
+       2. transform 2D: traslación, rotación y escala compuestas en una
+          única matriz afín que el compositor aplica por píxel con
+          supermuestreo 2x2.
+       ------------------------------------------------------------------ */
+    .xform-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      height: 180px;
+    }
+
+    .tile {
+      width: 92px;
+      height: 92px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #38bdf8, #8b5cf6);
+    }
+
+    .tile-rotate { transform: rotate(18deg); }
+    .tile-scale  { transform: scale(0.72); }
+    .tile-combo  { transform: translate(10px, -6px) rotate(-14deg) scale(1.18); }
+
+    /* ------------------------------------------------------------------
+       3. transition: el cambio de estilo que hace el script se interpola
+          en lugar de saltar de golpe.
+       ------------------------------------------------------------------ */
+    .reveal {
+      width: 120px;
+      height: 22px;
+      border-radius: 6px;
+      background: #1e293b;
+      transition: width 500ms cubic-bezier(0.25, 0.1, 0.25, 1), background 500ms linear;
+    }
+
+    .legend { font-size: 12px; color: var(--text-muted); margin-top: 10px; }
+    .status { font-size: 13px; color: var(--accent-emerald); }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <span class="brand">Astra Browser Core</span>
+    <span class="version">Sesión 8 · AstraStyle v8 · AstraJS v8 · AstraNet v8 · ASD6</span>
+  </div>
+
+  <h2>1 · Animaciones @keyframes conducidas por requestAnimationFrame</h2>
+  <div class="card">
+    <h3>animation: pulse-bar 1800ms ease-in-out infinite alternate</h3>
+    <div class="anim-bar" id="bar"></div>
+    <p class="legend">
+      Cada propiedad tiene su propia lista de keyframes: el ancho pasa por el paso
+      del 50&nbsp;% mientras el color interpola de forma independiente.
+    </p>
+  </div>
+
+  <h2>2 · transform 2D compuesto (traslación · rotación · escala)</h2>
+  <div class="xform-row">
+    <div class="tile tile-rotate"></div>
+    <div class="tile tile-scale"></div>
+    <div class="tile tile-combo"></div>
+  </div>
+
+  <h2>3 · Transiciones CSS y eventos DOM nivel 2</h2>
+  <div class="grid">
+    <div class="card rising">
+      <h3>transition</h3>
+      <div class="reveal" id="rv"></div>
+      <p class="legend">El script cambia el ancho y la transición lo interpola.</p>
+    </div>
+    <div class="card rising">
+      <h3>Fases de propagación</h3>
+      <p id="phases">captura → objetivo → burbujeo</p>
+    </div>
+    <div class="card rising">
+      <h3>Estado</h3>
+      <p class="status" id="status">inicializando…</p>
+    </div>
+  </div>
+
+  <script>
+    // Eventos DOM nivel 2: el mismo evento recorre las tres fases y cada
+    // listener recibe el objeto Event con target, currentTarget y eventPhase.
+    const trail = [];
+    const grid = document.querySelector(".grid");
+    const probe = document.querySelector("#phases");
+
+    grid.addEventListener("click", function (ev) {
+      trail.push("captura(" + ev.eventPhase + ")");
+    }, true);
+
+    probe.addEventListener("click", function (ev) {
+      trail.push("objetivo(" + ev.eventPhase + "):" + ev.target.tagName);
+      ev.preventDefault();
+    });
+
+    grid.addEventListener("click", function (ev) {
+      trail.push("burbujeo(" + ev.eventPhase + ")");
+      probe.textContent = trail.join(" → ");
+    });
+
+    // La transición arranca desde el valor base porque el cambio ocurre en el
+    // primer fotograma, no durante el cálculo inicial de estilo.
+    requestAnimationFrame(function () {
+      const rv = document.querySelector("#rv");
+      rv.style.width = "300px";
+      rv.style.background = "#10b981";
+      document.querySelector("#status").textContent =
+        "transición activa · animaciones en bucle · ASD6 con matriz afín";
+    });
+  </script>
+</body>
+</html>

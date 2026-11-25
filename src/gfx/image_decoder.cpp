@@ -1,4 +1,6 @@
 #include "gfx/image_decoder.hpp"
+
+#include "core/platform.hpp"
 #include "gfx/svg_engine.hpp"
 #include "net/http_client.hpp"
 
@@ -889,9 +891,10 @@ DecodedImage ImageDecoder::decode_webp(const uint8_t* data, size_t len) {
     static bool tried_dl = false;
     if (!tried_dl) {
         tried_dl = true;
-        webp_lib = dlopen("libwebp.so.7", RTLD_LAZY);
-        if (!webp_lib) webp_lib = dlopen("libwebp.so.6", RTLD_LAZY);
-        if (!webp_lib) webp_lib = dlopen("libwebp.so", RTLD_LAZY);
+        for (const char* name : platform::libwebp_names()) {
+            webp_lib = dlopen(name, RTLD_LAZY);
+            if (webp_lib) break;
+        }
         if (webp_lib) {
             fn_decode = reinterpret_cast<DecodeRGBAFn>(dlsym(webp_lib, "WebPDecodeRGBA"));
             fn_free = reinterpret_cast<WebPFreeFn>(dlsym(webp_lib, "WebPFree"));

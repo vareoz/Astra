@@ -62,6 +62,8 @@ std::vector<CssDeclaration> parse_declarations(std::string_view block) {
 
 bool match_selector(const DomNode* node, std::string_view selector, int& specificity, int depth = 0);
 
+// Divide por comas en el nivel superior respetando paréntesis, corchetes y
+// comillas, de modo que "a, b(1, 2), c[x=',']" produce tres piezas.
 std::vector<std::string> split_top_level_commas(std::string_view s) {
     std::vector<std::string> out;
     int pdepth = 0;
@@ -87,6 +89,58 @@ std::vector<std::string> split_top_level_commas(std::string_view s) {
         }
     }
     return out;
+}
+
+// -----------------------------------------------------------------------------
+// Session 8: utilidades de parseo para transform / animation / transition
+// -----------------------------------------------------------------------------
+
+// Divide "translate(4px, 8px) rotate(30deg)" en pares (función, argumentos),
+// respetando los paréntesis anidados.
+std::vector<std::pair<std::string, std::string>> split_functions(std::string_view v) {
+    std::vector<std::pair<std::string, std::string>> out;
+    size_t i = 0;
+    while (i < v.size()) {
+        while (i < v.size() && (std::isspace(static_cast<unsigned char>(v[i])) || v[i] == ',')) ++i;
+        size_t name_start = i;
+        while (i < v.size() && v[i] != '(' && !std::isspace(static_cast<unsigned char>(v[i]))) ++i;
+        if (name_start == i) break;
+        std::string fn = to_lower(v.substr(name_start, i - name_start));
+        while (i < v.size() && std::isspace(static_cast<unsigned char>(v[i]))) ++i;
+        if (i >= v.size() || v[i] != '(') {
+            out.emplace_back(std::move(fn), std::string());
+            continue;
+        }
+        ++i; // consume '('
+        int depth = 1;
+        size_t arg_start = i;
+        while (i < v.size() && depth > 0) {
+            if (v[i] == '(') ++depth;
+            else if (v[i] == ')') --depth;
+            if (depth > 0) ++i;
+        }
+        out.emplace_back(std::move(fn), trim(v.substr(arg_start, i - arg_start)));
+        if (i < v.size()) ++i; // consume ')'
+    }
+    return out;
+}
+
+bool is_time_token(std::string_view t) {
+    if (t.size() < 2) return false;
+    bool has_digit = false;
+    for (char c : t) {
+        if (std::isdigit(static_cast<unsigned char>(c))) has_digit = true;
+    }
+    if (!has_digit) return false;
+    return (t.size() > 2 && to_lower(t.substr(t.size() - 2)) == "ms") ||
+           (to_lower(t).back() == 's');
+}
+
+bool is_easing_token(std::string_view t) {
+    std::string l = to_lower(t);
+    return l == "linear" || l == "ease" || l == "ease-in" || l == "ease-out" ||
+           l == "ease-in-out" || l == "step-start" || l == "step-end" ||
+           l.rfind("cubic-bezier", 0) == 0 || l.rfind("steps", 0) == 0;
 }
 
 bool match_compound_selector(const DomNode* node, std::string_view part, int& specificity, int depth = 0) {
@@ -719,35 +773,107 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
                 }
             }
         }
-    } else if (p == "transform") {
-        size_t txp = vl.find("translatex(");
-        if (txp != std::string::npos) {
-            st.translate_x = StyleEngine::parse_px(vl.substr(txp + 11), 0.0f);
-        }
-        size_t typ = vl.find("translatey(");
-        if (typ != std::string::npos) {
-            st.translate_y = StyleEngine::parse_px(vl.substr(typ + 11), 0.0f);
-        }
-        size_t tp = vl.find("translate(");
-        if (tp != std::string::npos) {
-            size_t rp = vl.find(')', tp + 10);
-            if (rp != std::string::npos) {
-                std::string inner = vl.substr(tp + 10, rp - (tp + 10));
-                size_t comma = inner.find(',');
-                if (comma != std::string::npos) {
-                    st.translate_x = StyleEngine::parse_px(inner.substr(0, comma), 0.0f);
-                    st.translate_y = StyleEngine::parse_px(inner.substr(comma + 1), 0.0f);
-                } else {
-                    st.translate_x = StyleEngine::parse_px(inner, 0.0f);
-                }
-            }
-        }
     } else if (p == "border-color") {
         st.border_color = StyleEngine::parse_color(v, st.border_color);
     } else if (p == "border-width") {
         st.border_width = StyleEngine::parse_px(v, 1.0f);
     } else if (p == "border-radius") {
         st.border_radius = StyleEngine::parse_px(v, 0.0f);
+    } else if (p == "transform") {
+        st.transform = StyleEngine::parse_transform(v);
+    } else if (p == "animation") {
+        // Atajo de orden libre: el primer tiempo es la duración, el segundo el
+        // retardo; el resto se identifica por su forma.
+        AnimationSpec spec;
+        bool got_duration = false;
+        for (const auto& raw : split_ws(v)) {
+            std::string t = to_lower(raw);
+            if (is_time_token(t)) {
+                if (!got_duration) { spec.duration_ms = StyleEngine::parse_time_ms(t, 0.0f); got_duration = true; }
+                else spec.delay_ms = StyleEngine::parse_time_ms(t, 0.0f);
+            } else if (is_easing_token(t)) {
+                spec.easing = Easing::parse(t, spec.easing);
+            } else if (t == "infinite") {
+                spec.iteration_count = -1.0f;
+            } else if (t == "normal") {
+                spec.direction = AnimationDirection::Normal;
+            } else if (t == "reverse") {
+                spec.direction = AnimationDirection::Reverse;
+            } else if (t == "alternate") {
+                spec.direction = AnimationDirection::Alternate;
+            } else if (t == "alternate-reverse") {
+                spec.direction = AnimationDirection::AlternateReverse;
+            } else if (t == "forwards") {
+                spec.fill_mode = (spec.fill_mode == AnimationFillMode::Backwards)
+                                     ? AnimationFillMode::Both : AnimationFillMode::Forwards;
+            } else if (t == "backwards") {
+                spec.fill_mode = (spec.fill_mode == AnimationFillMode::Forwards)
+                                     ? AnimationFillMode::Both : AnimationFillMode::Backwards;
+            } else if (t == "both") {
+                spec.fill_mode = AnimationFillMode::Both;
+            } else if (t == "none" || t == "running" || t == "paused") {
+                // Ignorado: no hay control de reproducción por script todavía.
+            } else if (!t.empty() && std::isdigit(static_cast<unsigned char>(t[0]))) {
+                spec.iteration_count = static_cast<float>(std::atof(t.c_str()));
+            } else if (spec.name.empty()) {
+                spec.name = std::string(raw);
+            }
+        }
+        st.animation = spec;
+    } else if (p == "animation-name") {
+        st.animation.name = (vl == "none") ? std::string() : trim(v);
+    } else if (p == "animation-duration") {
+        st.animation.duration_ms = StyleEngine::parse_time_ms(v, 0.0f);
+    } else if (p == "animation-delay") {
+        st.animation.delay_ms = StyleEngine::parse_time_ms(v, 0.0f);
+    } else if (p == "animation-timing-function") {
+        st.animation.easing = Easing::parse(v, st.animation.easing);
+    } else if (p == "animation-iteration-count") {
+        st.animation.iteration_count = (vl == "infinite") ? -1.0f : static_cast<float>(std::atof(vl.c_str()));
+    } else if (p == "animation-direction") {
+        if (vl == "reverse") st.animation.direction = AnimationDirection::Reverse;
+        else if (vl == "alternate") st.animation.direction = AnimationDirection::Alternate;
+        else if (vl == "alternate-reverse") st.animation.direction = AnimationDirection::AlternateReverse;
+        else st.animation.direction = AnimationDirection::Normal;
+    } else if (p == "animation-fill-mode") {
+        if (vl == "forwards") st.animation.fill_mode = AnimationFillMode::Forwards;
+        else if (vl == "backwards") st.animation.fill_mode = AnimationFillMode::Backwards;
+        else if (vl == "both") st.animation.fill_mode = AnimationFillMode::Both;
+        else st.animation.fill_mode = AnimationFillMode::None;
+    } else if (p == "transition") {
+        st.transitions.clear();
+        if (vl != "none") {
+            for (const auto& entry : split_top_level_commas(v)) {
+                TransitionSpec ts;
+                bool got_duration = false;
+                bool got_property = false;
+                for (const auto& raw : split_ws(entry)) {
+                    std::string t = to_lower(raw);
+                    if (is_time_token(t)) {
+                        if (!got_duration) { ts.duration_ms = StyleEngine::parse_time_ms(t, 0.0f); got_duration = true; }
+                        else ts.delay_ms = StyleEngine::parse_time_ms(t, 0.0f);
+                    } else if (is_easing_token(t)) {
+                        ts.easing = Easing::parse(t, ts.easing);
+                    } else if (!got_property) {
+                        ts.property = t;
+                        got_property = true;
+                    }
+                }
+                if (ts.duration_ms > 0.0f) st.transitions.push_back(std::move(ts));
+            }
+        }
+    } else if (p == "transition-property") {
+        if (st.transitions.empty()) st.transitions.emplace_back();
+        for (auto& ts : st.transitions) ts.property = vl;
+    } else if (p == "transition-duration") {
+        if (st.transitions.empty()) st.transitions.emplace_back();
+        for (auto& ts : st.transitions) ts.duration_ms = StyleEngine::parse_time_ms(v, 0.0f);
+    } else if (p == "transition-delay") {
+        if (st.transitions.empty()) st.transitions.emplace_back();
+        for (auto& ts : st.transitions) ts.delay_ms = StyleEngine::parse_time_ms(v, 0.0f);
+    } else if (p == "transition-timing-function") {
+        if (st.transitions.empty()) st.transitions.emplace_back();
+        for (auto& ts : st.transitions) ts.easing = Easing::parse(v, ts.easing);
     } else if (p == "font-size") {
         st.font_size = std::clamp(StyleEngine::parse_px(v, st.font_size), 8.0f, 64.0f);
     } else if (p == "font-weight") {
@@ -1030,7 +1156,17 @@ void CssStylesheet::parse_block(std::string_view css, float min_w, float max_w) 
                 }
                 size_t inner_end = (pos > 0 && depth == 0) ? (pos - 1) : pos;
                 if (inner_end > inner_start) {
-                    if (header.rfind("@media", 0) == 0) {
+                    // Session 8: @keyframes se recoge antes que el resto de
+                    // @-reglas; su cuerpo son pasos, no declaraciones sueltas.
+                    if (header.rfind("@keyframes", 0) == 0 ||
+                        header.rfind("@-webkit-keyframes", 0) == 0 ||
+                        header.rfind("@-moz-keyframes", 0) == 0) {
+                        // Normaliza el prefijo de proveedor al nombre canónico.
+                        std::string h = header;
+                        size_t kw = h.find("keyframes");
+                        if (kw != std::string::npos) h = "@keyframes" + h.substr(kw + 9);
+                        parse_keyframes_block(h, css.substr(inner_start, inner_end - inner_start));
+                    } else if (header.rfind("@media", 0) == 0) {
                         // Skip print-only stylesheets on screen rendering
                         bool is_print_only = (header.find("print") != std::string::npos &&
                                               header.find("screen") == std::string::npos &&
@@ -1324,11 +1460,200 @@ std::unordered_map<std::string, std::string> StyleEngine::collect_root_vars(cons
     return vars;
 }
 
+// =============================================================================
+// Session 8 — transformaciones 2D, tiempos y funciones de temporización
+// =============================================================================
+
+void Transform2D::to_matrix(float ox, float oy, float out[6]) const {
+    const float rad = rotate_deg * 3.14159265358979323846f / 180.0f;
+    const float cs = std::cos(rad);
+    const float sn = std::sin(rad);
+    // M = T(origen) * T(translate) * R(rotate) * S(scale) * T(-origen)
+    const float a = cs * scale_x;
+    const float b = sn * scale_x;
+    const float c = -sn * scale_y;
+    const float d = cs * scale_y;
+    out[0] = a;
+    out[1] = b;
+    out[2] = c;
+    out[3] = d;
+    out[4] = translate_x + ox - (a * ox + c * oy);
+    out[5] = translate_y + oy - (b * ox + d * oy);
+}
+
+Transform2D StyleEngine::parse_transform(std::string_view val) {
+    Transform2D t;
+    std::string low = to_lower(val);
+    if (low.empty() || low == "none") return t;
+
+    for (const auto& [fn, args] : split_functions(val)) {
+        auto nums = split_top_level_commas(args);
+        auto num_at = [&](size_t i, float fb) -> float {
+            if (i >= nums.size()) return fb;
+            return static_cast<float>(std::atof(nums[i].c_str()));
+        };
+        auto px_at = [&](size_t i, float fb) -> float {
+            if (i >= nums.size()) return fb;
+            return StyleEngine::parse_px(nums[i], fb);
+        };
+        if (fn == "translate") {
+            t.translate_x += px_at(0, 0.0f);
+            t.translate_y += px_at(1, 0.0f);
+            t.enabled = true;
+        } else if (fn == "translatex") {
+            t.translate_x += px_at(0, 0.0f);
+            t.enabled = true;
+        } else if (fn == "translatey") {
+            t.translate_y += px_at(0, 0.0f);
+            t.enabled = true;
+        } else if (fn == "scale") {
+            float sx = num_at(0, 1.0f);
+            t.scale_x *= sx;
+            t.scale_y *= num_at(1, sx);
+            t.enabled = true;
+        } else if (fn == "scalex") {
+            t.scale_x *= num_at(0, 1.0f);
+            t.enabled = true;
+        } else if (fn == "scaley") {
+            t.scale_y *= num_at(0, 1.0f);
+            t.enabled = true;
+        } else if (fn == "rotate" || fn == "rotatez") {
+            // Admite deg (por defecto), rad y turn.
+            std::string a = nums.empty() ? std::string() : to_lower(nums[0]);
+            float v = a.empty() ? 0.0f : static_cast<float>(std::atof(a.c_str()));
+            if (a.find("rad") != std::string::npos) v = v * 180.0f / 3.14159265358979323846f;
+            else if (a.find("turn") != std::string::npos) v = v * 360.0f;
+            t.rotate_deg += v;
+            t.enabled = true;
+        }
+    }
+    if (t.is_identity()) t.enabled = false;
+    return t;
+}
+
+float StyleEngine::parse_time_ms(std::string_view val, float fallback) {
+    std::string v = to_lower(trim(val));
+    if (v.empty()) return fallback;
+    char* end = nullptr;
+    double num = std::strtod(v.c_str(), &end);
+    if (end == v.c_str()) return fallback;
+    std::string unit = trim(std::string(end));
+    if (unit == "ms") return static_cast<float>(num);
+    if (unit == "s" || unit.empty()) return static_cast<float>(num * 1000.0);
+    return static_cast<float>(num);
+}
+
+Easing Easing::parse(std::string_view value, Easing fallback) {
+    std::string v = to_lower(trim(value));
+    if (v.empty()) return fallback;
+    if (v == "linear") return Easing::linear();
+    if (v == "ease") return Easing::ease();
+    if (v == "ease-in") return Easing::ease_in();
+    if (v == "ease-out") return Easing::ease_out();
+    if (v == "ease-in-out") return Easing::ease_in_out();
+    if (v == "step-start") { Easing e; e.kind = EasingKind::StepStart; e.steps = 1; return e; }
+    if (v == "step-end") { Easing e; e.kind = EasingKind::StepEnd; e.steps = 1; return e; }
+    if (v.rfind("cubic-bezier", 0) == 0) {
+        size_t lp = v.find('(');
+        size_t rp = v.rfind(')');
+        if (lp != std::string::npos && rp != std::string::npos && rp > lp) {
+            auto parts = split_top_level_commas(std::string_view(v).substr(lp + 1, rp - lp - 1));
+            if (parts.size() == 4) {
+                Easing e;
+                e.kind = EasingKind::CubicBezier;
+                e.x1 = std::clamp(static_cast<float>(std::atof(parts[0].c_str())), 0.0f, 1.0f);
+                e.y1 = static_cast<float>(std::atof(parts[1].c_str()));
+                e.x2 = std::clamp(static_cast<float>(std::atof(parts[2].c_str())), 0.0f, 1.0f);
+                e.y2 = static_cast<float>(std::atof(parts[3].c_str()));
+                return e;
+            }
+        }
+        return fallback;
+    }
+    if (v.rfind("steps", 0) == 0) {
+        size_t lp = v.find('(');
+        size_t rp = v.rfind(')');
+        Easing e;
+        e.kind = EasingKind::StepEnd;
+        e.steps = 1;
+        if (lp != std::string::npos && rp != std::string::npos && rp > lp) {
+            auto parts = split_top_level_commas(std::string_view(v).substr(lp + 1, rp - lp - 1));
+            if (!parts.empty()) e.steps = std::max(1, std::atoi(parts[0].c_str()));
+            if (parts.size() > 1 && (parts[1].find("start") != std::string::npos)) {
+                e.kind = EasingKind::StepStart;
+            }
+        }
+        return e;
+    }
+    return fallback;
+}
+
+const CssKeyframesRule* CssStylesheet::find_keyframes(std::string_view name) const {
+    for (const auto& kf : keyframes_) {
+        if (kf.name == name) return &kf;
+    }
+    return nullptr;
+}
+
+// Parsea el cuerpo de un @keyframes: cada selector de paso ("from", "to",
+// "0%", "50%, 75%") se normaliza a uno o varios offsets en 0..1.
+void CssStylesheet::parse_keyframes_block(std::string_view header, std::string_view body) {
+    // header ya viene en minúsculas: "@keyframes nombre" (o @-prefijado).
+    std::string h(header);
+    size_t sp = h.find_first_of(" \t");
+    if (sp == std::string::npos) return;
+    std::string name = trim(h.substr(sp + 1));
+    if (name.empty()) return;
+
+    CssKeyframesRule rule;
+    rule.name = name;
+
+    size_t pos = 0;
+    while (pos < body.size()) {
+        size_t lbrace = body.find('{', pos);
+        if (lbrace == std::string_view::npos) break;
+        std::string_view sel = body.substr(pos, lbrace - pos);
+        size_t rbrace = body.find('}', lbrace + 1);
+        if (rbrace == std::string_view::npos) break;
+        std::string_view decl_body = body.substr(lbrace + 1, rbrace - lbrace - 1);
+        pos = rbrace + 1;
+
+        auto decls = parse_declarations(decl_body);
+        if (decls.empty()) continue;
+
+        for (const auto& piece : split_top_level_commas(sel)) {
+            std::string sl = to_lower(trim(piece));
+            float offset = -1.0f;
+            if (sl == "from") offset = 0.0f;
+            else if (sl == "to") offset = 1.0f;
+            else if (!sl.empty()) {
+                offset = static_cast<float>(std::atof(sl.c_str())) / 100.0f;
+            }
+            if (offset < 0.0f || offset > 1.0f) continue;
+            rule.keyframes.push_back(CssKeyframe{offset, decls});
+        }
+    }
+
+    if (rule.keyframes.empty()) return;
+    std::stable_sort(rule.keyframes.begin(), rule.keyframes.end(),
+                     [](const CssKeyframe& a, const CssKeyframe& b) { return a.offset < b.offset; });
+
+    // Una redefinición del mismo nombre sustituye a la anterior (cascada CSS).
+    for (auto& existing : keyframes_) {
+        if (existing.name == rule.name) {
+            existing = std::move(rule);
+            return;
+        }
+    }
+    keyframes_.push_back(std::move(rule));
+}
+
 ComputedStyle StyleEngine::compute_style(const DomNode* node,
                                          const CssStylesheet& sheet,
                                          const ComputedStyle* parent_style,
                                          float viewport_w,
-                                         bool light_web_default) {
+                                         bool light_web_default,
+                                         const StyleAdjuster* adjuster) {
     ComputedStyle st;
     // Inherit text properties & CSS custom properties from parent
     if (parent_style) {
@@ -1409,6 +1734,16 @@ ComputedStyle StyleEngine::compute_style(const DomNode* node,
     }
     for (const auto& decl : inline_decls) {
         apply_resolved(decl);
+    }
+
+    // Pass 3 (Session 8): el efecto animado se aplica por encima de la cascada
+    // del autor y del atributo `style`, como exige CSS Animations Level 1.
+    if (adjuster) {
+        std::vector<CssDeclaration> animated;
+        adjuster->collect(node, animated);
+        for (const auto& decl : animated) {
+            apply_resolved(decl);
+        }
     }
 
     return st;

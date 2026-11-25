@@ -1,5 +1,7 @@
 #include "core/arena.hpp"
 
+#include "core/platform.hpp"
+
 #include <algorithm>
 #include <stdexcept>
 #include <sys/mman.h>
@@ -120,7 +122,7 @@ void SlabArena::reset(bool release_to_os) {
         for (auto& slab : slabs_) {
             if (slab.base && slab.offset > 0) {
                 poison_buffer(slab.base, std::min<size_t>(slab.offset, 4096));
-                madvise(slab.base, slab.capacity, MADV_DONTNEED);
+                platform::release_pages(slab.base, slab.capacity);
             }
         }
         release_all_slabs();
@@ -128,7 +130,7 @@ void SlabArena::reset(bool release_to_os) {
         for (auto& slab : slabs_) {
             if (slab.base && slab.offset > 0) {
                 poison_buffer(slab.base, std::min<size_t>(slab.offset, 4096));
-                madvise(slab.base, slab.capacity, MADV_DONTNEED);
+                platform::release_pages(slab.base, slab.capacity);
             }
             slab.offset = 0;
         }

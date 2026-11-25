@@ -1,5 +1,7 @@
 #include "core/memory_governor.hpp"
 
+#include "core/platform.hpp"
+
 #include <algorithm>
 #include <fstream>
 #include <sstream>
@@ -34,23 +36,12 @@ void MemoryGovernor::unregister_process(pid_t pid) {
 }
 
 uint64_t MemoryGovernor::read_process_rss_bytes(pid_t pid) {
-    static const uint64_t page_size = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
-    std::string path = "/proc/" + std::to_string(pid) + "/statm";
-    std::ifstream f(path);
-    if (!f) return 0;
-    uint64_t size_pages = 0, resident_pages = 0;
-    if (!(f >> size_pages >> resident_pages)) return 0;
-    return resident_pages * page_size;
+    // Linux: /proc/<pid>/statm — Darwin: proc_pid_rusage/proc_pidinfo (libproc).
+    return platform::query_process_memory(pid).rss_bytes;
 }
 
 uint64_t MemoryGovernor::read_process_vsize_bytes(pid_t pid) {
-    static const uint64_t page_size = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
-    std::string path = "/proc/" + std::to_string(pid) + "/statm";
-    std::ifstream f(path);
-    if (!f) return 0;
-    uint64_t size_pages = 0;
-    if (!(f >> size_pages)) return 0;
-    return size_pages * page_size;
+    return platform::query_process_memory(pid).vsize_bytes;
 }
 
 MemorySnapshot MemoryGovernor::sample(uint64_t extra_tracked_bytes) const {

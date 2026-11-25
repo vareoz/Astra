@@ -1,5 +1,6 @@
 #include "browser/browser_app.hpp"
 #include "core/arena.hpp"
+#include "core/platform.hpp"
 #include "core/json.hpp"
 #include "core/memory_governor.hpp"
 #include "docs/doc_viewer.hpp"
@@ -19,6 +20,7 @@
 #include "net/websocket_client.hpp"
 #include "privacy/security_policy.hpp"
 #include "privacy/shield.hpp"
+#include "style/animation_engine.hpp"
 
 #include <arpa/inet.h>
 #include <chrono>
@@ -55,7 +57,8 @@ void expect(bool cond, const std::string& label) {
 }
 
 int run_full_test_suite() {
-    std::cout << "=== Astra Browser Core v10 — Full Open-Web & Media Verification Suite ===\n\n";
+    std::cout << "=== Astra Browser Core v10 — Full Open-Web & Media Verification Suite ("
+              << platform::os_name() << ") ===\n\n";
 
     // 1. SlabArena + OS Reclamation
     {
@@ -99,9 +102,9 @@ int run_full_test_suite() {
     // 4. Bounded RAM+Disk HttpCache
     {
         HttpCache cache("/tmp/astra_test_cache", 2048);
-        cache.store({"https://astra.test/a", "text/css", "\"e1\"", std::string(1000, 'A'), 0, 600});
-        cache.store({"https://astra.test/b", "text/css", "\"e2\"", std::string(1000, 'B'), 0, 600});
-        cache.store({"https://astra.test/c", "text/css", "\"e3\"", std::string(1000, 'C'), 0, 600});
+        cache.store({"https://astra.test/a", "text/css", "\"e1\"", std::string(1000, 'A'), 0, 600, "", false, false});
+        cache.store({"https://astra.test/b", "text/css", "\"e2\"", std::string(1000, 'B'), 0, 600, "", false, false});
+        cache.store({"https://astra.test/c", "text/css", "\"e3\"", std::string(1000, 'C'), 0, 600, "", false, false});
         CachedResource hit;
         bool found_c = cache.lookup("https://astra.test/c", hit);
         expect(found_c && hit.body.size() == 1000 && cache.stats().evictions >= 1 && cache.stats().current_bytes <= 2048,
@@ -243,8 +246,17 @@ int run_full_test_suite() {
                "AstraNet enforces strict TLS certificate+hostname verification and hits HttpCache on repeat load");
 
         auto mem = app.memory_snapshot();
-        expect(mem.total_rss_bytes > 0 && mem.total_rss_bytes < 256ULL * 1024 * 1024 && mem.processes.size() >= 3,
-               "MemoryGovernor tracks real Linux /proc RSS across Main + Content + RDD workers");
+        // Session 8: el RSS real se lee con la API nativa de cada sistema
+        // (/proc/<pid>/statm en Linux, proc_pid_rusage/proc_pidinfo en Darwin),
+        // así que la comprobación es la misma en ambas plataformas.
+        bool platform_known = std::string(platform::os_name()) == "linux" ||
+                              std::string(platform::os_name()) == "darwin";
+        auto self_mem = platform::query_process_memory(::getpid());
+        expect(mem.total_rss_bytes > 0 && mem.total_rss_bytes < 256ULL * 1024 * 1024 &&
+                   mem.processes.size() >= 3 && platform_known &&
+                   self_mem.valid && self_mem.rss_bytes > 0,
+               "MemoryGovernor tracks real per-process OS RSS across Main + Content + RDD workers on both "
+               "Linux (/proc/<pid>/statm) and macOS (libproc)");
 
         // 12. AstraFont Native TrueType Vector Typography + UTF-8 + Bounded LRU Cache
         {
@@ -767,7 +779,7 @@ int run_full_test_suite() {
             auto blob = gdl.serialize();
             size_t moff = 0;
             uint32_t magic = 0;
-            bool is_asd5 = read_u32(blob, moff, magic) && magic == 0x41534435u;
+            bool is_asd6 = read_u32(blob, moff, magic) && magic == 0x41534436u;
             DisplayList rt;
             bool rt_ok = DisplayList::deserialize(blob, rt);
             bool has_grad = false;
@@ -788,8 +800,8 @@ int run_full_test_suite() {
             bool grad_interp = (r_ch(left_px) > 220 && b_ch(left_px) < 85 &&
                                 r_ch(mid_px) > 120 && b_ch(mid_px) > 120 &&
                                 b_ch(right_px) > 220 && r_ch(right_px) < 85);
-            expect(is_asd5 && rt_ok && has_grad && grad_interp,
-                   "CSS linear-gradient(90deg) roundtrips in ASD5 DisplayList and rasterizes smooth per-pixel RGB interpolation");
+            expect(is_asd6 && rt_ok && has_grad && grad_interp,
+                   "CSS linear-gradient(90deg) roundtrips in ASD6 DisplayList and rasterizes smooth per-pixel RGB interpolation");
         }
 
         // 34. AstraNet v6: RFC 6455 WebSocket SHA-1/Base64 Handshake + Real Loopback Echo Server + JS new WebSocket()
@@ -799,6 +811,7 @@ int run_full_test_suite() {
             bool rfc_vector_ok = (canonical_accept == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
 
             int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            platform::harden_socket_fd(listen_fd);
             int opt = 1;
             if (listen_fd >= 0) setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
             sockaddr_in addr{};
@@ -840,7 +853,7 @@ int run_full_test_suite() {
                     "Upgrade: websocket\r\n"
                     "Connection: Upgrade\r\n"
                     "Sec-WebSocket-Accept: " + accept_val + "\r\n\r\n";
-                (void)::send(cfd, resp.data(), resp.size(), MSG_NOSIGNAL);
+                (void)::send(cfd, resp.data(), resp.size(), ASTRA_MSG_NOSIGNAL);
 
                 // Serve up to 3 masked client frames (Text -> Echo Text, Ping -> Pong, Close -> exit)
                 for (int iter = 0; iter < 4; ++iter) {
@@ -870,7 +883,7 @@ int run_full_test_suite() {
                         out.push_back(static_cast<uint8_t>(pl.size()));
                         out.insert(out.end(), pl.begin(), pl.end());
                     }
-                    if (!out.empty()) (void)::send(cfd, out.data(), out.size(), MSG_NOSIGNAL);
+                    if (!out.empty()) (void)::send(cfd, out.data(), out.size(), ASTRA_MSG_NOSIGNAL);
                 }
                 ::close(cfd);
             });
@@ -1225,13 +1238,24 @@ int run_full_test_suite() {
                 const LayoutFrame* f1 = c8root->children[0]->children[1];
                 const LayoutFrame* f2 = c8root->children[0]->children[2];
                 // Row 1: f0 (x=0, y=0) + f1 (x=120, y=0) = 230px <= 250px.
-                // Row 2: f2 wraps to y=50px, then transform:translate(15px, 10px) -> x=15px, y=60px.
+                // Row 2: f2 envuelve a y=50px. `transform: translate(15px, 10px)`
+                // NO mueve su caja de borde (CSS Transforms Level 1 §3: la
+                // transformación es una operación de pintado, no de layout):
+                // el desplazamiento viaja en la matriz afín del DisplayItem,
+                // que es donde lo comprueba esta prueba tras la fusión v10+v8.
                 DisplayList c8dl = LayoutEngine::build_display_list(c8root, 400, 300);
                 bool has_accent_bar = false;
+                bool chip_translated = false;
                 for (const auto& it : c8dl.items) {
                     if (it.type == DisplayItemType::FillRect && it.color_argb == 0xFF38BDF8u &&
                         std::abs(it.rect.w - 4.0f) < 0.5f) {
                         has_accent_bar = true;
+                    }
+                    if (it.type == DisplayItemType::FillRect && it.color_argb == 0xFF065F46u &&
+                        it.has_transform &&
+                        std::abs(it.xform[0] - 1.0f) < 1e-3f && std::abs(it.xform[3] - 1.0f) < 1e-3f &&
+                        std::abs(it.xform[4] - 15.0f) < 1e-3f && std::abs(it.xform[5] - 10.0f) < 1e-3f) {
+                        chip_translated = true;
                     }
                 }
                 ok_c8 = f0->style.background.to_argb() == 0xFF0284C7u &&
@@ -1239,12 +1263,16 @@ int run_full_test_suite() {
                         f2->style.background.to_argb() == 0xFF065F46u &&
                         std::abs(f0->border_box.x - 0.0f) < 1.0f &&
                         std::abs(f1->border_box.x - 120.0f) < 1.0f &&
-                        std::abs(f2->border_box.x - 15.0f) < 1.0f &&
-                        std::abs(f2->border_box.y - 60.0f) < 1.5f &&
+                        std::abs(f2->border_box.x - 0.0f) < 1.0f &&
+                        std::abs(f2->border_box.y - 50.0f) < 1.5f &&
+                        std::abs(f2->style.transform.translate_x - 15.0f) < 1e-3f &&
+                        std::abs(f2->style.transform.translate_y - 10.0f) < 1e-3f &&
+                        chip_translated &&
                         has_accent_bar;
             }
             expect(ok_c8,
-                   "CSS3 Level 8 resolves :first-child/:last-child, flex-wrap multi-row layout, border-left accent & transform:translate()");
+                   "CSS3 Level 8 resolves :first-child/:last-child, flex-wrap multi-row layout, border-left accent & "
+                   "paint-time transform:translate() (no layout shift, per CSS Transforms L1)");
         }
 
         // 43. End-to-End Session 8 Showcase (astra_session8.html): Inline SVG + Flex-Wrap + ES6 JS + Render
@@ -1601,7 +1629,15 @@ int run_full_test_suite() {
             bool ok_site_iso = (w_a != nullptr && w_b != nullptr && w_a->pid() != w_b->pid() &&
                                 app.site_isolated_worker_count() >= 3);
 
-            bool all49 = ok_seccomp && ok_csp && ok_csp_dom && ok_mixed && ok_cors && ok_samesite && ok_site_iso;
+            // El sandbox seccomp-BPF es una primitiva exclusiva del kernel de
+            // Linux. En otras plataformas ProcessSandbox informa "non-linux" y
+            // degrada sin bloquear: la prueba exige el filtro donde existe y,
+            // donde no, exige que el resto de la política siga aplicándose.
+            const bool linux_host = std::string(platform::os_name()) == "linux";
+            const bool sandbox_ok = linux_host
+                                        ? ok_seccomp
+                                        : (!ok_seccomp && seccomp_detail.find("non-linux") != std::string::npos);
+            bool all49 = sandbox_ok && ok_csp && ok_csp_dom && ok_mixed && ok_cors && ok_samesite && ok_site_iso;
             if (!all49) {
                 std::cerr << "    [diag49] seccomp=" << ok_seccomp << "(" << seccomp_detail << ")"
                           << " csp=" << ok_csp << " csp_dom=" << ok_csp_dom
@@ -1609,7 +1645,8 @@ int run_full_test_suite() {
                           << " samesite=" << ok_samesite << " site_iso=" << ok_site_iso << "\n";
             }
             expect(all49,
-                   "Hito C: Kernel seccomp-BPF sandbox (EPERM verified), CSP, Mixed Content, CORS/SOP, SameSite & Site Isolation");
+                   "Hito C: Kernel seccomp-BPF sandbox (EPERM verificado en Linux; degradación segura fuera de él), "
+                   "CSP, Mixed Content, CORS/SOP, SameSite & Site Isolation");
         }
 
         // 50. Hito C — Adversarial Parser Fuzz-Resistance Harness + End-to-End astra_session9.html
@@ -2075,6 +2112,450 @@ int run_full_test_suite() {
                    "YouTube Watch v10: videoId + ytInitialPlayerResponse (OK & LOGIN_REQUIRED) + live YouTube page render");
         }
 
+        // ---------------------------------------------------------------------
+        // 63. AstraStyle v8 — @keyframes + animation shorthand + easing curves
+        // ---------------------------------------------------------------------
+        {
+            SlabArena aa;
+            auto adoc = HtmlDocument::parse(aa,
+                "<!doctype html><html><head><style>"
+                "@keyframes grow {"
+                "  from { width: 100px; opacity: 0.2; background: #000000; }"
+                "  50%  { width: 200px; }"
+                "  to   { width: 300px; opacity: 1; background: #FFFFFF; }"
+                "}"
+                ".card { height: 40px; animation: grow 1000ms linear 200ms 1 forwards; }"
+                "</style></head><body><div class=\"card\"></div></body></html>");
+            CssStylesheet asheet;
+            asheet.parse(adoc.collect_stylesheets());
+
+            // La regla @keyframes se parseó con sus tres pasos normalizados.
+            const CssKeyframesRule* kf = asheet.find_keyframes("grow");
+            bool kf_ok = kf && kf->keyframes.size() == 3 &&
+                         std::abs(kf->keyframes[0].offset - 0.0f) < 1e-4f &&
+                         std::abs(kf->keyframes[1].offset - 0.5f) < 1e-4f &&
+                         std::abs(kf->keyframes[2].offset - 1.0f) < 1e-4f;
+
+            AnimationTimeline tl;
+            tl.attach(&asheet);
+            AnimationSpec spec;
+            spec.name = "grow";
+            spec.duration_ms = 1000.0f;
+            spec.delay_ms = 200.0f;
+            spec.iteration_count = 1.0f;
+            spec.easing = Easing::linear();
+            spec.fill_mode = AnimationFillMode::Forwards;
+
+            auto width_at = [&](double elapsed) -> float {
+                auto sample = tl.sample_keyframes(spec, elapsed);
+                for (const auto& d : sample.declarations) {
+                    if (d.property == "width") return StyleEngine::parse_px(d.value, -1.0f);
+                }
+                return -1.0f;
+            };
+
+            // Durante el retardo no hay efecto (fill-mode: forwards no rellena
+            // hacia atrás); a la mitad y al final los valores son exactos.
+            bool delay_empty = tl.sample_keyframes(spec, 100.0).declarations.empty();
+            float w_mid = width_at(200.0 + 500.0);   // progreso 0.50 -> keyframe 50%
+            float w_q1 = width_at(200.0 + 250.0);    // progreso 0.25 -> mitad de [0, 50%]
+            float w_end = width_at(200.0 + 1000.0);  // congelado por `forwards`
+            bool widths_ok = std::abs(w_mid - 200.0f) < 0.6f &&
+                             std::abs(w_q1 - 150.0f) < 0.6f &&
+                             std::abs(w_end - 300.0f) < 0.6f;
+
+            // El color interpola componente a componente (negro -> blanco).
+            std::string bg_mid;
+            for (const auto& d : tl.sample_keyframes(spec, 200.0 + 500.0).declarations) {
+                if (d.property == "background") bg_mid = d.value;
+            }
+            bool color_ok = (bg_mid == "#808080" || bg_mid == "#7F7F7F");
+
+            // Las curvas de temporización se evalúan con su definición CSS:
+            // toda ease* pasa por (0.5 -> 0.5) y ease-in arranca más lento.
+            Easing lin = Easing::parse("linear");
+            Easing ein = Easing::parse("ease-in");
+            Easing bez = Easing::parse("cubic-bezier(0.25, 0.1, 0.25, 1)");
+            bool easing_ok = std::abs(lin.eval(0.37f) - 0.37f) < 1e-4f &&
+                             std::abs(ein.eval(0.5f) - 0.3155f) < 0.01f &&
+                             ein.eval(0.25f) < 0.25f &&
+                             std::abs(bez.eval(0.5f) - Easing::ease().eval(0.5f)) < 1e-4f &&
+                             std::abs(Easing::parse("steps(4, end)").eval(0.7f) - 0.5f) < 1e-4f;
+
+            // Y el estilo calculado refleja el fotograma vigente a través de la
+            // cascada completa (el efecto animado gana a la regla del autor):
+            // el primer layout registra la animación con el reloj en 0 y el
+            // segundo, tras avanzar 700 ms, ya aplica el fotograma interpolado.
+            AnimationTimeline live;
+            LayoutEngine::build_layout(aa, adoc, asheet, 800.0f, 400.0f, false, &live);
+            live.advance(700.0);
+            SlabArena aa2;
+            LayoutFrame* aroot = LayoutEngine::build_layout(aa2, adoc, asheet, 800.0f, 400.0f, false, &live);
+            float laid_width = (aroot && !aroot->children.empty())
+                                   ? aroot->children[0]->border_box.w : -1.0f;
+            bool cascade_ok = std::abs(laid_width - 200.0f) < 0.6f;
+
+            expect(kf_ok && delay_empty && widths_ok && color_ok && easing_ok && cascade_ok,
+                   "AstraStyle v8 parses @keyframes, honours animation delay/fill-mode and interpolates "
+                   "px/colour values on exact CSS easing curves");
+        }
+
+        // ---------------------------------------------------------------------
+        // 64. AstraStyle v8 — CSS transform 2D compuesto + composición afín ASD6
+        // ---------------------------------------------------------------------
+        {
+            // rotate(90deg) alrededor del centro convierte una caja ancha en
+            // una franja vertical: es la prueba geométrica más estricta.
+            SlabArena ta;
+            auto tdoc = HtmlDocument::parse(ta,
+                "<!doctype html><html><head><style>"
+                "body { background: #000000; }"
+                ".rot { width: 120px; height: 20px; background: #22C55E;"
+                "       transform: translate(40px, 140px) rotate(90deg) scale(2); }"
+                "</style></head><body><div class=\"rot\"></div></body></html>");
+            CssStylesheet tsheet;
+            tsheet.parse(tdoc.collect_stylesheets());
+            LayoutFrame* troot = LayoutEngine::build_layout(ta, tdoc, tsheet, 400.0f, 200.0f);
+
+            const Transform2D& tf = troot->children[0]->style.transform;
+            bool parse_ok = tf.enabled &&
+                            std::abs(tf.translate_x - 40.0f) < 1e-3f &&
+                            std::abs(tf.translate_y - 140.0f) < 1e-3f &&
+                            std::abs(tf.rotate_deg - 90.0f) < 1e-3f &&
+                            std::abs(tf.scale_x - 2.0f) < 1e-3f &&
+                            std::abs(tf.scale_y - 2.0f) < 1e-3f;
+
+            // La matriz afín de rotación de 90° es [0 -1; 1 0] escalada por 2.
+            float m[6];
+            tf.to_matrix(0.0f, 0.0f, m);
+            bool matrix_ok = std::abs(m[0] - 0.0f) < 1e-3f && std::abs(m[1] - 2.0f) < 1e-3f &&
+                             std::abs(m[2] + 2.0f) < 1e-3f && std::abs(m[3] - 0.0f) < 1e-3f &&
+                             std::abs(m[4] - 40.0f) < 1e-3f && std::abs(m[5] - 140.0f) < 1e-3f;
+
+            DisplayList tdl = LayoutEngine::build_display_list(troot, 400, 200);
+            auto tblob = tdl.serialize();
+            DisplayList trt;
+            bool rt_ok = DisplayList::deserialize(tblob, trt);
+            bool xform_rt = false;
+            Rect src_rect{};
+            for (const auto& it : trt.items) {
+                if (it.type == DisplayItemType::FillRect && it.color_argb == 0xFF22C55Eu) {
+                    xform_rt = it.has_transform &&
+                               std::abs(it.xform[1] - 2.0f) < 1e-3f &&
+                               std::abs(it.xform[2] + 2.0f) < 1e-3f;
+                    src_rect = it.rect;
+                }
+            }
+
+            // Composición real: el centro de la caja no se mueve con la
+            // rotación, pero el ancho pintado pasa a ser la altura original
+            // (20px) escalada x2 = 40px, y el alto 120px x2 = 240px.
+            Framebuffer tfb(400, 400);
+            tfb.composite_display_list(trt, 0, 0.0f);
+            const uint32_t* px = tfb.pixels();
+            auto is_green = [](uint32_t c) {
+                return ((c >> 16) & 0xFFu) < 80u && ((c >> 8) & 0xFFu) > 160u && (c & 0xFFu) < 140u;
+            };
+            const int cx = static_cast<int>(std::round(src_rect.x + src_rect.w * 0.5f + 40.0f));
+            const int cy = static_cast<int>(std::round(src_rect.y + src_rect.h * 0.5f + 140.0f));
+            int span_x = 0, span_y = 0;
+            for (int x = 0; x < 400; ++x) {
+                if (cy >= 0 && cy < 400 && is_green(px[cy * 400 + x])) ++span_x;
+            }
+            for (int y = 0; y < 400; ++y) {
+                if (cx >= 0 && cx < 400 && is_green(px[y * 400 + cx])) ++span_y;
+            }
+            bool raster_ok = cx >= 0 && cx < 400 && cy >= 0 && cy < 400 &&
+                             is_green(px[cy * 400 + cx]) &&
+                             std::abs(span_x - 40) <= 3 && std::abs(span_y - 240) <= 3;
+
+            expect(parse_ok && matrix_ok && rt_ok && xform_rt && raster_ok,
+                   "CSS transform translate/rotate/scale composes an exact 2D affine matrix, roundtrips in "
+                   "ASD6 and rasterizes rotated geometry with 2x2 supersampling");
+        }
+
+        // ---------------------------------------------------------------------
+        // 65. AstraStyle v8 — CSS transitions conducidas por requestAnimationFrame
+        // ---------------------------------------------------------------------
+        {
+            const std::string tr_path = "/tmp/astra_session8_transition.html";
+            {
+                std::ofstream f(tr_path);
+                f << "<!doctype html><html><head><style>"
+                     ".fade { width: 100px; height: 30px; background: #111827;"
+                     "        transition: width 400ms linear; }"
+                     "</style></head><body><div class=\"fade\" id=\"fx\"></div>"
+                     "<script>"
+                     "var n = document.querySelector('#fx');"
+                     "requestAnimationFrame(function(){ n.style.width = '300px'; });"
+                     "</script></body></html>";
+            }
+            uint32_t ttab = app.new_tab("file://" + tr_path);
+            app.navigate(ttab, "file://" + tr_path);
+
+            auto width_of = [&]() -> float {
+                const Tab* t = app.active_tab();
+                if (!t) return -1.0f;
+                for (const auto& it : t->cached_display_list.items) {
+                    if (it.type == DisplayItemType::FillRect && it.color_argb == 0xFF111827u) return it.rect.w;
+                }
+                return -1.0f;
+            };
+
+            float w0 = width_of();
+
+            // El primer fotograma ejecuta el callback de rAF, que cambia el
+            // ancho: eso arranca la transición en lugar de saltar al destino.
+            app.step_animation_frames(1);
+            float w1 = width_of();
+
+            // ~200 ms (12 fotogramas de 16.67 ms) -> mitad del recorrido lineal.
+            app.step_animation_frames(12);
+            float w_mid = width_of();
+
+            // Pasado el total, la transición termina en el valor destino.
+            app.step_animation_frames(20);
+            float w_end = width_of();
+
+            bool start_ok = std::abs(w0 - 100.0f) < 0.6f && std::abs(w1 - 100.0f) < 6.0f;
+            bool mid_ok = w_mid > 140.0f && w_mid < 260.0f;
+            bool end_ok = std::abs(w_end - 300.0f) < 0.6f;
+
+            expect(start_ok && mid_ok && end_ok,
+                   "CSS transitions interpolate a scripted element.style change across rAF frames "
+                   "instead of snapping, and settle exactly on the target value");
+        }
+
+        // ---------------------------------------------------------------------
+        // 66. AstraJS v8 — DOM Events Level 2: captura, objetivo y burbujeo
+        // ---------------------------------------------------------------------
+        {
+            SlabArena ea;
+            HtmlDocument edoc = HtmlDocument::parse(ea,
+                "<html><body><div id=\"outer\"><div id=\"mid\">"
+                "<button id=\"inner\">Go</button></div></div>"
+                "<p id=\"log\">-</p></body></html>");
+            AstraJsEngine evm;
+
+            // Cada listener anota su fase y su currentTarget: la traza completa
+            // demuestra el orden exacto raíz->objetivo->raíz de la especificación.
+            std::string js =
+                "let trace = [];\n"
+                "const outer = document.querySelector(\"#outer\");\n"
+                "const mid = document.querySelector(\"#mid\");\n"
+                "const inner = document.querySelector(\"#inner\");\n"
+                "outer.addEventListener(\"click\", function(ev) {\n"
+                "  trace.push(\"cap:outer:\" + ev.eventPhase + \":\" + ev.currentTarget.id + \":\" + ev.target.id);\n"
+                "}, true);\n"
+                "mid.addEventListener(\"click\", function(ev) {\n"
+                "  trace.push(\"cap:mid:\" + ev.eventPhase);\n"
+                "}, { capture: true });\n"
+                "inner.addEventListener(\"click\", function(ev) {\n"
+                "  trace.push(\"target:\" + ev.eventPhase + \":\" + ev.type);\n"
+                "  ev.preventDefault();\n"
+                "});\n"
+                "mid.addEventListener(\"click\", function(ev) {\n"
+                "  trace.push(\"bub:mid:\" + ev.eventPhase);\n"
+                "});\n"
+                "outer.addEventListener(\"click\", function(ev) {\n"
+                "  trace.push(\"bub:outer:\" + ev.eventPhase);\n"
+                "});\n"
+                "let once_hits = 0;\n"
+                "outer.addEventListener(\"ping\", function(ev) { once_hits = once_hits + 1; }, { once: true });\n";
+            auto erep = evm.execute(js, edoc);
+
+            DomNode* btn = edoc.query_selector("#inner");
+            auto drep = evm.dispatch_event(btn, "click", edoc);
+
+            std::string joined;
+            auto git = evm.globals().find("trace");
+            if (git != evm.globals().end() && git->second.kind == JsValue::Kind::Object &&
+                git->second.obj) {
+                for (const auto& el : git->second.obj->elements) {
+                    if (!joined.empty()) joined += "|";
+                    joined += el.to_string();
+                }
+            }
+            const std::string expected =
+                "cap:outer:1:outer:inner|cap:mid:1|target:2:click|bub:mid:3|bub:outer:3";
+            bool order_ok = (joined == expected);
+            bool prevented_ok = drep.default_prevented && drep.listeners_invoked == 5;
+
+            // stopPropagation detiene el recorrido en el nodo que lo invoca.
+            std::string js2 =
+                "let t2 = [];\n"
+                "const o2 = document.querySelector(\"#outer\");\n"
+                "const i2 = document.querySelector(\"#inner\");\n"
+                "o2.addEventListener(\"tap\", function(ev) { t2.push(\"cap\"); ev.stopPropagation(); }, true);\n"
+                "i2.addEventListener(\"tap\", function(ev) { t2.push(\"target\"); });\n";
+            evm.execute(js2, edoc);
+            auto drep2 = evm.dispatch_event(btn, "tap", edoc);
+            std::string j2;
+            auto g2 = evm.globals().find("t2");
+            if (g2 != evm.globals().end() && g2->second.obj) {
+                for (const auto& el : g2->second.obj->elements) {
+                    if (!j2.empty()) j2 += "|";
+                    j2 += el.to_string();
+                }
+            }
+            bool stop_ok = (j2 == "cap") && !drep2.default_prevented && drep2.listeners_invoked == 1;
+
+            // `once`: el listener se retira después de ejecutarse una vez.
+            DomNode* outer_node = edoc.query_selector("#outer");
+            evm.dispatch_event(outer_node, "ping", edoc);
+            evm.dispatch_event(outer_node, "ping", edoc);
+            double once_hits = 0.0;
+            auto oh = evm.globals().find("once_hits");
+            if (oh != evm.globals().end()) once_hits = oh->second.to_number();
+            bool once_ok = std::abs(once_hits - 1.0) < 1e-9;
+
+            expect(erep.ok && order_ok && prevented_ok && stop_ok && once_ok,
+                   "AstraJS v8 dispatches DOM Events Level 2 through capture/target/bubble phases with a real "
+                   "Event object (target, currentTarget, eventPhase, preventDefault, stopPropagation, once)");
+        }
+
+        // ---------------------------------------------------------------------
+        // 67. AstraNet v8 — revalidación condicional If-None-Match -> 304
+        // ---------------------------------------------------------------------
+        {
+            std::error_code rec;
+            std::filesystem::remove_all("/tmp/astra_reval_cache", rec);
+
+            int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+            platform::harden_socket_fd(lfd);
+            int ropt = 1;
+            if (lfd >= 0) setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &ropt, sizeof(ropt));
+            sockaddr_in raddr{};
+            raddr.sin_family = AF_INET;
+            raddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            raddr.sin_port = 0;
+            bool rbound = (lfd >= 0 &&
+                           ::bind(lfd, reinterpret_cast<sockaddr*>(&raddr), sizeof(raddr)) == 0 &&
+                           ::listen(lfd, 8) == 0);
+            socklen_t ralen = sizeof(raddr);
+            uint16_t rport = 0;
+            if (rbound && ::getsockname(lfd, reinterpret_cast<sockaddr*>(&raddr), &ralen) == 0) {
+                rport = ntohs(raddr.sin_port);
+            }
+
+            // Servidor de origen mínimo: entrega el recurso con ETag y
+            // `Cache-Control: no-cache` (almacenable pero de revalidación
+            // obligatoria) y responde 304 sin cuerpo cuando el ETag coincide.
+            const std::string kEtag = "\"astra-v8-7f3c\"";
+            const std::string kBody = "body{--astra:8;color:#38bdf8;}";
+            int conditional_requests = 0;
+            int plain_requests = 0;
+            std::thread rsrv([&]() {
+                if (!rbound) return;
+                for (int i = 0; i < 3; ++i) {
+                    int cfd = ::accept(lfd, nullptr, nullptr);
+                    if (cfd < 0) return;
+                    std::string req;
+                    char rbuf[2048];
+                    while (req.find("\r\n\r\n") == std::string::npos && req.size() < 8192) {
+                        ssize_t n = ::recv(cfd, rbuf, sizeof(rbuf), 0);
+                        if (n <= 0) break;
+                        req.append(rbuf, static_cast<size_t>(n));
+                    }
+                    std::string lower_req = req;
+                    std::transform(lower_req.begin(), lower_req.end(), lower_req.begin(),
+                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    const bool matched = lower_req.find("if-none-match:") != std::string::npos &&
+                                         req.find(kEtag) != std::string::npos;
+                    std::string out;
+                    if (matched) {
+                        ++conditional_requests;
+                        out = "HTTP/1.1 304 Not Modified\r\n"
+                              "ETag: " + kEtag + "\r\n"
+                              "Cache-Control: no-cache\r\n"
+                              "Connection: keep-alive\r\n\r\n";
+                    } else {
+                        ++plain_requests;
+                        out = "HTTP/1.1 200 OK\r\n"
+                              "Content-Type: text/css\r\n"
+                              "ETag: " + kEtag + "\r\n"
+                              "Last-Modified: Wed, 19 Nov 2025 10:00:00 GMT\r\n"
+                              "Cache-Control: no-cache\r\n"
+                              "Content-Length: " + std::to_string(kBody.size()) + "\r\n"
+                              "Connection: keep-alive\r\n\r\n" + kBody;
+                    }
+                    (void)::send(cfd, out.data(), out.size(), ASTRA_MSG_NOSIGNAL);
+                    ::close(cfd);
+                }
+            });
+
+            HttpCache rcache("/tmp/astra_reval_cache", 1024 * 1024);
+            AstraShield rshield;
+            HttpClient rclient(rshield, &rcache);
+            const std::string rurl = "http://127.0.0.1:" + std::to_string(rport) + "/theme.css";
+
+            auto r1 = rclient.get(rurl, "127.0.0.1", true);
+            auto r2 = rclient.get(rurl, "127.0.0.1", true);
+            auto r3 = rclient.get(rurl, "127.0.0.1", true);
+
+            if (rsrv.joinable()) rsrv.join();
+            if (lfd >= 0) ::close(lfd);
+
+            // La primera petición transfiere el cuerpo; las siguientes sólo
+            // confirman el ETag y reutilizan los bytes ya almacenados.
+            bool first_ok = r1.status_code == 200 && !r1.from_cache && !r1.revalidated &&
+                            r1.body == kBody;
+            bool reval_ok = r2.status_code == 200 && r2.from_cache && r2.revalidated &&
+                            r2.body == kBody &&
+                            r3.status_code == 200 && r3.revalidated && r3.body == kBody;
+            bool server_ok = plain_requests == 1 && conditional_requests == 2;
+            bool stats_ok = rcache.stats().revalidations >= 2 && rcache.stats().not_modified >= 2;
+
+            // Y el parseo de directivas distingue los tres casos de RFC 9111.
+            CacheControl cc_store = HttpCache::parse_cache_control("public, max-age=600");
+            CacheControl cc_nocache = HttpCache::parse_cache_control("no-cache");
+            CacheControl cc_nostore = HttpCache::parse_cache_control("no-store, max-age=99");
+            bool cc_ok = cc_store.max_age_sec == 600 && !cc_store.must_revalidate && cc_store.storable() &&
+                         cc_nocache.must_revalidate && cc_nocache.max_age_sec == 0 && cc_nocache.storable() &&
+                         cc_nostore.no_store && !cc_nostore.storable();
+
+            expect(rbound && first_ok && reval_ok && server_ok && stats_ok && cc_ok,
+                   "AstraNet v8 revalidates a stale cache entry with a conditional If-None-Match GET and serves "
+                   "the stored body on 304 Not Modified without retransferring it");
+        }
+
+        // ---------------------------------------------------------------------
+        // 68. AstraJS v8 — document.cookie sobre el tarro particionado del Shield
+        // ---------------------------------------------------------------------
+        {
+            AstraShield jshield;
+            // Simula la partición de un sitio de primer nivel concreto.
+            std::string top = "astra-site.test";
+            std::string origin = "https://astra-site.test";
+
+            SlabArena ca;
+            HtmlDocument cdoc = HtmlDocument::parse(ca,
+                "<html><body><p id=\"out\">-</p></body></html>");
+            AstraJsEngine cvm;
+            cvm.bind_cookies(
+                [&]() { return jshield.cookie_header_for(top, origin, true); },
+                [&](const std::string& sc) { jshield.store_cookie(top, origin, sc); });
+
+            std::string js =
+                "document.cookie = \"theme=dark; Secure; HttpOnly\";\n"
+                "document.cookie = \"lang=es; Secure\";\n"
+                "const jar = document.cookie;\n"
+                "document.querySelector(\"#out\").textContent = jar;\n";
+            auto crep = cvm.execute(js, cdoc);
+
+            std::string jar = cdoc.query_selector("#out")->text_content();
+            bool both_present = jar.find("theme=dark") != std::string::npos &&
+                                jar.find("lang=es") != std::string::npos;
+
+            // Y la Total Cookie Protection sigue vigente para lo que escribió
+            // el script: otro sitio de primer nivel no ve nada de esa partición.
+            std::string other_site_jar = jshield.cookie_header_for("otro-sitio.test", origin, true);
+
+            expect(crep.ok && both_present && other_site_jar.empty(),
+                   "AstraJS v8 document.cookie reads and writes through the AstraShield partitioned jar, so "
+                   "script-set cookies stay isolated per top-level site");
+        }
+
         app.stop_workers();
     }
 
@@ -2083,7 +2564,7 @@ int run_full_test_suite() {
 }
 
 int run_stress_test(int tab_count, uint64_t ceiling_mb) {
-    std::cout << "=== Astra v9 Multi-Tab Stress Test (" << tab_count << " tabs, ceiling " << ceiling_mb << " MB) ===\n";
+    std::cout << "=== Astra v10 Multi-Tab Stress Test (" << tab_count << " tabs, ceiling " << ceiling_mb << " MB) ===\n";
     BrowserApp app(ceiling_mb * 1024ULL * 1024ULL);
     app.start_workers();
 

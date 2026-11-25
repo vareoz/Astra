@@ -1,4 +1,6 @@
 #include "net/http_client.hpp"
+
+#include "core/platform.hpp"
 #include "net/http2_client.hpp"
 
 #include <algorithm>
@@ -68,10 +70,14 @@ struct OpenSslApi {
     static constexpr int kSslVerifyPeer = 0x01;
 
     OpenSslApi() {
-        crypto_lib = dlopen("libcrypto.so.3", RTLD_LAZY | RTLD_GLOBAL);
-        if (!crypto_lib) crypto_lib = dlopen("libcrypto.so.1.1", RTLD_LAZY | RTLD_GLOBAL);
-        ssl_lib = dlopen("libssl.so.3", RTLD_LAZY);
-        if (!ssl_lib) ssl_lib = dlopen("libssl.so.1.1", RTLD_LAZY);
+        for (const char* name : platform::libcrypto_names()) {
+            crypto_lib = dlopen(name, RTLD_LAZY | RTLD_GLOBAL);
+            if (crypto_lib) break;
+        }
+        for (const char* name : platform::libssl_names()) {
+            ssl_lib = dlopen(name, RTLD_LAZY);
+            if (ssl_lib) break;
+        }
         if (!ssl_lib) return;
 
         TLS_client_method = reinterpret_cast<TLS_client_method_fn>(dlsym(ssl_lib, "TLS_client_method"));
@@ -139,8 +145,10 @@ struct ZlibApi {
     zlibVersion_fn zlibVersion = nullptr;
 
     ZlibApi() {
-        lib = dlopen("libz.so.1", RTLD_LAZY);
-        if (!lib) lib = dlopen("libz.so", RTLD_LAZY);
+        for (const char* name : platform::libz_names()) {
+            lib = dlopen(name, RTLD_LAZY);
+            if (lib) break;
+        }
         if (!lib) return;
         inflateInit2_ = reinterpret_cast<inflateInit2_fn>(dlsym(lib, "inflateInit2_"));
         inflate = reinterpret_cast<inflate_fn>(dlsym(lib, "inflate"));
@@ -169,8 +177,10 @@ struct BrotliApi {
     DecompressStream_fn decompress_stream = nullptr;
 
     BrotliApi() {
-        lib = dlopen("libbrotlidec.so.1", RTLD_LAZY);
-        if (!lib) lib = dlopen("libbrotlidec.so", RTLD_LAZY);
+        for (const char* name : platform::libbrotlidec_names()) {
+            lib = dlopen(name, RTLD_LAZY);
+            if (lib) break;
+        }
         if (!lib) return;
         create_instance = reinterpret_cast<CreateInstance_fn>(dlsym(lib, "BrotliDecoderCreateInstance"));
         destroy_instance = reinterpret_cast<DestroyInstance_fn>(dlsym(lib, "BrotliDecoderDestroyInstance"));
@@ -233,6 +243,7 @@ int connect_tcp(const std::string& host, uint16_t port) {
     int fd = -1;
     for (addrinfo* p = res; p != nullptr; p = p->ai_next) {
         fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        platform::harden_socket_fd(fd);
         if (fd < 0) continue;
 
         timeval tv{};
@@ -485,12 +496,17 @@ HttpResponse HttpClient::get(const std::string& url,
         std::string canonical_url = parsed.rebuild();
 
         // Step 3: Check bounded RAM/Disk HttpCache before opening any socket
+        CachedResource revalidatable;
+        bool can_revalidate = false;
         if (cache_) {
             CachedResource cached;
             bool hit = false;
             {
                 std::lock_guard<std::mutex> lk(state_mu_);
                 hit = cache_->lookup(canonical_url, cached);
+                if (!hit) {
+                    can_revalidate = cache_->lookup_for_revalidation(canonical_url, revalidatable);
+                }
             }
             if (hit) {
                 HttpResponse resp;
@@ -505,8 +521,52 @@ HttpResponse HttpClient::get(const std::string& url,
             }
         }
 
+        // Step 3b (Session 8): la copia almacenada ha caducado pero conserva
+        // validadores -> GET condicional. Si el recurso no cambió, el servidor
+        // responde 304 sin cuerpo y se reutiliza el que ya está en caché.
+        if (can_revalidate) {
+            if (!revalidatable.etag.empty()) {
+                ext_headers.emplace_back("If-None-Match", revalidatable.etag);
+            }
+            if (!revalidatable.last_modified.empty()) {
+                ext_headers.emplace_back("If-Modified-Since", revalidatable.last_modified);
+            }
+            std::lock_guard<std::mutex> lk(state_mu_);
+            cache_->note_revalidation_sent();
+        }
+
         HttpResponse resp = perform_single_request("GET", parsed, top_site, ext_headers, "", "");
         resp.privacy_decision = pdec;
+
+        if (resp.status_code == 304 && can_revalidate) {
+            // 304 Not Modified: renueva la frescura y sirve el cuerpo guardado.
+            std::string cc304 = resp.headers.count("cache-control") ? resp.headers["cache-control"] : "";
+            CacheControl cc = HttpCache::parse_cache_control(cc304);
+            if (cc.max_age_sec == 0 && !cc.must_revalidate && cc304.empty()) {
+                // Sin directivas nuevas se conserva la política original.
+                cc.max_age_sec = revalidatable.max_age_sec;
+                cc.must_revalidate = revalidatable.must_revalidate;
+            }
+            {
+                std::lock_guard<std::mutex> lk(state_mu_);
+                cache_->mark_revalidated(canonical_url, cc);
+            }
+            HttpResponse out;
+            out.status_code = 200;
+            out.final_url = canonical_url;
+            out.content_type = revalidatable.content_type;
+            out.body = std::move(revalidatable.body);
+            out.headers = resp.headers;
+            out.from_cache = true;
+            out.revalidated = true;
+            out.tls_verified = resp.tls_verified || (canonical_url.rfind("https://", 0) == 0);
+            out.tls_version = resp.tls_version;
+            out.alpn_protocol = resp.alpn_protocol;
+            out.used_http2 = resp.used_http2;
+            out.reused_connection = resp.reused_connection;
+            out.privacy_decision = pdec;
+            return out;
+        }
 
         if ((resp.status_code == 301 || resp.status_code == 302 ||
              resp.status_code == 303 || resp.status_code == 307 || resp.status_code == 308) &&
@@ -517,15 +577,17 @@ HttpResponse HttpClient::get(const std::string& url,
 
         // Step 4: Populate bounded HttpCache on 200 OK
         if (cache_ && resp.status_code == 200 && !resp.body.empty()) {
-            std::string cc = resp.headers.count("cache-control") ? resp.headers["cache-control"] : "";
-            int64_t max_age = HttpCache::parse_max_age(cc);
-            if (max_age > 0) {
-                CachedResource cr;
-                cr.url = resp.final_url;
-                cr.content_type = resp.content_type;
-                cr.etag = resp.headers.count("etag") ? resp.headers["etag"] : "";
-                cr.body = resp.body;
-                cr.max_age_sec = max_age;
+            std::string cc_raw = resp.headers.count("cache-control") ? resp.headers["cache-control"] : "";
+            CacheControl cc = HttpCache::parse_cache_control(cc_raw);
+            CachedResource cr;
+            cr.url = resp.final_url;
+            cr.content_type = resp.content_type;
+            cr.etag = resp.headers.count("etag") ? resp.headers["etag"] : "";
+            cr.last_modified = resp.headers.count("last-modified") ? resp.headers["last-modified"] : "";
+            cr.body = resp.body;
+            cr.max_age_sec = cc.max_age_sec;
+            cr.must_revalidate = cc.must_revalidate;
+            if (cc.storable() && (cc.max_age_sec > 0 || cr.has_validator())) {
                 std::lock_guard<std::mutex> lk(state_mu_);
                 cache_->store(cr);
             }
@@ -945,6 +1007,21 @@ HttpResponse HttpClient::perform_single_request(
                     }
                     if (hb.find("transfer-encoding: chunked") != std::string::npos) is_chunked = true;
                     if (hb.find("connection: close") != std::string::npos) server_close = true;
+
+                    // Session 8 (RFC 9110 §6.4.1): 1xx, 204 y 304 NUNCA llevan
+                    // cuerpo, aunque no declaren Content-Length. Sin este corte
+                    // la lectura de un 304 de revalidación se quedaría
+                    // esperando hasta que el servidor cerrara la conexión.
+                    int sc = 0;
+                    if (raw.size() >= 12 && raw.rfind("HTTP/", 0) == 0) {
+                        size_t sp = raw.find(' ');
+                        if (sp != std::string::npos) sc = std::atoi(raw.c_str() + sp + 1);
+                    }
+                    if (sc == 204 || sc == 304 || (sc >= 100 && sc < 200)) {
+                        raw.resize(hdr_end + 4);
+                        can_reuse = !server_close;
+                        return true;
+                    }
                 }
             }
             if (hdr_end != std::string::npos) {
@@ -1105,7 +1182,7 @@ HttpResponse HttpClient::perform_single_request(
         } else {
             size_t sent = 0;
             while (sent < req_str.size()) {
-                ssize_t n = ::send(conn.fd, req_str.data() + sent, req_str.size() - sent, MSG_NOSIGNAL);
+                ssize_t n = ::send(conn.fd, req_str.data() + sent, req_str.size() - sent, ASTRA_MSG_NOSIGNAL);
                 if (n <= 0) return false;
                 sent += static_cast<size_t>(n);
             }

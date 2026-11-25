@@ -1593,6 +1593,11 @@ void AstraJsEngine::bind_storage(StorageGetFn getter, StorageSetFn setter) {
     storage_set_ = std::move(setter);
 }
 
+void AstraJsEngine::bind_cookies(CookieGetFn getter, CookieSetFn setter) {
+    cookie_get_ = std::move(getter);
+    cookie_set_ = std::move(setter);
+}
+
 void AstraJsEngine::bind_fetch(FetchFn fetcher) {
     fetch_fn_ = std::move(fetcher);
 }
@@ -1731,7 +1736,7 @@ size_t AstraJsEngine::gc_collect() {
     for (const auto& cb : raf_callbacks_) mark_value(cb);
     mark_value(exception_value_);
     for (const auto& [key, vec] : listeners_) {
-        for (const auto& cb : vec) mark_value(cb);
+        for (const auto& l : vec) mark_value(l.callback);
     }
     for (const auto& [u, st] : history_entries_) mark_value(st);
 
@@ -2292,6 +2297,11 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                     else stack_.push_back(JsValue::make_undefined());
                 } else if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_document__") {
                     if (k == "title") stack_.push_back(JsValue::make_string(doc.title()));
+                    else if (k == "cookie") {
+                        // Session 8: sólo las cookies de la partición
+                        // (top_level_site, origin) actual son visibles al script.
+                        stack_.push_back(JsValue::make_string(cookie_get_ ? cookie_get_() : std::string()));
+                    }
                     else if (k == "body") stack_.push_back(JsValue::make_dom(doc.body()));
                     else if (k == "head") stack_.push_back(JsValue::make_dom(doc.query_selector("head")));
                     else if (k == "documentElement") stack_.push_back(JsValue::make_dom(doc.query_selector("html") ? doc.query_selector("html") : doc.root()));
@@ -2506,6 +2516,11 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                     globals_[k] = val;
                 } else if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_document__" && k == "title") {
                     if (DomNode* t = doc.query_selector("title")) t->set_text_content(doc.arena(), val.to_string());
+                } else if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_document__" && k == "cookie") {
+                    // Session 8: `document.cookie = "k=v; Secure"` se procesa
+                    // como una cabecera Set-Cookie dentro de la partición
+                    // (top_level_site, origin) activa de AstraShield.
+                    if (cookie_set_) cookie_set_(val.to_string());
                 } else if (obj.kind == JsValue::Kind::String && obj.sval == "__builtin_location__" && k == "href") {
                     current_url_ = val.to_string();
                     if (history_fn_) history_fn_(current_url_, false);
@@ -2811,7 +2826,22 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                     rep.logs.push_back(std::move(line));
                 } else if (recv.kind == JsValue::Kind::String && recv.sval == "__builtin_window__") {
                     if (method == "addEventListener" && args.size() >= 2) {
-                        listeners_[{doc.root(), args[0].to_string()}].push_back(args[1]);
+                        // Session 8: los listeners de window/document también
+                        // pasan por la estructura con fase de captura y `once`.
+                        EventListener wl;
+                        wl.callback = args[1];
+                        if (args.size() >= 3) {
+                            const JsValue& opt = args[2];
+                            if (opt.kind == JsValue::Kind::Bool) {
+                                wl.capture = opt.bval;
+                            } else if (opt.kind == JsValue::Kind::Object && opt.obj) {
+                                auto cit3 = opt.obj->props.find("capture");
+                                if (cit3 != opt.obj->props.end()) wl.capture = cit3->second.truthy();
+                                auto oit2 = opt.obj->props.find("once");
+                                if (oit2 != opt.obj->props.end()) wl.once = oit2->second.truthy();
+                            }
+                        }
+                        listeners_[{doc.root(), args[0].to_string()}].push_back(std::move(wl));
                     } else if (method == "matchMedia") {
                         GcObject* mq = alloc_object(GcObject::Type::Map);
                         mq->props["matches"] = JsValue::make_bool(false);
@@ -2870,7 +2900,22 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                         tn->text = args[0].to_string();
                         ret = JsValue::make_dom(tn);
                     } else if (method == "addEventListener" && args.size() >= 2) {
-                        listeners_[{doc.root(), args[0].to_string()}].push_back(args[1]);
+                        // Session 8: los listeners de window/document también
+                        // pasan por la estructura con fase de captura y `once`.
+                        EventListener wl;
+                        wl.callback = args[1];
+                        if (args.size() >= 3) {
+                            const JsValue& opt = args[2];
+                            if (opt.kind == JsValue::Kind::Bool) {
+                                wl.capture = opt.bval;
+                            } else if (opt.kind == JsValue::Kind::Object && opt.obj) {
+                                auto cit3 = opt.obj->props.find("capture");
+                                if (cit3 != opt.obj->props.end()) wl.capture = cit3->second.truthy();
+                                auto oit2 = opt.obj->props.find("once");
+                                if (oit2 != opt.obj->props.end()) wl.once = oit2->second.truthy();
+                            }
+                        }
+                        listeners_[{doc.root(), args[0].to_string()}].push_back(std::move(wl));
                     }
                 } else if (recv.kind == JsValue::Kind::String && recv.sval == "__builtin_astra_storage__") {
                     if (method == "set" && args.size() >= 2 && storage_set_) {
@@ -3278,7 +3323,42 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                             recv.node->parent = nullptr;
                         }
                     } else if (method == "addEventListener" && args.size() >= 2) {
-                        listeners_[{recv.node, args[0].to_string()}].push_back(args[1]);
+                        // Tercer argumento: booleano `useCapture` o un objeto
+                        // de opciones `{capture, once}` (DOM Events Level 2/3).
+                        EventListener l;
+                        l.callback = args[1];
+                        if (args.size() >= 3) {
+                            const JsValue& opt = args[2];
+                            if (opt.kind == JsValue::Kind::Bool) {
+                                l.capture = opt.bval;
+                            } else if (opt.kind == JsValue::Kind::Object && opt.obj) {
+                                auto cit2 = opt.obj->props.find("capture");
+                                if (cit2 != opt.obj->props.end()) l.capture = cit2->second.truthy();
+                                auto oit = opt.obj->props.find("once");
+                                if (oit != opt.obj->props.end()) l.once = oit->second.truthy();
+                            }
+                        }
+                        listeners_[{recv.node, args[0].to_string()}].push_back(std::move(l));
+                    } else if (method == "removeEventListener" && args.size() >= 2) {
+                        auto lit = listeners_.find({recv.node, args[0].to_string()});
+                        if (lit != listeners_.end()) {
+                            auto& vec = lit->second;
+                            vec.erase(std::remove_if(vec.begin(), vec.end(),
+                                                     [&](const EventListener& l) {
+                                                         return l.callback.obj == args[1].obj &&
+                                                                l.callback.kind == args[1].kind;
+                                                     }),
+                                      vec.end());
+                        }
+                    } else if (method == "dispatchEvent" && !args.empty()) {
+                        std::string ev_name = args[0].to_string();
+                        if (args[0].kind == JsValue::Kind::Object && args[0].obj) {
+                            auto tit = args[0].obj->props.find("type");
+                            if (tit != args[0].obj->props.end()) ev_name = tit->second.to_string();
+                        }
+                        auto sub = dispatch_event(recv.node, ev_name, doc);
+                        for (const auto& lg : sub.logs) rep.logs.push_back(lg);
+                        ret = JsValue::make_bool(!sub.default_prevented);
                     } else if ((recv.node->tag == "video" || recv.node->tag == "audio") && method == "play") {
                         recv.node->set_attr("data-astra-paused", "0");
                         ret = JsValue::make_obj(make_resolved_promise(JsValue::make_undefined()));
@@ -3317,7 +3397,20 @@ JsValue AstraJsEngine::run_chunk(const BytecodeChunk& chunk,
                         ret = JsValue::make_obj(ctx);
                     }
                 } else if (recv.kind == JsValue::Kind::Object && recv.obj) {
-                    if (recv.obj->type == GcObject::Type::Canvas2D) {
+                    if (recv.obj->type == GcObject::Type::Event) {
+                        // Session 8: control de propagación y cancelación del
+                        // comportamiento por defecto sobre el objeto Event.
+                        if (method == "stopPropagation") {
+                            recv.obj->props["__stopped__"] = JsValue::make_bool(true);
+                        } else if (method == "stopImmediatePropagation") {
+                            recv.obj->props["__stopped__"] = JsValue::make_bool(true);
+                            recv.obj->props["__stopped_immediate__"] = JsValue::make_bool(true);
+                        } else if (method == "preventDefault") {
+                            if (recv.obj->props["cancelable"].truthy()) {
+                                recv.obj->props["defaultPrevented"] = JsValue::make_bool(true);
+                            }
+                        }
+                    } else if (recv.obj->type == GcObject::Type::Canvas2D) {
                         auto cit = canvases_.find(recv.obj->canvas_id);
                         if (cit != canvases_.end()) {
                             CanvasSurface& surf = cit->second;
@@ -3865,22 +3958,103 @@ JsExecutionReport AstraJsEngine::execute(std::string_view code, HtmlDocument& do
     return rep;
 }
 
-JsExecutionReport AstraJsEngine::dispatch_event(DomNode* target, const std::string& event_name, HtmlDocument& doc) {
+JsExecutionReport AstraJsEngine::dispatch_event(DomNode* target, const std::string& event_name,
+                                                HtmlDocument& doc, bool bubbles, bool cancelable) {
     JsExecutionReport rep;
-    auto it = listeners_.find({target, event_name});
-    if (it != listeners_.end()) {
-        auto cbs = it->second;
-        for (const auto& cb : cbs) {
-            invoke_callable(cb, {}, doc, rep);
+    if (!target) {
+        rep.gc = gc_stats();
+        return rep;
+    }
+
+    // -------------------------------------------------------------------------
+    // DOM Events Level 2 §1.2 — ruta de propagación
+    // -------------------------------------------------------------------------
+    // La ruta se congela antes de invocar cualquier listener (como exige la
+    // especificación: mutar el árbol durante el despacho no cambia el camino).
+    // ancestors[0] es la raíz y ancestors.back() el propio objetivo.
+    std::vector<DomNode*> path;
+    for (DomNode* n = target; n != nullptr; n = n->parent) path.push_back(n);
+    std::reverse(path.begin(), path.end());
+
+    // El objeto Event que reciben todos los listeners del despacho.
+    GcObject* ev = alloc_object(GcObject::Type::Event);
+    ev->props["type"] = JsValue::make_string(event_name);
+    ev->props["target"] = JsValue::make_dom(target);
+    ev->props["currentTarget"] = JsValue::make_dom(target);
+    ev->props["bubbles"] = JsValue::make_bool(bubbles);
+    ev->props["cancelable"] = JsValue::make_bool(cancelable);
+    ev->props["defaultPrevented"] = JsValue::make_bool(false);
+    ev->props["eventPhase"] = JsValue::make_number(0);
+    ev->props["__stopped__"] = JsValue::make_bool(false);
+    ev->props["__stopped_immediate__"] = JsValue::make_bool(false);
+    const JsValue ev_val = JsValue::make_obj(ev);
+
+    auto stopped = [&]() { return ev->props["__stopped__"].truthy(); };
+    auto stopped_immediate = [&]() { return ev->props["__stopped_immediate__"].truthy(); };
+
+    // Ejecuta los listeners de un nodo que correspondan a la fase indicada.
+    // phase: 1 = captura, 2 = objetivo, 3 = burbujeo.
+    auto run_node = [&](DomNode* node, int phase, bool want_capture) {
+        auto it = listeners_.find({node, event_name});
+        if (it == listeners_.end() || it->second.empty()) return;
+
+        ev->props["currentTarget"] = JsValue::make_dom(node);
+        ev->props["eventPhase"] = JsValue::make_number(static_cast<double>(phase));
+
+        // Copia la lista: un listener puede registrar o quitar otros.
+        auto snapshot = it->second;
+        std::vector<const EventListener*> fired;
+        for (const auto& l : snapshot) {
+            if (phase != 2 && l.capture != want_capture) continue;
+            invoke_callable(l.callback, {ev_val}, doc, rep);
+            ++rep.listeners_invoked;
+            if (l.once) fired.push_back(&l);
             if (exception_active_) {
                 rep.ok = false;
                 rep.error = "Uncaught exception: " + exception_value_.to_string();
                 exception_active_ = false;
                 exception_value_ = JsValue::make_undefined();
             }
+            if (stopped_immediate()) break;
         }
-        drain_event_loop(doc, rep);
+
+        // `once`: los listeners de un solo uso se retiran tras ejecutarse.
+        if (!fired.empty()) {
+            auto cur = listeners_.find({node, event_name});
+            if (cur != listeners_.end()) {
+                for (const EventListener* done : fired) {
+                    auto& vec = cur->second;
+                    for (auto vit = vec.begin(); vit != vec.end(); ++vit) {
+                        if (vit->callback.obj == done->callback.obj &&
+                            vit->callback.kind == done->callback.kind && vit->once) {
+                            vec.erase(vit);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    // Fase 1 — captura: de la raíz hacia el padre del objetivo.
+    for (size_t i = 0; i + 1 < path.size(); ++i) {
+        if (stopped()) break;
+        run_node(path[i], 1, true);
     }
+
+    // Fase 2 — objetivo: se ejecutan sus listeners de captura y de burbujeo.
+    if (!stopped()) run_node(target, 2, false);
+
+    // Fase 3 — burbujeo: del padre del objetivo hacia la raíz.
+    if (bubbles) {
+        for (size_t i = path.size(); i-- > 1;) {
+            if (stopped()) break;
+            run_node(path[i - 1], 3, false);
+        }
+    }
+
+    rep.default_prevented = ev->props["defaultPrevented"].truthy();
+    drain_event_loop(doc, rep);
     rep.gc = gc_stats();
     return rep;
 }

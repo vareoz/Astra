@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 
 namespace astra {
@@ -119,7 +120,8 @@ LayoutFrame* build_frame_tree(SlabArena& arena,
                               const CssStylesheet& sheet,
                               const ComputedStyle* parent_style,
                               float viewport_w,
-                              bool light_web_default) {
+                              bool light_web_default,
+                              AnimationTimeline* timeline) {
     if (!node) return nullptr;
 
     if (node->type == NodeType::Text) {
@@ -151,6 +153,24 @@ LayoutFrame* build_frame_tree(SlabArena& arena,
     }
 
     ComputedStyle st = StyleEngine::compute_style(node, sheet, parent_style, viewport_w, light_web_default);
+
+    // Session 8: primero se calcula el estilo base (sin efecto animado) para
+    // conocer qué declara el elemento en `animation` / `transition`; con eso se
+    // registra o actualiza su estado en la línea de tiempo y, sólo si hay algo
+    // que animar, se recalcula el estilo dejando que el efecto gane la cascada.
+    if (timeline) {
+        const double now = timeline->clock_ms();
+        timeline->register_animation(node, st.animation, now);
+        if (!st.transitions.empty()) {
+            timeline->register_transitions(node, st.transitions,
+                                           AnimationTimeline::snapshot(st), now);
+        }
+        if (st.animation.valid() || !st.transitions.empty()) {
+            st = StyleEngine::compute_style(node, sheet, parent_style, viewport_w,
+                                            light_web_default, timeline);
+        }
+    }
+
     if (st.display == DisplayType::None) return nullptr;
 
     // Default styling for interactive <button> if author didn't override
@@ -190,7 +210,8 @@ LayoutFrame* build_frame_tree(SlabArena& arena,
                 subsheet.parse(subdoc.collect_stylesheets());
                 const DomNode* subbody = subdoc.body() ? subdoc.body() : subdoc.root();
                 if (subbody) {
-                    if (LayoutFrame* subf = build_frame_tree(arena, subbody, subsheet, &f->style, viewport_w, light_web_default)) {
+                    if (LayoutFrame* subf = build_frame_tree(arena, subbody, subsheet, &f->style,
+                                                            viewport_w, light_web_default, timeline)) {
                         f->children.push_back(subf);
                     }
                 }
@@ -272,7 +293,8 @@ LayoutFrame* build_frame_tree(SlabArena& arena,
     }
 
     for (const DomNode* ch : node->children) {
-        if (LayoutFrame* cf = build_frame_tree(arena, ch, sheet, &f->style, viewport_w, light_web_default)) {
+        if (LayoutFrame* cf = build_frame_tree(arena, ch, sheet, &f->style, viewport_w,
+                                               light_web_default, timeline)) {
             f->children.push_back(cf);
         }
     }
@@ -947,14 +969,31 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
         float dy = st.has_top ? st.top : (st.has_bottom ? -st.bottom : 0.0f);
         offset_subtree(frame, dx, dy);
     }
-    if (st.translate_x != 0.0f || st.translate_y != 0.0f) {
-        offset_subtree(frame, st.translate_x, st.translate_y);
-    }
+    // CSS Transforms Level 1 §3: `transform` NO participa en el layout; es una
+    // operación de pintado. La traslación se aplica en el compositor a través
+    // de la matriz afín del DisplayItem, no moviendo la caja de borde aquí.
+    // (Los campos translate_x/translate_y quedan a 0 y sin efecto en el flujo.)
+}
+
+// Multiplica dos matrices afines 2x3 en el orden [a c e; b d f]: out = m * n.
+void mul_affine(const float m[6], const float n[6], float out[6]) {
+    out[0] = m[0] * n[0] + m[2] * n[1];
+    out[1] = m[1] * n[0] + m[3] * n[1];
+    out[2] = m[0] * n[2] + m[2] * n[3];
+    out[3] = m[1] * n[2] + m[3] * n[3];
+    out[4] = m[0] * n[4] + m[2] * n[5] + m[4];
+    out[5] = m[1] * n[4] + m[3] * n[5] + m[5];
+}
+
+bool affine_is_identity(const float m[6]) {
+    return m[0] == 1.0f && m[1] == 0.0f && m[2] == 0.0f &&
+           m[3] == 1.0f && m[4] == 0.0f && m[5] == 0.0f;
 }
 
 void emit_display_items(const LayoutFrame* f, DisplayList& dl,
                         int32_t inherited_z, bool inherited_fixed, float inherited_opacity,
-                        bool has_clip, const Rect& clip_rect) {
+                        bool has_clip, const Rect& clip_rect,
+                        const float inherited_xform[6]) {
     if (!f) return;
     const ComputedStyle& st = f->style;
 
@@ -966,10 +1005,31 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
     float eff_opacity = inherited_opacity * st.opacity;
     if (eff_opacity <= 0.001f) return;
 
+    // Session 8: `transform` se acumula por el subárbol, igual que en CSS: la
+    // matriz del elemento se compone con la de sus ancestros transformados y se
+    // calcula alrededor del centro de su propia caja de borde
+    // (`transform-origin: 50% 50%`, el valor por defecto).
+    float eff_xform[6];
+    std::memcpy(eff_xform, inherited_xform, sizeof(eff_xform));
+    if (st.transform.enabled && !st.transform.is_identity()) {
+        float local[6];
+        st.transform.to_matrix(f->border_box.x + f->border_box.w * 0.5f,
+                               f->border_box.y + f->border_box.h * 0.5f,
+                               local);
+        float composed[6];
+        mul_affine(inherited_xform, local, composed);
+        std::memcpy(eff_xform, composed, sizeof(eff_xform));
+    }
+    const bool eff_has_xform = !affine_is_identity(eff_xform);
+
     auto attach_clip = [&](DisplayItem& it) {
         if (has_clip) {
             it.has_clip = true;
             it.clip_rect = clip_rect;
+        }
+        if (eff_has_xform) {
+            it.has_transform = true;
+            std::memcpy(it.xform, eff_xform, sizeof(it.xform));
         }
     };
 
@@ -1200,7 +1260,7 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
     }
 
     for (const LayoutFrame* ch : f->children) {
-        emit_display_items(ch, dl, eff_z, eff_fixed, eff_opacity, child_has_clip, child_clip);
+        emit_display_items(ch, dl, eff_z, eff_fixed, eff_opacity, child_has_clip, child_clip, eff_xform);
     }
 }
 
@@ -1220,7 +1280,7 @@ const HitRegion* DisplayList::hit_test(float x, float y, float scroll_y) const {
 std::vector<uint8_t> DisplayList::serialize() const {
     std::vector<uint8_t> buf;
     buf.reserve(64 + items.size() * 76 + hit_regions.size() * 40);
-    write_u32(buf, 0x41534435u); // Magic 'ASD5' (Session 6: FillGradient + EmbedCanvas + WebRender clip_rect)
+    write_u32(buf, 0x41534436u); // Magic 'ASD6' (Session 8: matriz afín 2D por item)
     write_u32(buf, viewport_width);
     write_u32(buf, viewport_height);
     write_f32(buf, content_height);
@@ -1241,13 +1301,16 @@ std::vector<uint8_t> DisplayList::serialize() const {
         write_u32(buf, static_cast<uint32_t>(it.z_index));
         uint32_t flags = (it.bold ? 1u : 0u) | (it.monospace ? 2u : 0u) |
                          (it.focused ? 4u : 0u) | (it.fixed_viewport ? 8u : 0u) |
-                         (it.has_clip ? 16u : 0u);
+                         (it.has_clip ? 16u : 0u) | (it.has_transform ? 32u : 0u);
         write_u32(buf, flags);
         if (it.has_clip) {
             write_f32(buf, it.clip_rect.x);
             write_f32(buf, it.clip_rect.y);
             write_f32(buf, it.clip_rect.w);
             write_f32(buf, it.clip_rect.h);
+        }
+        if (it.has_transform) {
+            for (int k = 0; k < 6; ++k) write_f32(buf, it.xform[k]);
         }
         write_str(buf, it.text);
     }
@@ -1269,8 +1332,10 @@ bool DisplayList::deserialize(const std::vector<uint8_t>& blob, DisplayList& out
     size_t off = 0;
     uint32_t magic = 0, count = 0;
     if (!read_u32(blob, off, magic) ||
-        (magic != 0x41534435u && magic != 0x41534434u && magic != 0x41534433u)) return false;
-    bool is_v5 = (magic == 0x41534435u);
+        (magic != 0x41534436u && magic != 0x41534435u &&
+         magic != 0x41534434u && magic != 0x41534433u)) return false;
+    bool is_v6 = (magic == 0x41534436u);
+    bool is_v5 = is_v6 || (magic == 0x41534435u);
     if (!read_u32(blob, off, out.viewport_width)) return false;
     if (!read_u32(blob, off, out.viewport_height)) return false;
     if (!read_f32(blob, off, out.content_height)) return false;
@@ -1310,6 +1375,12 @@ bool DisplayList::deserialize(const std::vector<uint8_t>& blob, DisplayList& out
             if (!read_f32(blob, off, it.clip_rect.w)) return false;
             if (!read_f32(blob, off, it.clip_rect.h)) return false;
         }
+        it.has_transform = is_v6 && ((flags & 32u) != 0);
+        if (it.has_transform) {
+            for (int k = 0; k < 6; ++k) {
+                if (!read_f32(blob, off, it.xform[k])) return false;
+            }
+        }
         if (!read_str(blob, off, it.text)) return false;
         out.items.push_back(std::move(it));
     }
@@ -1342,12 +1413,15 @@ LayoutFrame* LayoutEngine::build_layout(SlabArena& arena,
                                         const CssStylesheet& sheet,
                                         float viewport_w,
                                         float viewport_h,
-                                        bool light_web_default) {
+                                        bool light_web_default,
+                                        AnimationTimeline* timeline) {
     const DomNode* body = doc.body();
     ComputedStyle root_seed;
     root_seed.css_vars = StyleEngine::collect_root_vars(sheet, viewport_w);
     const ComputedStyle* seed_ptr = root_seed.css_vars.empty() ? nullptr : &root_seed;
-    LayoutFrame* root = build_frame_tree(arena, body, sheet, seed_ptr, viewport_w, light_web_default);
+    if (timeline) timeline->attach(&sheet);
+    LayoutFrame* root = build_frame_tree(arena, body, sheet, seed_ptr, viewport_w,
+                                         light_web_default, timeline);
     if (!root) return nullptr;
     Rect viewport{0.0f, 0.0f, viewport_w, viewport_h};
     layout_node(root, 0.0f, 0.0f, viewport_w, viewport, viewport);
@@ -1368,7 +1442,8 @@ DisplayList LayoutEngine::build_display_list(const LayoutFrame* root,
             dl.clear_color_argb = root->style.background.to_argb();
         }
         dl.content_height = root->border_box.h;
-        emit_display_items(root, dl, 0, false, 1.0f, false, Rect{});
+        static const float kIdentity[6] = {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+        emit_display_items(root, dl, 0, false, 1.0f, false, Rect{}, kIdentity);
         // Stable-sort paint layers by z-index (preserving DOM order within equal z-index)
         std::stable_sort(dl.items.begin(), dl.items.end(),
                          [](const DisplayItem& a, const DisplayItem& b) {

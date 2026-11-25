@@ -1,5 +1,7 @@
 #include "net/websocket_client.hpp"
 
+#include "core/platform.hpp"
+
 #include <algorithm>
 #include <arpa/inet.h>
 #include <cctype>
@@ -56,8 +58,7 @@ struct WsTlsApi {
         static bool init = false;
         if (!init) {
             init = true;
-            const char* libs[] = {"libssl.so.3", "libssl.so.1.1", "libssl.so"};
-            for (const char* name : libs) {
+            for (const char* name : platform::libssl_names()) {
                 api.handle = dlopen(name, RTLD_LAZY | RTLD_LOCAL);
                 if (api.handle) break;
             }
@@ -264,7 +265,7 @@ bool WebSocketClient::write_all(const uint8_t* data, size_t len) {
         if (use_tls_ && ssl_) {
             n = WsTlsApi::instance().SSL_write(ssl_, data + sent, static_cast<int>(len - sent));
         } else {
-            n = ::send(fd_, data + sent, len - sent, MSG_NOSIGNAL);
+            n = ::send(fd_, data + sent, len - sent, ASTRA_MSG_NOSIGNAL);
         }
         if (n <= 0) return false;
         sent += static_cast<size_t>(n);
@@ -321,6 +322,7 @@ bool WebSocketClient::connect(const std::string& url, int timeout_ms, std::strin
     int fd = -1;
     for (addrinfo* rp = res; rp; rp = rp->ai_next) {
         fd = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        platform::harden_socket_fd(fd);
         if (fd < 0) continue;
         timeval tv{};
         tv.tv_sec = std::max(1, timeout_ms / 1000);

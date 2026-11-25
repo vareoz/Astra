@@ -1,6 +1,8 @@
 #include "ipc/ipc_channel.hpp"
 #include "ipc/sandbox.hpp"
 
+#include "core/platform.hpp"
+
 #include <cerrno>
 #include <cstring>
 #include <signal.h>
@@ -15,7 +17,7 @@ bool write_exact(int fd, const void* data, size_t len) {
     const uint8_t* p = static_cast<const uint8_t*>(data);
     size_t sent = 0;
     while (sent < len) {
-        ssize_t n = ::send(fd, p + sent, len - sent, MSG_NOSIGNAL);
+        ssize_t n = ::send(fd, p + sent, len - sent, ASTRA_MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EINTR) continue;
             return false;
@@ -68,9 +70,15 @@ void IpcChannel::close() {
 
 bool IpcChannel::create_pair(IpcChannel& parent_end, IpcChannel& child_end) {
     int fds[2] = {-1, -1};
-    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) != 0) {
+    if (::socketpair(AF_UNIX, SOCK_STREAM | ASTRA_SOCK_CLOEXEC, 0, fds) != 0) {
         return false;
     }
+    // Darwin no admite SOCK_CLOEXEC en socketpair(): se aplica FD_CLOEXEC y
+    // SO_NOSIGPIPE a posteriori para que ambos extremos del canal se comporten
+    // igual que en Linux (el fork() de los procesos hijos conserva el fd, pero
+    // un exec() posterior no lo heredaría).
+    platform::harden_socket_fd(fds[0]);
+    platform::harden_socket_fd(fds[1]);
     parent_end = IpcChannel(fds[0]);
     child_end = IpcChannel(fds[1]);
     return true;

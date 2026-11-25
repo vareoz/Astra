@@ -29,6 +29,9 @@ struct HttpResponse {
     bool used_http2 = false;
     bool multiplexed_h2 = false;
     bool reused_connection = false;
+    // Session 8: la respuesta se sirvió desde la caché tras confirmar con el
+    // servidor mediante un GET condicional que devolvió 304 Not Modified.
+    bool revalidated = false;
     PrivacyDecision privacy_decision;
 };
 
