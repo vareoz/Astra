@@ -2964,6 +2964,56 @@ int run_full_test_suite() {
                    "and currentColor resolves to the computed color");
         }
 
+        // ---------------------------------------------------------------------
+        // 74. SVG: el contenido de <defs> no se pinta
+        // ---------------------------------------------------------------------
+        {
+            // SVG 1.1 §5.6: lo que hay dentro de <defs>, <clipPath>, <mask>,
+            // <symbol>... son DEFINICIONES; sólo se dibujan al referenciarlas.
+            // El motor las pintaba, y como un <clipPath> suele contener un
+            // rectángulo del tamaño del lienzo, logos y wordmarks acababan
+            // como bloques macizos: el wordmark de Wikipedia salía 100%
+            // opaco en vez de mostrar sus letras.
+            const std::string svg =
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 40 40\" width=\"40\" height=\"40\">"
+                "<defs><clipPath id=\"c\"><rect x=\"0\" y=\"0\" width=\"40\" height=\"40\" fill=\"#ffffff\"/></clipPath>"
+                "<linearGradient id=\"g\"><stop offset=\"0\"/></linearGradient></defs>"
+                "<circle cx=\"20\" cy=\"20\" r=\"8\" fill=\"#0E65C0\"/>"
+                "</svg>";
+            SvgSurface surf = SvgEngine::render_svg(svg, 40, 40);
+
+            size_t opaque = 0;
+            bool has_blue = false;
+            for (uint32_t px : surf.argb) {
+                if (((px >> 24) & 0xFFu) > 16) ++opaque;
+                if ((px & 0x00FFFFFFu) == 0x000E65C0u && ((px >> 24) & 0xFFu) > 200) has_blue = true;
+            }
+            const double ratio = surf.argb.empty() ? 1.0
+                                                   : static_cast<double>(opaque) / static_cast<double>(surf.argb.size());
+            // El círculo ocupa ~pi*8^2/1600 = 12.6% del lienzo: debe haber
+            // pintura, pero muy lejos del 100% que daba el rect de <defs>.
+            bool ok_svg = surf.valid && has_blue && ratio > 0.05 && ratio < 0.35;
+
+            // Y el mismo SVG a través del decodificador de <img>.
+            DecodedImage dec = ImageDecoder::decode_bytes(
+                reinterpret_cast<const uint8_t*>(svg.data()), svg.size());
+            size_t dec_opaque = 0;
+            for (uint32_t px : dec.argb) {
+                if (((px >> 24) & 0xFFu) > 16) ++dec_opaque;
+            }
+            bool ok_img = dec.valid && dec.format == "SVG" && !dec.argb.empty() &&
+                          static_cast<double>(dec_opaque) / static_cast<double>(dec.argb.size()) < 0.35;
+
+            if (!(ok_svg && ok_img)) {
+                std::cerr << "    [diag74] valid=" << surf.valid << " blue=" << has_blue
+                          << " ratio=" << ratio << " dec=" << dec.valid << "\n";
+            }
+
+            expect(ok_svg && ok_img,
+                   "SvgEngine skips non-rendered <defs>/<clipPath>/<mask> subtrees, so a logo is drawn as its "
+                   "real shape instead of a solid block covering the whole surface");
+        }
+
         app.stop_workers();
     }
 

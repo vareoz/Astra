@@ -447,6 +447,25 @@ void render_svg_node(const DomNode* node,
                      float vb_x, float vb_y, float sx, float sy,
                      SsCanvas& canvas) {
     if (!node || node->type != NodeType::Element) return;
+
+    // SVG 1.1 §5.6 y §14: el contenido de estos elementos son DEFINICIONES,
+    // no se pinta directamente; sólo se referencia desde otros elementos. Sin
+    // esta exclusión, el rectángulo que suele llevar dentro un <clipPath>
+    // acababa dibujado y tapaba todo el lienzo: por eso logos y wordmarks
+    // salían como bloques macizos en lugar de su forma real.
+    static const char* const kNonRendered[] = {
+        "defs", "clippath", "mask", "symbol", "marker", "pattern",
+        "lineargradient", "radialgradient", "filter", "metadata", "title", "desc"
+    };
+    {
+        std::string lt = node->tag;
+        std::transform(lt.begin(), lt.end(), lt.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        for (const char* nr : kNonRendered) {
+            if (lt == nr) return;
+        }
+    }
+
     SvgPaint p = derive_paint(node, parent_paint);
     float scale_sw = (sx + sy) * 0.5f;
     float sw = std::max(1.0f, p.stroke_width * scale_sw);
