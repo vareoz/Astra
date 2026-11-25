@@ -132,7 +132,7 @@ struct CanvasSurface {
 
 // Mark-and-Sweep GC-managed heap object (Array, Map, Function, Class, Promise, Canvas2D, StyleProxy, WebSocket)
 struct GcObject {
-    enum class Type { Array, Map, Function, Class, Promise, Canvas2D, StyleProxy, WebSocket };
+    enum class Type { Array, Map, Function, Class, Promise, Canvas2D, StyleProxy, WebSocket, Event };
     enum class PromiseState : uint8_t { Pending, Fulfilled, Rejected };
     struct PromiseReaction {
         GcObject* next = nullptr;
@@ -184,6 +184,9 @@ struct JsExecutionReport {
     size_t timers_run = 0;
     size_t raf_run = 0;
     GcStats gc;
+    // Session 8: resultado del despacho de eventos DOM.
+    bool default_prevented = false;
+    size_t listeners_invoked = 0;
 };
 
 struct JsFetchResult {
@@ -214,12 +217,25 @@ public:
     AstraJsEngine(const AstraJsEngine&) = delete;
     AstraJsEngine& operator=(const AstraJsEngine&) = delete;
 
+    // Session 8: `document.cookie` se delega al tarro particionado de
+    // AstraShield. El getter devuelve la cabecera Cookie visible para el
+    // origen activo y el setter procesa una cadena Set-Cookie, de modo que la
+    // Total Cookie Protection sigue aplicándose a lo que escribe el script.
+    using CookieGetFn = std::function<std::string()>;
+    using CookieSetFn = std::function<void(const std::string&)>;
+
     void bind_storage(StorageGetFn getter, StorageSetFn setter);
     void bind_fetch(FetchFn fetcher);
+    void bind_cookies(CookieGetFn getter, CookieSetFn setter);
     JsExecutionReport execute(std::string_view code, HtmlDocument& doc);
 
     // Dispatch a real DOM event (e.g. "click", "input", "submit") to registered JS bytecode handlers
-    JsExecutionReport dispatch_event(DomNode* target, const std::string& event_name, HtmlDocument& doc);
+    // Despacha un evento con las tres fases de DOM Events Level 2 (captura,
+    // objetivo y burbujeo) construyendo un objeto Event real con `target`,
+    // `currentTarget`, `eventPhase`, `stopPropagation()`,
+    // `stopImmediatePropagation()` y `preventDefault()`.
+    JsExecutionReport dispatch_event(DomNode* target, const std::string& event_name, HtmlDocument& doc,
+                                     bool bubbles = true, bool cancelable = true);
 
     // Execute one queued requestAnimationFrame batch (callbacks may re-enqueue for the next frame)
     JsExecutionReport run_animation_frame(double timestamp_ms, HtmlDocument& doc);
@@ -291,7 +307,17 @@ private:
 
     std::unordered_map<std::string, CanvasSurface> canvases_;
     // DOM event listeners: (node_ptr, event_name) -> callbacks
-    std::map<std::pair<DomNode*, std::string>, std::vector<JsValue>> listeners_;
+    // Session 8 — DOM Events Level 2: cada listener recuerda si se registró
+    // para la fase de captura, porque eso decide en qué recorrido del árbol se
+    // ejecuta (descendente para captura, ascendente para burbujeo).
+    struct EventListener {
+        JsValue callback;
+        bool capture = false;
+        bool once = false;
+    };
+    std::map<std::pair<DomNode*, std::string>, std::vector<EventListener>> listeners_;
+    CookieGetFn cookie_get_;
+    CookieSetFn cookie_set_;
     std::unordered_map<std::string, std::string> local_storage_;
 
     StorageGetFn storage_get_;

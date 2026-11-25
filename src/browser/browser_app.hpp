@@ -10,6 +10,7 @@
 #include "ipc/ipc_channel.hpp"
 #include "js/astra_js.hpp"
 #include "layout/layout_engine.hpp"
+#include "style/animation_engine.hpp"
 #include "media/media_engine.hpp"
 #include "net/http_cache.hpp"
 #include "net/http_client.hpp"
@@ -47,6 +48,11 @@ struct Tab {
     std::unique_ptr<SlabArena> live_arena;
     std::unique_ptr<HtmlDocument> live_doc;
     std::unique_ptr<AstraJsEngine> js_vm;
+    // Session 8: la hoja de estilo y la línea de tiempo de animaciones viven
+    // tanto como la pestaña. La hoja debe ser persistente porque la línea de
+    // tiempo guarda un puntero a ella para resolver sus reglas @keyframes.
+    std::unique_ptr<CssStylesheet> live_sheet;
+    std::unique_ptr<AnimationTimeline> timeline;
     DisplayList cached_display_list;
     std::string focused_input_selector;
     std::vector<std::string> console_logs;

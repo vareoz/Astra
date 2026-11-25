@@ -1,5 +1,7 @@
 #include "media/media_engine.hpp"
 
+#include "core/platform.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -517,8 +519,10 @@ struct AlsaApi {
     static void silent_err(const char*, int, const char*, int, const char*, ...) {}
 
     AlsaApi() {
-        lib = dlopen("libasound.so.2", RTLD_LAZY);
-        if (!lib) lib = dlopen("libasound.so", RTLD_LAZY);
+        for (const char* name : platform::libaudio_names()) {
+            lib = dlopen(name, RTLD_LAZY);
+            if (lib) break;
+        }
         if (!lib) return;
         using err_cb_t = void (*)(const char*, int, const char*, int, const char*, ...);
         using set_err_fn = int (*)(err_cb_t);

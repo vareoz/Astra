@@ -1,0 +1,6 @@
+# Artefactos de compilación (make genera aquí los .o, los .d y el binario).
+build/
+
+# Salidas de render y caché local de pruebas.
+*.png
+!examples/*.png

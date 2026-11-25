@@ -1,5 +1,7 @@
 #include "gfx/font_engine.hpp"
 
+#include "core/platform.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -58,8 +60,10 @@ FontEngine& FontEngine::instance() {
 }
 
 FontEngine::FontEngine() {
-    dl_handle_ = dlopen("libfreetype.so.6", RTLD_LAZY);
-    if (!dl_handle_) dl_handle_ = dlopen("libfreetype.so", RTLD_LAZY);
+    for (const char* name : platform::libfreetype_names()) {
+        dl_handle_ = dlopen(name, RTLD_LAZY);
+        if (dl_handle_) break;
+    }
     if (!dl_handle_) return;
 
     ft_init_ = reinterpret_cast<FT_Init_FreeType_fn>(dlsym(dl_handle_, "FT_Init_FreeType"));
@@ -76,23 +80,43 @@ FontEngine::FontEngine() {
 
     if (ft_init_(&ft_lib_) != 0 || !ft_lib_) return;
 
+    // Session 8: los candidatos de cada familia cubren Linux (DejaVu /
+    // Liberation / Noto / JetBrains Mono) y macOS (/System/Library/Fonts y su
+    // carpeta Supplemental, además de Homebrew), de modo que la tipografía
+    // vectorial real funciona en ambas plataformas sin empaquetar fuentes.
     face_sans_reg_ = try_load_face(ft_lib_, ft_new_face_, {
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Geneva.ttf",
+        "/System/Library/Fonts/Supplemental/Verdana.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "/opt/homebrew/share/fonts/DejaVuSans.ttf"
     });
     face_sans_bold_ = try_load_face(ft_lib_, ft_new_face_, {
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Verdana Bold.ttf",
+        "/Library/Fonts/Arial Bold.ttf",
+        "/opt/homebrew/share/fonts/DejaVuSans-Bold.ttf"
     });
     face_mono_reg_ = try_load_face(ft_lib_, ft_new_face_, {
         "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/System/Library/Fonts/Supplemental/Courier New.ttf",
+        "/System/Library/Fonts/Monaco.ttf",
+        "/System/Library/Fonts/Menlo.ttc",
+        "/opt/homebrew/share/fonts/DejaVuSansMono.ttf"
     });
     face_mono_bold_ = try_load_face(ft_lib_, ft_new_face_, {
         "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Courier New Bold.ttf",
+        "/System/Library/Fonts/Menlo.ttc",
+        "/opt/homebrew/share/fonts/DejaVuSansMono-Bold.ttf"
     });
 
     if (!face_sans_reg_) return;

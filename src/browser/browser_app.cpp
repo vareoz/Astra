@@ -817,10 +817,16 @@ bool BrowserApp::render_html_via_content_ipc(const std::string& html,
 
 void BrowserApp::relayout_live_tab(Tab& tab, float vw, float vh) {
     if (!tab.live_arena || !tab.live_doc) return;
-    CssStylesheet sheet;
+    // La hoja se reconstruye en el mismo objeto persistente para que el
+    // puntero que guarda la línea de tiempo siga siendo válido.
+    tab.live_sheet = std::make_unique<CssStylesheet>();
+    CssStylesheet& sheet = *tab.live_sheet;
     sheet.parse(tab.live_doc->collect_stylesheets());
     if (!tab.extra_css.empty()) sheet.parse(tab.extra_css);
-    LayoutFrame* root = LayoutEngine::build_layout(*tab.live_arena, *tab.live_doc, sheet, vw, vh);
+    if (!tab.timeline) tab.timeline = std::make_unique<AnimationTimeline>();
+    tab.timeline->retain_only(*tab.live_doc);
+    LayoutFrame* root = LayoutEngine::build_layout(*tab.live_arena, *tab.live_doc, sheet, vw, vh,
+                                                  tab.timeline.get());
     tab.cached_display_list = LayoutEngine::build_display_list(root, static_cast<uint32_t>(vw), static_cast<uint32_t>(vh));
     tab.arena_bytes = tab.live_arena->bytes_used();
 }
@@ -852,6 +858,10 @@ NavigationResult BrowserApp::navigate(uint32_t tab_id, const std::string& url, b
 
     tab->live_doc = std::make_unique<HtmlDocument>(HtmlDocument::parse(*tab->live_arena, html));
     tab->js_vm = std::make_unique<AstraJsEngine>();
+    // Los nodos del documento anterior vivían en la arena que acabamos de
+    // reciclar: la línea de tiempo se reinicia para no guardar punteros muertos.
+    tab->live_sheet.reset();
+    tab->timeline = std::make_unique<AnimationTimeline>();
     tab->focused_input_selector.clear();
 
     // Bind disk-persisted per-origin storage & network fetch (GET/POST)
@@ -860,6 +870,21 @@ NavigationResult BrowserApp::navigate(uint32_t tab_id, const std::string& url, b
     tab->js_vm->bind_storage(
         [this, origin_key](const std::string& k) { return origin_storage_get(origin_key, k); },
         [this, origin_key](const std::string& k, const std::string& v) { origin_storage_set(origin_key, k, v); });
+    // Session 8: `document.cookie` queda enganchado al tarro particionado de
+    // AstraShield, con la misma clave (top_level_site, origin) que usan las
+    // peticiones de red. Así lo que escribe un script sigue sin poder filtrarse
+    // a otro sitio de primer nivel bajo Total Cookie Protection.
+    const std::string cookie_top_site = pu.valid ? pu.registrable_domain() : origin_key;
+    const std::string cookie_origin = origin_key;
+    const bool cookie_https = pu.valid && pu.scheme == "https";
+    tab->js_vm->bind_cookies(
+        [this, cookie_top_site, cookie_origin, cookie_https]() {
+            return shield_.cookie_header_for(cookie_top_site, cookie_origin, cookie_https);
+        },
+        [this, cookie_top_site, cookie_origin](const std::string& set_cookie) {
+            shield_.store_cookie(cookie_top_site, cookie_origin, set_cookie);
+        });
+
     std::string fetch_base = final_url;
     tab->js_vm->bind_fetch([this, fetch_base](const std::string& req_url,
                                               const std::string& method,
@@ -917,12 +942,17 @@ NavigationResult BrowserApp::navigate(uint32_t tab_id, const std::string& url, b
             res.rendered_via_ipc = true;
         }
     }
+    // Session 8: el proceso principal construye siempre el estado de estilo
+    // vivo de la pestaña (hoja persistente + línea de tiempo de animaciones),
+    // porque es el que atiende clics, teclado y requestAnimationFrame. Sembrarlo
+    // ya en la navegación es lo que permite que una transición CSS arranque
+    // desde el valor base en vez de saltar al destino en el primer fotograma, y
+    // que una animación @keyframes declarada en la hoja empiece a correr aunque
+    // la página no traiga ningún script.
+    relayout_live_tab(*tab, 1280.0f, 636.0f);
+
     if (!res.rendered_via_ipc) {
-        CssStylesheet sheet;
-        sheet.parse(tab->live_doc->collect_stylesheets());
-        if (!all_extra_css.empty()) sheet.parse(all_extra_css);
-        LayoutFrame* root = LayoutEngine::build_layout(*tab->live_arena, *tab->live_doc, sheet, 1280.0f, 636.0f);
-        dl = LayoutEngine::build_display_list(root, 1280, 636);
+        dl = tab->cached_display_list;
         rendered_title = tab->live_doc->title();
         blob_bytes = dl.serialize().size();
         arena_used = tab->live_arena->bytes_used();
@@ -1338,17 +1368,36 @@ bool BrowserApp::decode_video_via_rdd(const std::string& path, uint32_t frame_id
 
 bool BrowserApp::step_animation_frames(int count, double dt_ms) {
     Tab* active = find_tab(active_tab_id_);
-    if (!active || !active->live_doc || !active->js_vm) return false;
+    if (!active || !active->live_doc) return false;
+
     bool ran_any = false;
     for (int i = 0; i < count; ++i) {
-        if (active->js_vm->pending_raf_count() == 0) break;
+        const bool has_js_raf = active->js_vm && active->js_vm->pending_raf_count() > 0;
+        const bool has_css_anim =
+            active->timeline && (active->timeline->active_animation_count() > 0 ||
+                                 active->timeline->active_transition_count() > 0);
+        // Session 8: el mismo reloj alimenta los callbacks de
+        // requestAnimationFrame y las animaciones/transiciones declarativas.
+        if (!has_js_raf && !has_css_anim) break;
+
         raf_clock_ms_ += dt_ms;
-        auto rep = active->js_vm->run_animation_frame(raf_clock_ms_, *active->live_doc);
-        for (const auto& l : rep.logs) active->console_logs.push_back(l);
-        if (rep.raf_run > 0) ran_any = true;
-    }
-    if (ran_any) {
-        relayout_live_tab(*active);
+        bool frame_changed = false;
+
+        if (has_js_raf) {
+            auto rep = active->js_vm->run_animation_frame(raf_clock_ms_, *active->live_doc);
+            for (const auto& l : rep.logs) active->console_logs.push_back(l);
+            if (rep.raf_run > 0) frame_changed = true;
+        }
+        if (active->timeline && active->timeline->advance(raf_clock_ms_)) {
+            frame_changed = true;
+        }
+        if (frame_changed) {
+            // Recalcular estilo + layout en cada fotograma: así las
+            // transiciones que arrancan a mitad de la animación se registran
+            // con el reloj correcto.
+            relayout_live_tab(*active);
+            ran_any = true;
+        }
     }
     return ran_any;
 }

@@ -2,6 +2,7 @@
 
 #include "core/arena.hpp"
 #include "dom/html_parser.hpp"
+#include "style/animation_engine.hpp"
 #include "style/css_engine.hpp"
 
 #include <cstdint>
@@ -56,6 +57,10 @@ struct DisplayItem {
     bool fixed_viewport = false;
     bool has_clip = false;
     Rect clip_rect;
+    // Session 8: matriz afín 2D [a c e; b d f] ya resuelta alrededor del centro
+    // de la caja, lista para que el compositor la aplique por píxel.
+    bool has_transform = false;
+    float xform[6] = {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
     std::string text;
 };
 
@@ -93,11 +98,15 @@ struct DisplayList {
 
 class LayoutEngine {
 public:
+    // `timeline` es opcional: cuando se pasa, el motor registra en él las
+    // animaciones y transiciones declaradas por cada elemento y aplica el
+    // efecto animado vigente sobre la cascada (Session 8).
     static LayoutFrame* build_layout(SlabArena& arena,
                                      const HtmlDocument& doc,
                                      const CssStylesheet& sheet,
                                      float viewport_w,
-                                     float viewport_h);
+                                     float viewport_h,
+                                     AnimationTimeline* timeline = nullptr);
 
     static DisplayList build_display_list(const LayoutFrame* root,
                                           uint32_t viewport_w,

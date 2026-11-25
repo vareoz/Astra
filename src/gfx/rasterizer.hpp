@@ -90,6 +90,16 @@ public:
     void fill_gradient_rounded_rect(int x, int y, int w, int h, int radius,
                                     uint32_t start_argb, uint32_t end_argb, float angle_deg);
     void stroke_rounded_rect(int x, int y, int w, int h, int radius, int thickness, uint32_t argb);
+
+    // Session 8 — composición de una caja bajo una matriz afín 2D arbitraria.
+    // `m` mapea espacio local (coordenadas del propio DisplayList) a espacio de
+    // dispositivo. Se recorre la caja envolvente en dispositivo y se aplica la
+    // matriz inversa para muestrear el espacio local, con supermuestreo 2x2
+    // para obtener bordes suavizados en rotaciones y escalados no enteros.
+    // `shader(lx, ly)` devuelve el color ARGB en coordenadas locales relativas
+    // al origen de la caja; un alfa 0 descarta el píxel.
+    void fill_affine_box(const float m[6], float rx, float ry, float rw, float rh,
+                         const std::function<uint32_t(float lx, float ly)>& shader);
     void draw_text(int x, int y, std::string_view text, uint32_t argb, float font_size,
                    bool bold = false, bool monospace = false);
     void blit_scaled(int dst_x, int dst_y, int dst_w, int dst_h,

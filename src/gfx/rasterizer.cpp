@@ -1,4 +1,6 @@
 #include "gfx/rasterizer.hpp"
+
+#include "core/platform.hpp"
 #include "gfx/font_engine.hpp"
 
 #include <algorithm>
@@ -194,6 +196,119 @@ void Framebuffer::fill_rounded_rect(int x, int y, int w, int h, int radius, uint
     for (int py = y0; py < y1; ++py) {
         for (int px = x0; px < x1; ++px) {
             if (inside_rounded(px - x, py - y, w, h, radius)) blend_pixel(px, py, argb);
+        }
+    }
+}
+
+namespace {
+
+// Color de un linear-gradient CSS en coordenadas locales (float), con la misma
+// convención de ángulo que fill_gradient_rounded_rect (0deg = arriba).
+uint32_t gradient_color_at(float lx, float ly, float w, float h,
+                           uint32_t start_argb, uint32_t end_argb, float angle_deg) {
+    constexpr float kPi = 3.14159265358979323846f;
+    const float rad = angle_deg * (kPi / 180.0f);
+    const float vx = std::sin(rad);
+    const float vy = -std::cos(rad);
+    const float p10 = w * vx;
+    const float p01 = h * vy;
+    const float p11 = p10 + p01;
+    const float min_p = std::min({0.0f, p10, p01, p11});
+    const float max_p = std::max({0.0f, p10, p01, p11});
+    const float inv_span = (max_p - min_p > 1e-4f) ? (1.0f / (max_p - min_p)) : 0.0f;
+    const float t = std::clamp((lx * vx + ly * vy - min_p) * inv_span, 0.0f, 1.0f);
+
+    auto mix = [t](uint32_t a, uint32_t b, int shift) {
+        const float va = static_cast<float>((a >> shift) & 0xFFu);
+        const float vb = static_cast<float>((b >> shift) & 0xFFu);
+        return static_cast<uint32_t>(std::lround(va + (vb - va) * t)) & 0xFFu;
+    };
+    return (mix(start_argb, end_argb, 24) << 24) | (mix(start_argb, end_argb, 16) << 16) |
+           (mix(start_argb, end_argb, 8) << 8) | mix(start_argb, end_argb, 0);
+}
+
+// Versión en coma flotante de inside_rounded, para el muestreo afín.
+bool inside_rounded_f(float x, float y, float w, float h, float r) {
+    if (r <= 0.0f) return true;
+    r = std::min({r, w * 0.5f, h * 0.5f});
+    float dx = 0.0f, dy = 0.0f;
+    if (x < r && y < r) { dx = r - x; dy = r - y; }
+    else if (x > w - r && y < r) { dx = x - (w - r); dy = r - y; }
+    else if (x < r && y > h - r) { dx = r - x; dy = y - (h - r); }
+    else if (x > w - r && y > h - r) { dx = x - (w - r); dy = y - (h - r); }
+    else return true;
+    return (dx * dx + dy * dy) <= r * r;
+}
+
+} // namespace
+
+// -----------------------------------------------------------------------------
+// Session 8: composición afín con supermuestreo 2x2
+// -----------------------------------------------------------------------------
+void Framebuffer::fill_affine_box(const float m[6], float rx, float ry, float rw, float rh,
+                                  const std::function<uint32_t(float, float)>& shader) {
+    if (rw <= 0.0f || rh <= 0.0f || !shader) return;
+
+    // Inversa de [a c e; b d f].
+    const float det = m[0] * m[3] - m[1] * m[2];
+    if (std::fabs(det) < 1e-8f) return; // matriz degenerada: nada visible
+    const float inv_det = 1.0f / det;
+    const float ia = m[3] * inv_det;
+    const float ib = -m[1] * inv_det;
+    const float ic = -m[2] * inv_det;
+    const float id = m[0] * inv_det;
+    const float ie = (m[2] * m[5] - m[3] * m[4]) * inv_det;
+    const float if_ = (m[1] * m[4] - m[0] * m[5]) * inv_det;
+
+    // Caja envolvente en dispositivo de las cuatro esquinas transformadas.
+    const float cx[4] = {rx, rx + rw, rx, rx + rw};
+    const float cy[4] = {ry, ry, ry + rh, ry + rh};
+    float min_x = 1e30f, min_y = 1e30f, max_x = -1e30f, max_y = -1e30f;
+    for (int i = 0; i < 4; ++i) {
+        const float dx = m[0] * cx[i] + m[2] * cy[i] + m[4];
+        const float dy = m[1] * cx[i] + m[3] * cy[i] + m[5];
+        min_x = std::min(min_x, dx);
+        max_x = std::max(max_x, dx);
+        min_y = std::min(min_y, dy);
+        max_y = std::max(max_y, dy);
+    }
+
+    int x0 = std::max(0, static_cast<int>(std::floor(min_x)));
+    int y0 = std::max(0, static_cast<int>(std::floor(min_y)));
+    int x1 = std::min(width_, static_cast<int>(std::ceil(max_x)) + 1);
+    int y1 = std::min(height_, static_cast<int>(std::ceil(max_y)) + 1);
+
+    // Desplazamientos de los 4 subpíxeles (rejilla ordenada 2x2).
+    static const float kOff[4][2] = {{0.25f, 0.25f}, {0.75f, 0.25f},
+                                     {0.25f, 0.75f}, {0.75f, 0.75f}};
+
+    for (int py = y0; py < y1; ++py) {
+        for (int px = x0; px < x1; ++px) {
+            uint32_t acc_a = 0, acc_r = 0, acc_g = 0, acc_b = 0;
+            int hits = 0;
+            for (const auto& off : kOff) {
+                const float sx = static_cast<float>(px) + off[0];
+                const float sy = static_cast<float>(py) + off[1];
+                const float lx = ia * sx + ic * sy + ie;
+                const float ly = ib * sx + id * sy + if_;
+                if (lx < rx || lx >= rx + rw || ly < ry || ly >= ry + rh) continue;
+                const uint32_t c = shader(lx - rx, ly - ry);
+                const uint32_t a = (c >> 24) & 0xFFu;
+                if (a == 0) continue;
+                acc_a += a;
+                acc_r += ((c >> 16) & 0xFFu) * a;
+                acc_g += ((c >> 8) & 0xFFu) * a;
+                acc_b += (c & 0xFFu) * a;
+                ++hits;
+            }
+            if (hits == 0 || acc_a == 0) continue;
+            // Media ponderada por alfa de los subpíxeles cubiertos; el alfa
+            // final se reparte sobre los 4 subpíxeles para dar la cobertura.
+            const uint32_t out_r = acc_r / acc_a;
+            const uint32_t out_g = acc_g / acc_a;
+            const uint32_t out_b = acc_b / acc_a;
+            const uint32_t out_a = std::min<uint32_t>(255u, acc_a / 4u);
+            blend_pixel(px, py, (out_a << 24) | (out_r << 16) | (out_g << 8) | out_b);
         }
     }
 }
@@ -457,6 +572,22 @@ void Framebuffer::composite_display_list(const DisplayList& dl,
 
         if (iy >= height_ || iy + ih <= y_offset) continue;
 
+        // Session 8: la matriz del item vive en espacio de DisplayList; el
+        // compositor le compone la traslación de scroll/chrome para obtener la
+        // matriz de dispositivo que consume fill_affine_box.
+        const float dev_dy = item.fixed_viewport
+                                 ? static_cast<float>(y_offset)
+                                 : (static_cast<float>(y_offset) - scroll_y);
+        float dev_m[6] = {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, dev_dy};
+        if (item.has_transform) {
+            dev_m[0] = item.xform[0];
+            dev_m[1] = item.xform[1];
+            dev_m[2] = item.xform[2];
+            dev_m[3] = item.xform[3];
+            dev_m[4] = item.xform[4];
+            dev_m[5] = item.xform[5] + dev_dy;
+        }
+
         if (item.has_clip) {
             int clx = static_cast<int>(std::round(item.clip_rect.x));
             float cl_eff_y = item.fixed_viewport ? item.clip_rect.y : (item.clip_rect.y - scroll_y);
@@ -491,12 +622,32 @@ void Framebuffer::composite_display_list(const DisplayList& dl,
                 break;
             }
             case DisplayItemType::FillRect: {
+                if (item.has_transform) {
+                    const float rw = item.rect.w, rh = item.rect.h, rr = item.radius;
+                    const uint32_t col = item.color_argb;
+                    fill_affine_box(dev_m, item.rect.x, item.rect.y, rw, rh,
+                                    [rw, rh, rr, col](float lx, float ly) -> uint32_t {
+                                        return inside_rounded_f(lx, ly, rw, rh, rr) ? col : 0u;
+                                    });
+                    break;
+                }
                 int cy = std::max(y_offset, iy);
                 int ch = std::min(height_, iy + ih) - cy;
                 if (ch > 0) fill_rounded_rect(ix, cy, iw, ch, static_cast<int>(item.radius), item.color_argb);
                 break;
             }
             case DisplayItemType::FillGradient: {
+                if (item.has_transform) {
+                    const float rw = item.rect.w, rh = item.rect.h, rr = item.radius;
+                    const uint32_t c0 = item.color_argb, c1 = item.color2_argb;
+                    const float ang = item.angle_deg;
+                    fill_affine_box(dev_m, item.rect.x, item.rect.y, rw, rh,
+                                    [rw, rh, rr, c0, c1, ang](float lx, float ly) -> uint32_t {
+                                        if (!inside_rounded_f(lx, ly, rw, rh, rr)) return 0u;
+                                        return gradient_color_at(lx, ly, rw, rh, c0, c1, ang);
+                                    });
+                    break;
+                }
                 if (iw > 0 && ih > 0) {
                     fill_gradient_rounded_rect(ix, iy, iw, ih, static_cast<int>(item.radius),
                                                item.color_argb, item.color2_argb, item.angle_deg);
@@ -504,6 +655,21 @@ void Framebuffer::composite_display_list(const DisplayList& dl,
                 break;
             }
             case DisplayItemType::StrokeRect: {
+                if (item.has_transform) {
+                    const float rw = item.rect.w, rh = item.rect.h, rr = item.radius;
+                    const float th = std::max(1.0f, item.thickness);
+                    const uint32_t col = item.color_argb;
+                    fill_affine_box(dev_m, item.rect.x, item.rect.y, rw, rh,
+                                    [rw, rh, rr, th, col](float lx, float ly) -> uint32_t {
+                                        if (!inside_rounded_f(lx, ly, rw, rh, rr)) return 0u;
+                                        const bool inner =
+                                            lx >= th && lx < rw - th && ly >= th && ly < rh - th &&
+                                            inside_rounded_f(lx - th, ly - th, rw - 2 * th, rh - 2 * th,
+                                                             std::max(0.0f, rr - th));
+                                        return inner ? 0u : col;
+                                    });
+                    break;
+                }
                 int cy = std::max(y_offset, iy);
                 int ch = std::min(height_, iy + ih) - cy;
                 if (ch > 0) stroke_rounded_rect(ix, cy, iw, ch, static_cast<int>(item.radius),
@@ -511,6 +677,26 @@ void Framebuffer::composite_display_list(const DisplayList& dl,
                 break;
             }
             case DisplayItemType::DrawText:
+                if (item.has_transform) {
+                    // El trazado de glifos rotados exigiría rasterizar cada
+                    // contorno bajo la matriz; el compositor software aplica la
+                    // parte de traslación y escala (la que domina en las
+                    // animaciones reales) y mantiene los glifos sin cizalla.
+                    const float ox = item.rect.x;
+                    const float oy = item.rect.y;
+                    const float tx = dev_m[0] * ox + dev_m[2] * oy + dev_m[4];
+                    const float ty = dev_m[1] * ox + dev_m[3] * oy + dev_m[5];
+                    const float sx = std::sqrt(dev_m[0] * dev_m[0] + dev_m[1] * dev_m[1]);
+                    const float sy = std::sqrt(dev_m[2] * dev_m[2] + dev_m[3] * dev_m[3]);
+                    const float scale = std::max(0.1f, 0.5f * (sx + sy));
+                    const int txi = static_cast<int>(std::round(tx));
+                    const int tyi = static_cast<int>(std::round(ty));
+                    if (tyi >= y_offset && tyi < height_) {
+                        draw_text(txi, tyi, item.text, item.color_argb,
+                                  item.font_size * scale, item.bold, item.monospace);
+                    }
+                    break;
+                }
                 if (iy >= y_offset) {
                     draw_text(ix, iy, item.text, item.color_argb, item.font_size, item.bold, item.monospace);
                 }
@@ -746,7 +932,11 @@ bool Framebuffer::save_png(const std::string& path) const {
 bool Framebuffer::present_x11_interactive(const std::string& window_title,
                                           const InteractiveCallbacks& callbacks) {
     if (!std::getenv("DISPLAY")) return false;
-    void* x11 = dlopen("libX11.so.6", RTLD_LAZY);
+    void* x11 = nullptr;
+    for (const char* name : platform::libx11_names()) {
+        x11 = dlopen(name, RTLD_LAZY);
+        if (x11) break;
+    }
     if (!x11) return false;
 
     struct XButtonEv {
