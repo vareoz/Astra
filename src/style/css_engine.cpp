@@ -697,6 +697,40 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
         }
     } else if (p == "flex-direction") {
         st.flex_direction = (vl == "column") ? FlexDirection::Column : FlexDirection::Row;
+    } else if (p == "flex-grow") {
+        st.flex_grow = std::max(0.0f, static_cast<float>(std::atof(vl.c_str())));
+    } else if (p == "flex-basis") {
+        st.flex_basis = (vl == "auto" || vl == "content") ? -1.0f
+                                                          : std::max(0.0f, StyleEngine::parse_px(v, -1.0f));
+    } else if (p == "flex") {
+        // Atajo `flex: <grow> [<shrink>] [<basis>]`, más las palabras clave.
+        if (vl == "none") {
+            st.flex_grow = 0.0f;
+        } else if (vl == "auto") {
+            st.flex_grow = 1.0f;
+            st.flex_basis = -1.0f;
+        } else if (vl == "initial") {
+            st.flex_grow = 0.0f;
+            st.flex_basis = -1.0f;
+        } else {
+            auto toks = split_ws(vl);
+            if (!toks.empty()) {
+                // Un primer valor con unidad es `flex-basis`; sin unidad, `flex-grow`.
+                if (toks[0].find_first_not_of("0123456789.") == std::string::npos) {
+                    st.flex_grow = std::max(0.0f, static_cast<float>(std::atof(toks[0].c_str())));
+                    // El tercer token (o el segundo con unidad) es la base.
+                    for (size_t k = 1; k < toks.size(); ++k) {
+                        if (toks[k].find_first_not_of("0123456789.") != std::string::npos) {
+                            st.flex_basis = std::max(0.0f, StyleEngine::parse_px(toks[k], -1.0f));
+                            break;
+                        }
+                    }
+                } else {
+                    st.flex_grow = 1.0f;
+                    st.flex_basis = std::max(0.0f, StyleEngine::parse_px(toks[0], -1.0f));
+                }
+            }
+        }
     } else if (p == "flex-wrap") {
         st.flex_wrap = (vl == "wrap" || vl == "wrap-reverse");
     } else if (p == "justify-content") {

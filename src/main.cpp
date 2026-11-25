@@ -2744,6 +2744,96 @@ int run_full_test_suite() {
                    "drop the 40px block floor so short words and punctuation sit flush on the line");
         }
 
+        // ---------------------------------------------------------------------
+        // 71. Espacio entre cajas en línea y reparto por flex-grow
+        // ---------------------------------------------------------------------
+        {
+            // (a) Un nodo de texto que es SÓLO un espacio separa dos elementos
+            // en línea y debe conservarse colapsado (CSS Text §4.1.1); entre
+            // bloques, en cambio, se elimina y no debe abrir renglones.
+            SlabArena wa;
+            HtmlDocument wdoc = HtmlDocument::parse(wa,
+                "<html><body>\n"
+                "  <p><a href=\"#\">uno</a> <a href=\"#\">dos</a></p>\n"
+                "  <div>bloque A</div>\n"
+                "  <div>bloque B</div>\n"
+                "</body></html>");
+            CssStylesheet wsheet;
+            LayoutFrame* wroot = LayoutEngine::build_layout(wa, wdoc, wsheet, 900.0f, 400.0f, true);
+
+            std::vector<const LayoutFrame*> leaves;
+            std::function<void(const LayoutFrame*)> collect = [&](const LayoutFrame* f) {
+                if (!f) return;
+                if (f->children.empty() && f->node && f->node->type == NodeType::Text) leaves.push_back(f);
+                for (const LayoutFrame* c : f->children) collect(c);
+            };
+            collect(wroot);
+
+            // El espacio sobrevive entre los dos enlaces...
+            bool space_kept = false;
+            for (size_t k = 1; k + 1 < leaves.size(); ++k) {
+                if (leaves[k]->node->text_content() == " " &&
+                    leaves[k - 1]->node->text_content() == "uno" &&
+                    leaves[k + 1]->node->text_content() == "dos") {
+                    space_kept = (leaves[k]->border_box.w > 1.0f && leaves[k]->border_box.w < 12.0f);
+                }
+            }
+            // ...y los dos bloques quedan en renglones consecutivos, sin que
+            // los saltos de línea del HTML metan líneas en blanco entre ellos.
+            const LayoutFrame *bA = nullptr, *bB = nullptr;
+            for (const LayoutFrame* lf : leaves) {
+                if (lf->node->text_content() == "bloque A") bA = lf;
+                if (lf->node->text_content() == "bloque B") bB = lf;
+            }
+            bool blocks_ok = bA && bB && (bB->border_box.y - bA->border_box.y) > 1.0f &&
+                             (bB->border_box.y - bA->border_box.y) < 40.0f;
+
+            // (b) flex-grow reparte el espacio libre: con un hermano fijo de
+            // 100px, el que crece debe llevarse el resto y empujar al tercero
+            // contra el borde opuesto.
+            SlabArena fa2;
+            HtmlDocument fdoc2 = HtmlDocument::parse(fa2,
+                "<html><head><style>"
+                "body { margin: 0; padding: 0; }"
+                ".bar { display: flex; width: 600px; }"
+                ".left { width: 100px; height: 20px; }"
+                ".mid { flex-grow: 1; height: 20px; }"
+                ".right { flex: 0 0 80px; height: 20px; }"
+                "</style></head><body><div class=\"bar\">"
+                "<div class=\"left\"></div><div class=\"mid\"></div><div class=\"right\"></div>"
+                "</div></body></html>");
+            CssStylesheet fsheet2;
+            fsheet2.parse(fdoc2.collect_stylesheets());
+            LayoutFrame* froot2 = LayoutEngine::build_layout(fa2, fdoc2, fsheet2, 900.0f, 400.0f);
+            const LayoutFrame* bar = (froot2 && !froot2->children.empty()) ? froot2->children[0] : nullptr;
+            bool flex_ok = false;
+            if (bar && bar->children.size() == 3) {
+                const LayoutFrame* L = bar->children[0];
+                const LayoutFrame* M = bar->children[1];
+                const LayoutFrame* R = bar->children[2];
+                flex_ok = std::abs(L->border_box.w - 100.0f) < 1.5f &&
+                          std::abs(R->border_box.w - 80.0f) < 1.5f &&
+                          // el elástico se queda con 600 - 100 - 80
+                          std::abs(M->border_box.w - 420.0f) < 2.0f &&
+                          M->border_box.x > L->border_box.x &&
+                          R->border_box.x > M->border_box.x &&
+                          std::abs(M->style.flex_grow - 1.0f) < 1e-6f &&
+                          std::abs(R->style.flex_basis - 80.0f) < 1e-6f;
+            }
+
+            if (!(space_kept && blocks_ok && flex_ok)) {
+                std::cerr << "    [diag71] space=" << space_kept << " blocks=" << blocks_ok
+                          << " flex=" << flex_ok << " hojas=" << leaves.size() << "\n";
+                if (bar) for (const LayoutFrame* c : bar->children)
+                    std::cerr << "      flex item x=" << c->border_box.x << " w=" << c->border_box.w
+                              << " grow=" << c->style.flex_grow << " basis=" << c->style.flex_basis << "\n";
+            }
+
+            expect(space_kept && blocks_ok && flex_ok,
+                   "Whitespace-only text collapses to one space between inline boxes (and vanishes between "
+                   "blocks), and flex-grow / flex shorthand distribute the container's free space");
+        }
+
         app.stop_workers();
     }
 

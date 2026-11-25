@@ -24,7 +24,14 @@ uint32_t apply_opacity(uint32_t argb, float opacity) {
     return (na << 24) | (argb & 0x00FFFFFFu);
 }
 
-std::vector<std::string> wrap_text(const std::string& raw, float max_width, float font_size, bool bold, bool mono) {
+// `keep_leading`/`keep_trailing` conservan UN espacio en el borde de la
+// primera/última línea. Hace falta porque la caja se mide con el texto crudo
+// (espacios incluidos): si el dibujado los recorta, la palabra se pega a la
+// anterior y sobra hueco al final. Sólo se activan cuando el nodo tiene
+// vecinos en línea, no al principio o final de un bloque, donde CSS Text
+// §4.1.1 sí elimina el espacio de borde.
+std::vector<std::string> wrap_text(const std::string& raw, float max_width, float font_size, bool bold, bool mono,
+                                   bool keep_leading = false, bool keep_trailing = false) {
     std::vector<std::string> lines;
     auto& fe = FontEngine::instance();
     float usable_w = std::max(40.0f, max_width);
@@ -56,6 +63,12 @@ std::vector<std::string> wrap_text(const std::string& raw, float max_width, floa
         }
     }
     if (!cur.empty()) lines.push_back(std::move(cur));
+    if (!lines.empty()) {
+        const bool raw_lead = !raw.empty() && std::isspace(static_cast<unsigned char>(raw.front()));
+        const bool raw_trail = !raw.empty() && std::isspace(static_cast<unsigned char>(raw.back()));
+        if (keep_leading && raw_lead) lines.front().insert(lines.front().begin(), ' ');
+        if (keep_trailing && raw_trail) lines.back().push_back(' ');
+    }
     return lines;
 }
 
@@ -293,7 +306,29 @@ LayoutFrame* build_frame_tree(SlabArena& arena,
         f->children.push_back(make_pseudo_frame(before_st));
     }
 
-    for (const DomNode* ch : node->children) {
+    // Session 12: un nodo de texto que es sólo un espacio únicamente cuenta
+    // cuando separa dos cajas EN LÍNEA. Entre cajas de bloque, CSS lo elimina,
+    // así que aquí se descarta para no abrir renglones fantasma.
+    auto is_collapsible_space = [](const DomNode* n) {
+        return n && n->type == NodeType::Text && n->text == " ";
+    };
+    auto participates_inline = [&](const DomNode* n) -> bool {
+        if (!n) return false;
+        if (n->type == NodeType::Text) return true;
+        if (n->type != NodeType::Element) return false;
+        ComputedStyle cs = StyleEngine::compute_style(n, sheet, &f->style, viewport_w, light_web_default);
+        return cs.display == DisplayType::Inline || cs.display == DisplayType::InlineBlock;
+    };
+
+    const std::vector<DomNode*>& kids = node->children;
+    for (size_t ci = 0; ci < kids.size(); ++ci) {
+        const DomNode* ch = kids[ci];
+        if (is_collapsible_space(ch)) {
+            const DomNode* prev = (ci > 0) ? kids[ci - 1] : nullptr;
+            const DomNode* next = (ci + 1 < kids.size()) ? kids[ci + 1] : nullptr;
+            // Sólo sobrevive si tiene contenido en línea a ambos lados.
+            if (!prev || !next || !participates_inline(prev) || !participates_inline(next)) continue;
+        }
         if (LayoutFrame* cf = build_frame_tree(arena, ch, sheet, &f->style, viewport_w,
                                                light_web_default, timeline)) {
             f->children.push_back(cf);
@@ -425,7 +460,19 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
 
     // Text frame
     if (frame->node && frame->node->type == NodeType::Text) {
-        frame->wrapped_lines = wrap_text(frame->node->text, inner_w, st.font_size, st.bold, st.monospace);
+        bool keep_lead = false, keep_trail = false;
+        if (const DomNode* tn = frame->node; tn && tn->parent) {
+            const auto& sib = tn->parent->children;
+            for (size_t k = 0; k < sib.size(); ++k) {
+                if (sib[k] == tn) {
+                    keep_lead = (k > 0);
+                    keep_trail = (k + 1 < sib.size());
+                    break;
+                }
+            }
+        }
+        frame->wrapped_lines = wrap_text(frame->node->text, inner_w, st.font_size, st.bold, st.monospace,
+                                         keep_lead, keep_trail);
         float lh = line_height_for_size(st.font_size);
         frame->content_box.h = static_cast<float>(frame->wrapped_lines.size()) * lh;
         frame->border_box.h = frame->content_box.h;
@@ -661,7 +708,10 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
                 const ComputedStyle& cs = flow_children[i]->style;
                 float extra = cs.padding.left + cs.padding.right + cs.border_width * 2.0f;
                 float attr_w = intrinsic_html_w(flow_children[i]);
-                if (cs.width > 0.0f) {
+                if (cs.flex_basis >= 0.0f) {
+                    float bw = (cs.box_sizing == BoxSizing::BorderBox) ? cs.flex_basis : (cs.flex_basis + extra);
+                    item_w[i] = std::min(inner_w, bw + cs.margin.left + cs.margin.right);
+                } else if (cs.width > 0.0f) {
                     float bw = (cs.box_sizing == BoxSizing::BorderBox) ? cs.width : (cs.width + extra);
                     item_w[i] = std::min(inner_w, bw + cs.margin.left + cs.margin.right);
                 } else if (attr_w > 0.0f) {
@@ -725,10 +775,16 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
         size_t count = flow_children.size();
         float total_gap = st.gap * static_cast<float>(count > 0 ? count - 1 : 0);
         bool has_explicit_w = false;
+        bool has_flex_grow = false;
         for (LayoutFrame* ch : flow_children) {
-            if (ch->style.width > 0.0f || intrinsic_html_w(ch) > 0.0f) { has_explicit_w = true; break; }
+            if (ch->style.flex_grow > 0.0f) has_flex_grow = true;
+            if (ch->style.width > 0.0f || ch->style.flex_basis >= 0.0f || intrinsic_html_w(ch) > 0.0f) {
+                has_explicit_w = true;
+            }
         }
-        bool custom_justify = (st.justify_content != JustifyContent::FlexStart) || has_explicit_w;
+        // Con `flex-grow` el reparto deja de ser equitativo, así que se toma
+        // siempre la rama que mide cada ítem y distribuye el sobrante.
+        bool custom_justify = (st.justify_content != JustifyContent::FlexStart) || has_explicit_w || has_flex_grow;
         float max_h = 0.0f;
 
         if (!custom_justify) {
@@ -749,7 +805,11 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
                 const ComputedStyle& cs = flow_children[i]->style;
                 float extra = cs.padding.left + cs.padding.right + cs.border_width * 2.0f;
                 float attr_w = intrinsic_html_w(flow_children[i]);
-                if (cs.width > 0.0f) {
+                if (cs.flex_basis >= 0.0f) {
+                    float bw = (cs.box_sizing == BoxSizing::BorderBox) ? cs.flex_basis : (cs.flex_basis + extra);
+                    child_w[i] = bw + cs.margin.left + cs.margin.right;
+                    used_w += child_w[i];
+                } else if (cs.width > 0.0f) {
                     float bw = (cs.box_sizing == BoxSizing::BorderBox) ? cs.width : (cs.width + extra);
                     child_w[i] = bw + cs.margin.left + cs.margin.right;
                     used_w += child_w[i];
@@ -778,6 +838,25 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
                 }
             }
             float avail_items_w = std::max(40.0f, inner_w - total_gap);
+
+            // CSS Flexbox §9.7: el espacio libre sobrante se reparte entre los
+            // ítems en proporción a su `flex-grow`. Es lo que empuja un bloque
+            // contra el borde opuesto cuando su hermano declara `flex-grow: 1`.
+            if (has_flex_grow && used_w < avail_items_w) {
+                float sum_grow = 0.0f;
+                for (size_t i = 0; i < count; ++i) sum_grow += flow_children[i]->style.flex_grow;
+                if (sum_grow > 0.0f) {
+                    const float free_w = avail_items_w - used_w;
+                    for (size_t i = 0; i < count; ++i) {
+                        const float g = flow_children[i]->style.flex_grow;
+                        if (g <= 0.0f) continue;
+                        const float add = free_w * (g / sum_grow);
+                        child_w[i] += add;
+                        used_w += add;
+                    }
+                }
+            }
+
             if (used_w > avail_items_w && used_w > 0.0f) {
                 float scale = avail_items_w / used_w;
                 used_w = 0.0f;

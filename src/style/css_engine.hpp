@@ -245,6 +245,12 @@ struct EdgeSizes {
 struct ComputedStyle {
     DisplayType display = DisplayType::Block;
     FlexDirection flex_direction = FlexDirection::Row;
+    // CSS Flexbox Level 1 §7: factor de crecimiento del ítem y tamaño base.
+    // `flex-grow` reparte el espacio libre del contenedor; sin él, un
+    // `flex: 1` o `flex-grow: 1` no empujaba nada y los bloques quedaban
+    // amontonados a la izquierda.
+    float flex_grow = 0.0f;
+    float flex_basis = -1.0f; // < 0 = auto
     bool flex_wrap = false;
     JustifyContent justify_content = JustifyContent::FlexStart;
     AlignItems align_items = AlignItems::Stretch;

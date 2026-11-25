@@ -476,7 +476,14 @@ HtmlDocument HtmlDocument::parse(SlabArena& arena, std::string_view html) {
             std::string decoded = decode_entities(raw);
             bool all_ws = std::all_of(decoded.begin(), decoded.end(),
                                       [](unsigned char c) { return std::isspace(c); });
-            if (!all_ws) {
+            // CSS Text §4.1.1: una secuencia de espacios entre dos cajas en
+            // línea COLAPSA a un único espacio, no desaparece. Descartar estos
+            // nodos pegaba las palabras cuando dos elementos en línea sólo
+            // estaban separados por espacio (`<a>uno</a> <a>dos</a>`). Se
+            // conserva colapsado; LayoutEngine descarta después los que caen
+            // entre cajas de bloque, donde el espacio sí se elimina.
+            if (all_ws && !decoded.empty()) decoded = " ";
+            if (!decoded.empty()) {
                 DomNode* txt = arena.create<DomNode>();
                 txt->type = NodeType::Text;
                 txt->text = std::move(decoded);
