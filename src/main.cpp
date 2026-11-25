@@ -2647,6 +2647,103 @@ int run_full_test_suite() {
                    "grid-template shorthand) place a sidebar and content side by side instead of stacking them");
         }
 
+        // ---------------------------------------------------------------------
+        // 70. Tipografía: font-size relativo y cajas en línea sin suelo artificial
+        // ---------------------------------------------------------------------
+        {
+            // Fallo original: `parse_px` ignoraba el `%`, así que
+            // `font-size: 100%` se leía como 100px y el clamp lo dejaba en 64.
+            // Toda etiqueta con tamaño porcentual salía gigante.
+            SlabArena fa;
+            HtmlDocument fdoc = HtmlDocument::parse(fa,
+                "<html><head><style>"
+                "body { margin: 0; padding: 0; font-size: 20px; }"
+                "#same { font-size: 100%; }"
+                "#small { font-size: 88.4%; }"
+                "#em { font-size: 1.5em; }"
+                "#rem { font-size: 1.5rem; }"
+                "#kw { font-size: large; }"
+                "#rel { font-size: smaller; }"
+                "</style></head><body>"
+                "<div id=\"same\">a</div><div id=\"small\">b</div><div id=\"em\">c</div>"
+                "<div id=\"rem\">d</div><div id=\"kw\">e</div><div id=\"rel\">f</div>"
+                "</body></html>");
+            CssStylesheet fsheet;
+            fsheet.parse(fdoc.collect_stylesheets());
+            LayoutFrame* froot = LayoutEngine::build_layout(fa, fdoc, fsheet, 900.0f, 600.0f);
+
+            auto font_of = [&](const char* id) -> float {
+                const DomNode* n = fdoc.query_selector((std::string("#") + id).c_str());
+                if (!n || !froot) return -1.0f;
+                float out = -1.0f;
+                std::function<void(const LayoutFrame*)> seek = [&](const LayoutFrame* f) {
+                    if (!f || out >= 0.0f) return;
+                    if (f->node == n) { out = f->style.font_size; return; }
+                    for (const LayoutFrame* c : f->children) seek(c);
+                };
+                seek(froot);
+                return out;
+            };
+
+            bool fonts_ok =
+                std::abs(font_of("same") - 20.0f) < 0.5f &&     // 100% del heredado
+                std::abs(font_of("small") - 17.68f) < 0.5f &&   // 88.4% de 20
+                std::abs(font_of("em") - 30.0f) < 0.5f &&       // 1.5em del heredado
+                std::abs(font_of("rem") - 24.0f) < 0.5f &&      // 1.5rem de la raíz (16)
+                std::abs(font_of("kw") - 18.0f) < 0.5f &&       // large = 1.125 x 16
+                std::abs(font_of("rel") - (20.0f / 1.2f)) < 0.5f; // smaller
+
+            // Segundo fallo: layout_node imponía un suelo de 40px a toda caja,
+            // también a las de línea, de modo que una palabra corta o un signo
+            // de puntuación abrían un hueco enorme dentro del párrafo.
+            SlabArena ia;
+            HtmlDocument idoc = HtmlDocument::parse(ia,
+                "<html><body><p>A <b>web browser</b>, is an <a href=\"#\">app</a>.</p></body></html>");
+            CssStylesheet isheet;
+            LayoutFrame* iroot = LayoutEngine::build_layout(ia, idoc, isheet, 900.0f, 400.0f, true);
+
+            std::vector<const LayoutFrame*> leaves;
+            std::function<void(const LayoutFrame*)> collect = [&](const LayoutFrame* f) {
+                if (!f) return;
+                if (f->children.empty() && f->node && f->node->type == NodeType::Text) leaves.push_back(f);
+                for (const LayoutFrame* c : f->children) collect(c);
+            };
+            collect(iroot);
+
+            bool inline_ok = leaves.size() >= 5;
+            if (inline_ok) {
+                // Ninguna caja de texto corta debe inflarse al viejo suelo de 40px...
+                for (const LayoutFrame* lf : leaves) {
+                    const std::string t = lf->node->text_content();
+                    if (t.size() <= 2 && lf->border_box.w > 24.0f) inline_ok = false;
+                }
+                // ...y las cajas de una misma línea deben ir contiguas, sin
+                // holgura artificial entre ellas.
+                for (size_t k = 1; k < leaves.size(); ++k) {
+                    const LayoutFrame* prev = leaves[k - 1];
+                    const LayoutFrame* cur = leaves[k];
+                    if (std::abs(prev->border_box.y - cur->border_box.y) > 1.0f) continue; // otra línea
+                    const float gap = cur->border_box.x - (prev->border_box.x + prev->border_box.w);
+                    if (gap > 4.0f) inline_ok = false;
+                }
+            }
+
+            if (!(fonts_ok && inline_ok)) {
+                std::cerr << "    [diag70] same=" << font_of("same") << " small=" << font_of("small")
+                          << " em=" << font_of("em") << " rem=" << font_of("rem")
+                          << " kw=" << font_of("kw") << " rel=" << font_of("rel")
+                          << " leaves=" << leaves.size() << "\n";
+                for (const LayoutFrame* lf : leaves) {
+                    std::cerr << "      [" << lf->node->text_content() << "] x=" << lf->border_box.x
+                              << " w=" << lf->border_box.w << "\n";
+                }
+            }
+
+            expect(fonts_ok && inline_ok,
+                   "CSS font-size resolves %, em, rem and keywords against the inherited size, and inline boxes "
+                   "drop the 40px block floor so short words and punctuation sit flush on the line");
+        }
+
         app.stop_workers();
     }
 

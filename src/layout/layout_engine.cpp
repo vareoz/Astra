@@ -318,7 +318,14 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
     float pad_y = st.padding.top + st.border_width;
     float horiz_extra = pad_x + st.padding.right + st.border_width;
     float vert_extra = pad_y + st.padding.bottom + st.border_width;
-    float max_avail = std::max(40.0f, avail_w - st.margin.left - st.margin.right);
+    // El suelo de 40px evita cajas de bloque degeneradas, pero NO debe
+    // aplicarse a las cajas en línea: una palabra corta o un signo de
+    // puntuación miden mucho menos, y con el suelo cada uno abría un hueco
+    // artificial dentro de la línea de texto.
+    const float avail_minus_margins = avail_w - st.margin.left - st.margin.right;
+    float max_avail = (st.display == DisplayType::Inline)
+                          ? std::max(0.0f, avail_minus_margins)
+                          : std::max(40.0f, avail_minus_margins);
 
     float box_w = max_avail;
     float resolved_width = st.width;
@@ -961,7 +968,11 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
                         float ih = ich->border_box.h + ich->style.margin.top + ich->style.margin.bottom;
                         line_h = std::max(line_h, ih);
                         line_items.push_back(ich);
-                        float inline_gap = (ich->style.display == DisplayType::InlineBlock) ? 4.0f : 3.0f;
+                        // Las cajas en línea se colocan contiguas: el espacio
+                        // entre palabras ya viene en el propio texto. Sólo los
+                        // inline-block conservan una holgura, porque el nodo de
+                        // texto en blanco que los separaba se descarta al parsear.
+                        float inline_gap = (ich->style.display == DisplayType::InlineBlock) ? 4.0f : 0.0f;
                         line_x += ich->border_box.w + ich->style.margin.left + ich->style.margin.right + inline_gap;
                         ++i;
                     }

@@ -296,6 +296,10 @@ struct ComputedStyle {
     Color color{230, 234, 240, 255};
     BoxShadow box_shadow;
     float font_size = 14.0f;
+    // Tamaño de fuente HEREDADO del padre. CSS Fonts §3.1: un `font-size` en
+    // porcentaje o en `em` se resuelve contra este valor, no contra el propio
+    // ni contra el del documento raíz.
+    float parent_font_size = 16.0f;
     bool bold = false;
     bool monospace = false;
     float line_height = 1.48f;

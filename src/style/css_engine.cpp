@@ -618,6 +618,50 @@ std::vector<GridTrack> parse_grid_tracks(std::string_view val) {
     return tracks;
 }
 
+// CSS Fonts Level 3 §3.1 — `font-size` admite longitudes absolutas, `rem`
+// (relativo a la raíz), `em` y porcentajes (ambos relativos al tamaño
+// HEREDADO) y las palabras clave absolutas y relativas.
+float resolve_font_size(const std::string& vl, const std::string& raw,
+                        float parent_px, float fallback) {
+    const std::string v = trim(vl);
+    if (v.empty()) return fallback;
+
+    // Palabras clave absolutas, escaladas sobre el medium de 16px.
+    struct Kw { const char* name; float factor; };
+    static const Kw kKeywords[] = {
+        {"xx-small", 0.5625f}, {"x-small", 0.6250f}, {"small", 0.8125f},
+        {"medium", 1.0f},      {"large", 1.125f},    {"x-large", 1.5f},
+        {"xx-large", 2.0f},    {"xxx-large", 3.0f}
+    };
+    for (const auto& k : kKeywords) {
+        if (v == k.name) return 16.0f * k.factor;
+    }
+    // Palabras clave relativas al padre.
+    if (v == "smaller") return parent_px / 1.2f;
+    if (v == "larger") return parent_px * 1.2f;
+    if (v == "inherit" || v == "unset") return parent_px;
+    if (v == "initial") return 16.0f;
+
+    if (v.rfind("calc(", 0) == 0) {
+        // En calc() el 100% de un font-size es el tamaño heredado.
+        return StyleEngine::eval_calc(raw, parent_px, 1280.0f, fallback);
+    }
+
+    char* end = nullptr;
+    const float num = std::strtof(v.c_str(), &end);
+    if (end == v.c_str()) return fallback;
+    const std::string unit = trim(std::string(end));
+
+    if (unit == "%") return parent_px * (num / 100.0f);
+    if (unit == "rem") return 16.0f * num;            // relativo a la raíz
+    if (unit == "em") return parent_px * num;         // relativo al heredado
+    if (unit == "pt") return num * (96.0f / 72.0f);
+    if (unit == "pc") return num * 16.0f;
+    if (unit == "vw") return 1280.0f * (num / 100.0f);
+    if (unit == "vh") return 636.0f * (num / 100.0f);
+    return num;                                        // px o sin unidad
+}
+
 void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
     const std::string& p = d.property;
     const std::string& v = d.value;
@@ -948,7 +992,10 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
         if (st.transitions.empty()) st.transitions.emplace_back();
         for (auto& ts : st.transitions) ts.easing = Easing::parse(v, ts.easing);
     } else if (p == "font-size") {
-        st.font_size = std::clamp(StyleEngine::parse_px(v, st.font_size), 8.0f, 64.0f);
+        // El techo se mantiene alto para no truncar titulares legítimos, pero
+        // acotado frente a valores hostiles.
+        st.font_size = std::clamp(resolve_font_size(vl, v, st.parent_font_size, st.font_size),
+                                  6.0f, 160.0f);
     } else if (p == "font-weight") {
         st.bold = (vl == "bold" || vl == "600" || vl == "700" || vl == "800" || vl == "900");
     } else if (p == "font-family") {
@@ -1729,6 +1776,7 @@ ComputedStyle StyleEngine::compute_style(const DomNode* node,
                                          const StyleAdjuster* adjuster) {
     ComputedStyle st;
     // Inherit text properties & CSS custom properties from parent
+    st.parent_font_size = parent_style ? parent_style->font_size : 16.0f;
     if (parent_style) {
         st.color = parent_style->color;
         st.font_size = parent_style->font_size;
