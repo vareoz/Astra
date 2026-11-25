@@ -1563,7 +1563,7 @@ int run_full_test_suite() {
         // 49. Hito C — Real Kernel seccomp-BPF Sandbox + CSP + Mixed Content + SOP/CORS + SameSite Cookies + Site Isolation
         {
             std::string seccomp_detail;
-            bool ok_seccomp = ProcessSandbox::self_verify_seccomp(&seccomp_detail);
+            bool ok_seccomp = ProcessSandbox::self_verify(&seccomp_detail);
 
             // CSP inline-script & connect-src enforcement
             ContentSecurityPolicy csp;
@@ -1629,24 +1629,24 @@ int run_full_test_suite() {
             bool ok_site_iso = (w_a != nullptr && w_b != nullptr && w_a->pid() != w_b->pid() &&
                                 app.site_isolated_worker_count() >= 3);
 
-            // El sandbox seccomp-BPF es una primitiva exclusiva del kernel de
-            // Linux. En otras plataformas ProcessSandbox informa "non-linux" y
-            // degrada sin bloquear: la prueba exige el filtro donde existe y,
-            // donde no, exige que el resto de la política siga aplicándose.
-            const bool linux_host = std::string(platform::os_name()) == "linux";
-            const bool sandbox_ok = linux_host
-                                        ? ok_seccomp
-                                        : (!ok_seccomp && seccomp_detail.find("non-linux") != std::string::npos);
+            // El confinamiento del proceso de contenido se exige en TODAS las
+            // plataformas soportadas, con la primitiva nativa de cada kernel:
+            // seccomp-BPF en Linux y un perfil Seatbelt en macOS. La prueba
+            // comprueba además que el canal IPC sobrevive al sandbox, porque un
+            // confinamiento que rompiera el IPC dejaría al navegador sin
+            // proceso de contenido y no valdría de nada.
+            const bool sandbox_ok = ok_seccomp;
             bool all49 = sandbox_ok && ok_csp && ok_csp_dom && ok_mixed && ok_cors && ok_samesite && ok_site_iso;
             if (!all49) {
-                std::cerr << "    [diag49] seccomp=" << ok_seccomp << "(" << seccomp_detail << ")"
+                std::cerr << "    [diag49] sandbox(" << SandboxReport::mechanism() << ")=" << ok_seccomp << "(" << seccomp_detail << ")"
                           << " csp=" << ok_csp << " csp_dom=" << ok_csp_dom
                           << " mixed=" << ok_mixed << " cors=" << ok_cors
                           << " samesite=" << ok_samesite << " site_iso=" << ok_site_iso << "\n";
             }
             expect(all49,
-                   "Hito C: Kernel seccomp-BPF sandbox (EPERM verificado en Linux; degradación segura fuera de él), "
-                   "CSP, Mixed Content, CORS/SOP, SameSite & Site Isolation");
+                   "Hito C: Kernel sandbox del proceso de contenido verificado con EPERM en la primitiva nativa "
+                   "(seccomp-BPF en Linux, Seatbelt en macOS) sin romper el IPC, CSP, Mixed Content, CORS/SOP, "
+                   "SameSite & Site Isolation");
         }
 
         // 50. Hito C — Adversarial Parser Fuzz-Resistance Harness + End-to-End astra_session9.html

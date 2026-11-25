@@ -140,7 +140,9 @@ bool WorkerProcess::spawn(const std::string& role, const std::function<void(IpcC
     if (pid < 0) return false;
 
     if (pid == 0) {
-        // Child worker process — engage kernel seccomp-BPF + PR_SET_NO_NEW_PRIVS + rlimits
+        // Child worker process — confinamiento con la primitiva nativa del
+        // kernel: seccomp-BPF + PR_SET_NO_NEW_PRIVS en Linux, perfil Seatbelt
+        // en macOS, más las guardas setrlimit en ambos.
         parent_end.close();
         if (role.rfind("rdd", 0) == 0) {
             (void)ProcessSandbox::apply(SandboxProfile::RddMediaWorker);

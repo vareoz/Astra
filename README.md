@@ -21,7 +21,10 @@ El árbol de código es portable: todas las divergencias de sistema operativo es
 ## Módulos principales
 
 - **Core, Memoria y Portabilidad (`src/core/`)**: `SlabArena` por pestaña basado en `mmap`/`munmap` con devolución inmediata de páginas al kernel (`MADV_DONTNEED` en Linux, `MADV_FREE` en Darwin), `MemoryGovernor` con lectura **real** de RSS por proceso (`/proc/<pid>/statm` en Linux, `proc_pid_rusage`/`proc_pidinfo` en macOS) y deshidratación LRU de pestañas, parser JSON RFC 8259 y **capa de portabilidad POSIX `platform.hpp`** (banderas de socket, semántica de `madvise`, nombres de biblioteca para `dlopen`).
-- **IPC Multiproceso y Sandbox de Kernel (`src/ipc/`)**: Aislamiento real mediante `fork()`, sockets binarios `AF_UNIX` (`Main`, `Content`, `RDD Media`), **Site Isolation por eTLD+1** (procesos de contenido dedicados por origen) y **sandbox real de kernel Linux (`ProcessSandbox`) con `PR_SET_NO_NEW_PRIVS`, `setrlimit` y filtro `seccomp-BPF`** (`SECCOMP_MODE_FILTER`) bloqueando con `EPERM` las syscalls `socket`/`connect`/`bind`/`listen`/`accept`/`ptrace`/`mount`/`chmod`/`chown` y (en `ContentWorker`) `execve`/`execveat`/`fork`/`vfork`/`kill`.
+- **IPC Multiproceso y Sandbox de Kernel (`src/ipc/`)**: Aislamiento real mediante `fork()`, sockets binarios `AF_UNIX` (`Main`, `Content`, `RDD Media`), **Site Isolation por eTLD+1** (procesos de contenido dedicados por origen) y **`ProcessSandbox` multiplataforma**, que confina a los workers con la primitiva nativa de cada kernel:
+  - **Linux**: `PR_SET_NO_NEW_PRIVS` + `setrlimit` + filtro **`seccomp-BPF`** (`SECCOMP_MODE_FILTER`) que devuelve `EPERM` en `socket`/`connect`/`bind`/`listen`/`accept`/`ptrace`/`mount`/`chmod`/`chown` y, en `ContentWorker`, también `execve`/`execveat`/`fork`/`vfork`/`kill`.
+  - **macOS**: `setrlimit` + perfil **Seatbelt** compilado con `sandbox_init` (SBPL). `(deny network*)` corta `connect()`/`bind()`, `(deny process-exec)` corta `execve()` y `(deny process-fork)` impide engendrar procesos. El worker `RddMediaWorker` conserva `process-exec` para el decodificador auxiliar, igual que en Linux.
+  - En ambas plataformas el `socketpair(AF_UNIX)` del canal IPC **sigue funcionando** tras el confinamiento: la suite lo comprueba como control positivo, porque un sandbox que rompiera el IPC dejaría al navegador sin proceso de contenido.
 - **Seguridad Web y Privacidad (`src/privacy/`)**:
   - **Motor de Políticas Web (`security_policy.*`)**: `SecurityOrigin` (Same-Origin Policy y clave `site_key()` eTLD+1), **`ContentSecurityPolicy` (CSP Nivel 2/3)** desde cabecera HTTP y `<meta http-equiv="Content-Security-Policy">` (control de `script-src`, `style-src`, `connect-src`, `default-src`, `'self'`, `'none'`, `'unsafe-inline'`, wildcards `*.dominio`), **`MixedContentBlocker`** (bloqueo de contenido activo `http://`/`ws://` desde documentos `https://`) y **`CorsEnforcer`** (`Access-Control-Allow-Origin`).
   - **`AstraShield`**: Total Cookie Protection particionado por `(top_level_site, origin)` con **aplicación real de `SameSite=Strict | Lax | None`** (rechazo de `SameSite=None` sin `Secure`), bloqueador Trie de rastreadores, limpieza de parámetros UTM/FBCLID, modo HTTPS-Only y cabeceras endurecidas (`Sec-GPC`).
@@ -65,6 +68,7 @@ Esta versión fusiona dos líneas de desarrollo que partían ambas de la v7: la 
 
 - **Compilación**: `g++ -std=c++20 -O2 -Wall -Wextra -pthread` en macOS 27.2 arm64 (Apple clang 21) — **0 errores, 0 warnings**.
 - **Suite de verificación (`--test`)**: **68 / 68 pruebas aprobadas** (43 de la v7 + 19 de la rama de web abierta + 6 de la rama de animación y portabilidad).
+- **Sandbox verificado a nivel de kernel en macOS**: `connect()=EPERM`, `bind()=EPERM`, `execve()=EPERM` y canal IPC `AF_UNIX` vivo, con el perfil Seatbelt activo en el proceso de contenido real.
 - **Prueba de estrés de 150 pestañas (`--stress-tabs 150 --cap 2048`)**:
   - 150 pestañas creadas en **620.6 ms** (**4.1 ms/pestaña**).
   - **RAM total real (suma del RSS de los 3 procesos)**: **19.95 MB / 2048 MB** (`main`: 14.81 MB + `content`: 4.05 MB + `rdd-media`: 1.09 MB — ~0.97 % del techo de 2 GB).
@@ -73,7 +77,7 @@ Esta versión fusiona dos líneas de desarrollo que partían ambas de la v7: la 
 
 ### Dos salvedades honestas sobre esta verificación
 
-1. **El sandbox `seccomp-BPF` no se ejerce en macOS.** Es una primitiva del kernel de Linux; `ProcessSandbox` informa `non-linux` y degrada sin bloquear. La prueba de seguridad exige el filtro donde existe y, fuera de él, que el resto de la política (CSP, Mixed Content, CORS/SOP, `SameSite`, Site Isolation) siga aplicándose — eso es lo verificado aquí. **En macOS el proceso de contenido corre sin sandbox**; falta un perfil equivalente con `sandbox_init`.
+1. **El sandbox de macOS usa API obsoleta y es lista de denegación, no de permiso.** `sandbox_init` está marcada como deprecada desde macOS 10.8, pero sigue siendo la única vía de confinar un binario sin empaquetar ni firmar, y es la que usaron históricamente los navegadores. El perfil parte de `(allow default)` y veta operaciones concretas — igual que el filtro seccomp de Linux deniega una lista de syscalls — así que es un confinamiento real pero más débil que una lista blanca. Además Darwin no tiene equivalente a `PR_SET_NO_NEW_PRIVS`.
 2. **`RegExp` se apoya en `std::regex`.** Los patrones llegan desde JS de páginas no confiables, y `std::regex` es conocido por desbordar la pila y por explosión exponencial ante patrones patológicos. El harness de fuzzing actual no cubre esa superficie.
 
 ## Resultados verificados (Sesión 9)

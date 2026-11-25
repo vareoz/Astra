@@ -30,7 +30,7 @@ After inspecting the Mozilla Firefox source tree (`ipc/docs/processes.md`, `layo
 
 | Módulo | Qué aporta |
 |---|---|
-| `ipc/sandbox.*` | `ProcessSandbox`: `PR_SET_NO_NEW_PRIVS`, `setrlimit` y filtro `seccomp-BPF` aplicado en el `fork()` de los workers (`ipc_channel.cpp`). Exclusivo de Linux; degrada de forma explícita en otros kernels. |
+| `ipc/sandbox.*` | `ProcessSandbox`: confinamiento del worker en el `fork()` (`ipc_channel.cpp`) con la primitiva nativa de cada kernel — `PR_SET_NO_NEW_PRIVS` + `setrlimit` + `seccomp-BPF` en Linux, `setrlimit` + perfil Seatbelt (`sandbox_init` con SBPL) en macOS. `self_verify()` lo comprueba con EPERM real y valida como control positivo que el IPC sobrevive. |
 | `privacy/security_policy.*` | `SecurityOrigin` (SOP + clave eTLD+1), `ContentSecurityPolicy` (cabecera y `<meta>`), `MixedContentBlocker` y `CorsEnforcer`, consultados en el camino de carga de recursos. |
 | `gfx/svg_engine.*` | Parser y rasterizador vectorial nativo de `<svg>` con supermuestreo 2x2. |
 | `style/animation_engine.*` | `@keyframes` con listas de fotogramas por propiedad, `transition` sobre valores calculados y curvas de temporización CSS exactas, conducidas por el reloj de `requestAnimationFrame`. |
@@ -47,7 +47,8 @@ Astra nació como motor nativo para Linux. A partir de la sesión 8 **las mismas
 | Supresión de `SIGPIPE` al escribir | `send(..., MSG_NOSIGNAL)` | `setsockopt(SO_NOSIGPIPE)` |
 | Devolución de páginas anónimas | `madvise(MADV_DONTNEED)` | `madvise(MADV_FREE)` |
 | RSS / VSIZE por proceso | `/proc/<pid>/statm` | `proc_pid_rusage` + `proc_pidinfo` (libproc) |
-| Bibliotecas por `dlopen` | `libssl.so.3`, `libz.so.1`, `libfreetype.so.6`, `libX11.so.6`, `libasound.so.2` | rutas absolutas de OpenSSL 3 / FreeType (Homebrew o MacPorts), `libz.1.dylib`, `/opt/X11` |
+| Bibliotecas por `dlopen` | `libssl.so.3`, `libz.so.1`, `libfreetype.so.6`, `libX11.so.6`, `libasound.so.2`, `libbrotlidec.so.1`, `libwebp.so.7` | rutas absolutas de OpenSSL 3 / FreeType / Brotli / WebP (Homebrew o MacPorts), `libz.1.dylib`, `/opt/X11` |
+| Sandbox del proceso | `seccomp-BPF` + `PR_SET_NO_NEW_PRIVS` | perfil Seatbelt vía `sandbox_init` (SBPL); sin equivalente a `no-new-privs` |
 | Enlazado de `dl*()` | `-ldl` | parte de `libSystem` (sin `-ldl`) |
 
 Dos detalles importantes del puerto a macOS:
