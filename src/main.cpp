@@ -2556,6 +2556,97 @@ int run_full_test_suite() {
                    "script-set cookies stay isolated per top-level site");
         }
 
+        // ---------------------------------------------------------------------
+        // 69. CSS Grid Level 1 — áreas con nombre (grid-template-areas/grid-area)
+        // ---------------------------------------------------------------------
+        {
+            // Reproduce la plantilla real con la que las skins modernas colocan
+            // barra lateral y contenido en columnas contiguas. El fallo que
+            // motivó esta prueba: los identificadores de área distinguen
+            // mayúsculas, y normalizarlos a minúsculas hacía que NINGÚN hijo
+            // casara con su área, apilándolos en vertical y empujando el
+            // contenido fuera del viewport.
+            SlabArena ga;
+            HtmlDocument gdoc = HtmlDocument::parse(ga,
+                "<html><head><style>"
+                "body { margin: 0; padding: 0; }"
+                ".page {"
+                "  display: grid; column-gap: 24px;"
+                "  grid-template: min-content 1fr min-content / 200px minmax(0, 1fr);"
+                "  grid-template-areas: 'siteNotice siteNotice' 'columnStart pageContent' 'footer footer';"
+                "}"
+                ".notice  { grid-area: siteNotice;  height: 40px; background: #111111; }"
+                ".side    { grid-area: columnStart; height: 90px; background: #222222; }"
+                ".main    { grid-area: pageContent; height: 90px; background: #333333; }"
+                ".foot    { grid-area: footer;      height: 30px; background: #444444; }"
+                "</style></head><body><div class=\"page\">"
+                // Orden del DOM a propósito distinto del orden visual:
+                // la colocación debe venir de la plantilla, no del flujo.
+                "<div class=\"foot\"></div>"
+                "<div class=\"main\"></div>"
+                "<div class=\"side\"></div>"
+                "<div class=\"notice\"></div>"
+                "</div></body></html>");
+            CssStylesheet gsheet;
+            gsheet.parse(gdoc.collect_stylesheets());
+            LayoutFrame* groot = LayoutEngine::build_layout(ga, gdoc, gsheet, 1024.0f, 600.0f);
+
+            const LayoutFrame* page = (groot && !groot->children.empty()) ? groot->children[0] : nullptr;
+            bool tpl_ok = page && page->style.display == DisplayType::Grid &&
+                          page->style.grid_areas.size() == 3 &&
+                          page->style.grid_areas[1].size() == 2 &&
+                          page->style.grid_areas[1][0] == "columnStart" &&
+                          page->style.grid_areas[1][1] == "pageContent" &&
+                          // `grid-template` tras la barra: 200px + minmax(0,1fr)
+                          page->style.grid_columns.size() == 2 &&
+                          !page->style.grid_columns[0].is_fr &&
+                          std::abs(page->style.grid_columns[0].value - 200.0f) < 0.5f &&
+                          page->style.grid_columns[1].is_fr;
+
+            const LayoutFrame *notice = nullptr, *side = nullptr, *main_c = nullptr, *foot = nullptr;
+            if (page) {
+                for (const LayoutFrame* c : page->children) {
+                    if (c->style.grid_area == "siteNotice") notice = c;
+                    else if (c->style.grid_area == "columnStart") side = c;
+                    else if (c->style.grid_area == "pageContent") main_c = c;
+                    else if (c->style.grid_area == "footer") foot = c;
+                }
+            }
+            bool found_all = notice && side && main_c && foot;
+
+            // Lo esencial: barra lateral y contenido COMPARTEN banda vertical
+            // (están uno al lado del otro), el aviso va encima y el pie debajo.
+            bool geometry_ok = false;
+            if (found_all) {
+                const float gap = 24.0f;
+                geometry_ok =
+                    std::abs(notice->border_box.y - 0.0f) < 1.0f &&
+                    std::abs(notice->border_box.w - (1024.0f - 0.0f)) < 2.0f &&   // abarca las 2 columnas
+                    std::abs(side->border_box.y - main_c->border_box.y) < 1.0f &&  // misma fila
+                    std::abs(side->border_box.w - 200.0f) < 1.0f &&                // pista fija
+                    main_c->border_box.x > side->border_box.x + side->border_box.w - 1.0f &&
+                    std::abs(main_c->border_box.x - (200.0f + gap)) < 1.5f &&      // tras el column-gap
+                    main_c->border_box.w > 700.0f &&                               // minmax(0,1fr) se lleva el resto
+                    foot->border_box.y > main_c->border_box.y + 80.0f;             // el pie, al final
+            }
+
+            if (!(tpl_ok && found_all && geometry_ok)) {
+                std::cerr << "    [diag69] tpl=" << tpl_ok << " found=" << found_all
+                          << " geom=" << geometry_ok << "\n";
+                if (page) std::cerr << "      page box=(" << page->border_box.x << "," << page->border_box.y
+                                    << " " << page->border_box.w << "x" << page->border_box.h
+                                    << ") areas=" << page->style.grid_areas.size()
+                                    << " cols=" << page->style.grid_columns.size() << "\n";
+                auto pb=[&](const char* n,const LayoutFrame* f){ if(f) std::cerr << "      " << n << " box=("
+                    << f->border_box.x << "," << f->border_box.y << " " << f->border_box.w
+                    << "x" << f->border_box.h << ")\n"; else std::cerr << "      " << n << " NULL\n"; };
+                pb("notice",notice); pb("side",side); pb("main",main_c); pb("foot",foot);
+            }
+            expect(tpl_ok && found_all && geometry_ok,
+                   "CSS Grid named areas (grid-template-areas + grid-area, case-sensitive idents, minmax() and "
+                   "grid-template shorthand) place a sidebar and content side by side instead of stacking them");
+        }
+
         app.stop_workers();
     }
 

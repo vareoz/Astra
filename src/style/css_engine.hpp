@@ -255,7 +255,17 @@ struct ComputedStyle {
     OverflowMode overflow = OverflowMode::Visible;
     BoxSizing box_sizing = BoxSizing::ContentBox;
     std::vector<GridTrack> grid_columns;
+    // Session 11 — CSS Grid Level 1 §7.3: plantilla de áreas con nombre del
+    // contenedor (`grid-template-areas`), una fila por cada cadena, y nombre
+    // del área que ocupa este elemento (`grid-area`). Es el mecanismo con el
+    // que las skins modernas colocan barra lateral y contenido en columnas.
+    std::vector<std::vector<std::string>> grid_areas;
+    std::string grid_area;
     float gap = 0.0f;
+    // `column-gap` / `row-gap` sobreescriben a `gap` en su eje cuando se
+    // declaran por separado; -1 significa "usa el valor de `gap`".
+    float column_gap = -1.0f;
+    float row_gap = -1.0f;
     float width = -1.0f;      // < 0 means auto
     float width_pct = -1.0f;  // >= 0 means percentage of containing width
     std::string width_calc;   // non-empty means calc(...) expression resolved against containing width

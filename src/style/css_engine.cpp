@@ -563,11 +563,45 @@ std::vector<GridTrack> parse_grid_tracks(std::string_view val) {
                 for (int i = 0; i < count; ++i) tracks.push_back(tr);
             }
             pos = rp + 1;
+        } else if (s.compare(pos, 7, "minmax(") == 0) {
+            // minmax(min, max): el tamaño que manda para repartir el espacio es
+            // el máximo, así que `minmax(0, 1fr)` se comporta como `1fr`.
+            int depth = 1;
+            size_t q = pos + 7;
+            while (q < s.size() && depth > 0) {
+                if (s[q] == '(') ++depth;
+                else if (s[q] == ')') --depth;
+                if (depth > 0) ++q;
+            }
+            std::string inner = s.substr(pos + 7, q - (pos + 7));
+            size_t comma = inner.rfind(',');
+            std::string upper = trim(comma == std::string::npos ? inner : inner.substr(comma + 1));
+            GridTrack tr;
+            if (upper.find("fr") != std::string::npos) {
+                tr.is_fr = true;
+                tr.value = std::max(0.1f, std::strtof(upper.c_str(), nullptr));
+            } else if (upper == "auto" || upper == "max-content" || upper == "min-content") {
+                tr.is_fr = true;
+                tr.value = 1.0f;
+            } else {
+                tr.is_fr = false;
+                tr.value = std::max(24.0f, StyleEngine::parse_px(upper, 120.0f));
+            }
+            tracks.push_back(tr);
+            pos = (q < s.size()) ? q + 1 : s.size();
         } else {
             size_t st = pos;
             while (pos < s.size() && !std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
             std::string tok = s.substr(st, pos - st);
             GridTrack tr;
+            if (tok == "min-content" || tok == "max-content" || tok == "fit-content") {
+                // Sin cálculo intrínseco de pistas, una pista de contenido se
+                // comporta como flexible: reparte lo que quede.
+                tr.is_fr = true;
+                tr.value = 1.0f;
+                tracks.push_back(tr);
+                continue;
+            }
             if (tok.find("fr") != std::string::npos) {
                 tr.is_fr = true;
                 tr.value = std::max(0.1f, std::strtof(tok.c_str(), nullptr));
@@ -637,6 +671,45 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
         else st.text_align = TextAlign::Left;
     } else if (p == "grid-template-columns") {
         st.grid_columns = parse_grid_tracks(v);
+    } else if (p == "grid-template-areas") {
+        // Cada cadena entrecomillada es una fila de la plantilla.
+        st.grid_areas.clear();
+        bool in_str = false;
+        char q = 0;
+        std::string cur;
+        for (char c : v) {
+            if (!in_str && (c == '"' || c == '\'')) { in_str = true; q = c; cur.clear(); }
+            else if (in_str && c == q) {
+                in_str = false;
+                std::vector<std::string> row = split_ws(cur);
+                if (!row.empty()) st.grid_areas.push_back(std::move(row));
+            } else if (in_str) cur.push_back(c);
+        }
+    } else if (p == "grid-template") {
+        // Atajo `filas / columnas`: las columnas son lo que hay tras la barra.
+        // Si además lleva cadenas, son áreas con nombre.
+        size_t slash = v.rfind('/');
+        if (slash != std::string::npos) {
+            st.grid_columns = parse_grid_tracks(std::string_view(v).substr(slash + 1));
+        }
+        if (v.find('"') != std::string::npos || v.find('\'') != std::string::npos) {
+            CssDeclaration areas{"grid-template-areas", v};
+            apply_declaration(st, areas);
+        }
+    } else if (p == "grid-area") {
+        // Forma corta con un único identificador (la que usan las skins).
+        // CSS Values §4.2: los identificadores de autor distinguen mayúsculas,
+        // así que aquí se usa el valor crudo y NO el normalizado a minúsculas:
+        // la plantilla declara `pageContent`, no `pagecontent`.
+        std::string name = trim(v);
+        if (!name.empty() && name.find('/') == std::string::npos &&
+            !std::isdigit(static_cast<unsigned char>(name[0]))) {
+            st.grid_area = name;
+        }
+    } else if (p == "column-gap" || p == "grid-column-gap") {
+        st.column_gap = std::max(0.0f, StyleEngine::parse_px(v, 0.0f));
+    } else if (p == "row-gap" || p == "grid-row-gap") {
+        st.row_gap = std::max(0.0f, StyleEngine::parse_px(v, 0.0f));
     } else if (p == "gap" || p == "grid-gap") {
         st.gap = StyleEngine::parse_px(v, 0.0f);
     } else if (p == "width") {

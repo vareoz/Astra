@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <map>
 #include <cstring>
 #include <cstdlib>
 
@@ -533,7 +534,10 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
         std::vector<GridTrack> cols = st.grid_columns;
         if (cols.empty()) cols = {GridTrack{1.0f, true}, GridTrack{1.0f, true}};
         size_t ncols = cols.size();
-        float total_gap = st.gap * static_cast<float>(ncols > 1 ? ncols - 1 : 0);
+        // Separación por eje: `column-gap`/`row-gap` mandan sobre `gap`.
+        const float cgap = (st.column_gap >= 0.0f) ? st.column_gap : st.gap;
+        const float rgap = (st.row_gap >= 0.0f) ? st.row_gap : st.gap;
+        float total_gap = cgap * static_cast<float>(ncols > 1 ? ncols - 1 : 0);
         float fixed_px = 0.0f;
         float total_fr = 0.0f;
         for (const auto& t : cols) {
@@ -549,8 +553,75 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
                            ? std::max(40.0f, (total_fr > 0.0f ? rem_w * (cols[c].value / total_fr) : 60.0f))
                            : cols[c].value;
             col_x[c] = cx;
-            cx += col_w[c] + st.gap;
+            cx += col_w[c] + cgap;
         }
+        // CSS Grid Level 1 §7.3 — colocación por áreas con nombre.
+        // Cuando el contenedor declara `grid-template-areas`, cada hijo con
+        // `grid-area: <nombre>` se coloca en el rectángulo de pistas que ocupa
+        // ese nombre en la plantilla, en vez de fluir secuencialmente. Es lo
+        // que permite que una barra lateral y el contenido queden en columnas
+        // contiguas en lugar de apilarse uno encima del otro.
+        bool placed_by_area = false;
+        if (!st.grid_areas.empty()) {
+            struct AreaRect { size_t r0, r1, c0, c1; };
+            std::map<std::string, AreaRect> areas;
+            for (size_t r = 0; r < st.grid_areas.size(); ++r) {
+                const auto& row = st.grid_areas[r];
+                for (size_t c = 0; c < row.size() && c < ncols; ++c) {
+                    const std::string& nm = row[c];
+                    if (nm.empty() || nm == ".") continue; // celda vacía
+                    auto it = areas.find(nm);
+                    if (it == areas.end()) {
+                        areas.emplace(nm, AreaRect{r, r, c, c});
+                    } else {
+                        it->second.r0 = std::min(it->second.r0, r);
+                        it->second.r1 = std::max(it->second.r1, r);
+                        it->second.c0 = std::min(it->second.c0, c);
+                        it->second.c1 = std::max(it->second.c1, c);
+                    }
+                }
+            }
+
+            // Reparte los hijos por fila de la plantilla; los que no nombran un
+            // área conocida se dejan para el flujo automático posterior.
+            std::vector<std::vector<LayoutFrame*>> rows(st.grid_areas.size());
+            std::vector<LayoutFrame*> unplaced;
+            for (LayoutFrame* ch : flow_children) {
+                auto it = ch->style.grid_area.empty() ? areas.end() : areas.find(ch->style.grid_area);
+                if (it == areas.end()) {
+                    unplaced.push_back(ch);
+                } else {
+                    rows[it->second.r0].push_back(ch);
+                }
+            }
+
+            if (rows.size() > 0) {
+                for (size_t r = 0; r < rows.size(); ++r) {
+                    if (rows[r].empty()) continue;
+                    float row_h = 0.0f;
+                    for (LayoutFrame* ch : rows[r]) {
+                        const AreaRect& ar = areas[ch->style.grid_area];
+                        const size_t c0 = std::min(ar.c0, ncols - 1);
+                        const size_t c1 = std::min(ar.c1, ncols - 1);
+                        // Ancho del área = pistas abarcadas + los gaps interiores.
+                        float span_w = 0.0f;
+                        for (size_t c = c0; c <= c1; ++c) span_w += col_w[c];
+                        span_w += cgap * static_cast<float>(c1 - c0);
+                        layout_node(ch, col_x[c0], cur_y, span_w, next_cb, viewport);
+                        float ch_h = ch->border_box.h + ch->style.margin.top + ch->style.margin.bottom;
+                        row_h = std::max(row_h, ch_h);
+                    }
+                    cur_y += row_h + rgap;
+                }
+                if (!rows.empty()) cur_y -= rgap;
+                placed_by_area = true;
+            }
+
+            // Los hijos sin área declarada siguen en flujo automático debajo.
+            flow_children.swap(unplaced);
+            if (!flow_children.empty() && placed_by_area) cur_y += rgap;
+        }
+
         size_t idx = 0;
         while (idx < flow_children.size()) {
             float row_h = 0.0f;
@@ -561,7 +632,7 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
                 row_h = std::max(row_h, ch_h);
             }
             cur_y += row_h;
-            if (idx < flow_children.size()) cur_y += st.gap;
+            if (idx < flow_children.size()) cur_y += rgap;
         }
     } else if (st.display == DisplayType::Flex && st.flex_direction == FlexDirection::Row && !flow_children.empty()) {
         auto intrinsic_html_w = [](const LayoutFrame* f) -> float {
