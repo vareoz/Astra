@@ -1249,7 +1249,12 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
         dl.items.push_back(std::move(sh));
     }
 
-    if (st.background_gradient.enabled && f->border_box.w > 0 && f->border_box.h > 0) {
+    // Un elemento con `mask-image` sin aplicar no debe pintar su fondo: el
+    // recorte es justo lo que le da forma de icono y, sin él, saldría un
+    // bloque de color macizo. Es preferible no dibujar nada.
+    const bool suppress_bg = st.has_unapplied_mask();
+
+    if (!suppress_bg && st.background_gradient.enabled && f->border_box.w > 0 && f->border_box.h > 0) {
         DisplayItem item;
         item.type = DisplayItemType::FillGradient;
         item.rect = f->border_box;
@@ -1261,7 +1266,7 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
         item.fixed_viewport = eff_fixed;
         attach_clip(item);
         dl.items.push_back(std::move(item));
-    } else if (st.background.a > 0 && f->border_box.w > 0 && f->border_box.h > 0) {
+    } else if (!suppress_bg && st.background.a > 0 && f->border_box.w > 0 && f->border_box.h > 0) {
         DisplayItem item;
         item.type = DisplayItemType::FillRect;
         item.rect = f->border_box;

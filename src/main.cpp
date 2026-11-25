@@ -2905,6 +2905,65 @@ int run_full_test_suite() {
                    "start of a line is dropped so wrapped lines are not indented");
         }
 
+        // ---------------------------------------------------------------------
+        // 73. Fondo enmascarado no pintado y currentColor
+        // ---------------------------------------------------------------------
+        {
+            // Los iconos de las skins modernas son un color de fondo recortado
+            // por `mask-image`. Sin aplicar la máscara, pintar el fondo entero
+            // daba un bloque macizo donde debía verse un icono: 365 reglas de
+            // este tipo en una sola hoja de Wikipedia, de ahí los cuadros
+            // negros. Mientras la máscara no se aplique, no se pinta el fondo.
+            SlabArena ma;
+            HtmlDocument mdoc = HtmlDocument::parse(ma,
+                "<html><head><style>"
+                "body { margin: 0; padding: 0; color: #336699; }"
+                ".icon { width: 18px; height: 18px; background: #202122;"
+                "        mask-image: url(/w/icon.svg); }"
+                ".plain { width: 18px; height: 18px; background: #202122; }"
+                ".tinted { width: 10px; height: 10px; background: currentColor; }"
+                "</style></head><body>"
+                "<div class=\"icon\"></div><div class=\"plain\"></div><div class=\"tinted\"></div>"
+                "</body></html>");
+            CssStylesheet msheet;
+            msheet.parse(mdoc.collect_stylesheets());
+            LayoutFrame* mroot = LayoutEngine::build_layout(ma, mdoc, msheet, 400.0f, 200.0f);
+
+            const LayoutFrame *icon = nullptr, *plain = nullptr, *tinted = nullptr;
+            if (mroot) {
+                for (const LayoutFrame* c : mroot->children) {
+                    if (!c->node || c->node->type != NodeType::Element) continue;
+                    const std::string cl = c->node->get_attr("class");
+                    if (cl == "icon") icon = c;
+                    else if (cl == "plain") plain = c;
+                    else if (cl == "tinted") tinted = c;
+                }
+            }
+            bool style_ok = icon && plain && tinted &&
+                            icon->style.has_unapplied_mask() &&
+                            !plain->style.has_unapplied_mask() &&
+                            // currentColor toma el valor calculado de `color`
+                            tinted->style.background.to_argb() == 0xFF336699u;
+
+            // El enmascarado no emite relleno; el normal sí.
+            DisplayList mdl = LayoutEngine::build_display_list(mroot, 400, 200);
+            int dark_fills = 0;
+            for (const auto& it : mdl.items) {
+                if (it.type == DisplayItemType::FillRect && it.color_argb == 0xFF202122u) ++dark_fills;
+            }
+            bool paint_ok = (dark_fills == 1); // sólo .plain
+
+            if (!(style_ok && paint_ok)) {
+                std::cerr << "    [diag73] style=" << style_ok << " dark_fills=" << dark_fills
+                          << " icon=" << (icon ? icon->style.mask_image : "(null)")
+                          << " tinted=" << (tinted ? tinted->style.background.to_argb() : 0) << "\n";
+            }
+
+            expect(style_ok && paint_ok,
+                   "An element whose background is shaped by an unapplied mask-image paints no solid block, "
+                   "and currentColor resolves to the computed color");
+        }
+
         app.stop_workers();
     }
 

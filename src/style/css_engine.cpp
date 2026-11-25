@@ -831,6 +831,15 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
         st.padding.left = StyleEngine::parse_px(v);
     } else if (p == "padding-right") {
         st.padding.right = StyleEngine::parse_px(v);
+    } else if ((p == "background" || p == "background-color" || p == "border-color" ||
+                p == "color") && vl == "currentcolor") {
+        // CSS Color §4.4: `currentColor` es el valor calculado de `color`.
+        if (p == "border-color") {
+            st.border_color = st.color;
+        } else if (p != "color") {
+            st.background = st.color;
+            st.background_gradient.enabled = false;
+        }
     } else if (p == "background" || p == "background-color" || p == "background-image") {
         size_t lg = vl.find("linear-gradient(");
         if (lg != std::string::npos) {
@@ -924,6 +933,11 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
                 }
             }
         }
+    } else if (p == "mask-image" || p == "-webkit-mask-image") {
+        st.mask_image = (vl == "none" || vl.empty()) ? std::string() : trim(v);
+    } else if (p == "mask" || p == "-webkit-mask") {
+        // Atajo: aquí sólo interesa saber si declara una imagen de máscara.
+        st.mask_image = (vl.find("url(") == std::string::npos) ? std::string() : trim(v);
     } else if (p == "border-color") {
         st.border_color = StyleEngine::parse_color(v, st.border_color);
     } else if (p == "border-width") {

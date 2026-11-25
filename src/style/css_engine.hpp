@@ -297,6 +297,13 @@ struct ComputedStyle {
     Color border_color{0, 0, 0, 0};
     float border_left_width = 0.0f;
     Color border_left_color{0, 0, 0, 0};
+    // `mask-image` recorta el fondo con la forma de una imagen. El motor aún
+    // no la aplica, pero sí registra su presencia: pintar el fondo entero de
+    // un elemento enmascarado produce un bloque de color macizo donde debería
+    // verse un icono, así que el compositor lo omite (ver has_unapplied_mask).
+    std::string mask_image;
+    bool has_unapplied_mask() const { return !mask_image.empty(); }
+
     Color background{0, 0, 0, 0};
     LinearGradient background_gradient;
     Color color{230, 234, 240, 255};
