@@ -39,7 +39,12 @@ enum class DisplayItemType : uint32_t {
     EmbedAudio = 9,
     FillGradient = 10,
     EmbedCanvas = 11,
-    EmbedSvg = 12
+    EmbedSvg = 12,
+    // Session 13: relleno recortado por una imagen de máscara. `color_argb`
+    // es el tinte y `text` la URL de la máscara; el compositor usa el canal
+    // alfa de esa imagen como cobertura. Es como se dibujan los iconos de las
+    // interfaces modernas (un color teñido a través de la forma de un SVG).
+    MaskedFill = 13
 };
 
 struct DisplayItem {

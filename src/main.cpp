@@ -3014,6 +3014,89 @@ int run_full_test_suite() {
                    "real shape instead of a solid block covering the whole surface");
         }
 
+        // ---------------------------------------------------------------------
+        // 75. mask-image: el icono se tiñe a través del alfa de la máscara
+        // ---------------------------------------------------------------------
+        {
+            // Las interfaces modernas dibujan sus iconos con un color de fondo
+            // recortado por `mask-image` (365 reglas así en una sola hoja de
+            // Wikipedia). El motor emite ahora un MaskedFill y el compositor
+            // pinta el tinte usando el alfa de la máscara como cobertura.
+            const std::string mask_svg =
+                "data:image/svg+xml,"
+                "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' width='20' height='20'%3E"
+                "%3Ccircle cx='10' cy='10' r='6' fill='%23000'/%3E%3C/svg%3E";
+
+            SlabArena ka;
+            HtmlDocument kdoc = HtmlDocument::parse(ka,
+                "<html><head><style>"
+                "body { margin: 0; padding: 0; background: #FFFFFF; }"
+                ".ico { width: 20px; height: 20px; background: #C83264;"
+                "       mask-image: url(\"" + mask_svg + "\"); }"
+                "</style></head><body><div class=\"ico\"></div></body></html>");
+            CssStylesheet ksheet;
+            ksheet.parse(kdoc.collect_stylesheets());
+            LayoutFrame* kroot = LayoutEngine::build_layout(ka, kdoc, ksheet, 100.0f, 60.0f);
+
+            const LayoutFrame* ico = (kroot && !kroot->children.empty()) ? kroot->children[0] : nullptr;
+            bool url_ok = ico && ico->style.mask_image.rfind("data:image/svg+xml", 0) == 0;
+
+            DisplayList kdl = LayoutEngine::build_display_list(kroot, 100, 60);
+            const DisplayItem* mf = nullptr;
+            int solid_fills = 0;
+            for (const auto& it : kdl.items) {
+                if (it.type == DisplayItemType::MaskedFill) mf = &it;
+                if (it.type == DisplayItemType::FillRect && it.color_argb == 0xFFC83264u) ++solid_fills;
+            }
+            // Se emite el item enmascarado y NO un relleno macizo del tinte.
+            bool item_ok = mf && solid_fills == 0 && mf->color_argb == 0xFFC83264u;
+
+            // Composición real: el centro queda teñido y las esquinas no,
+            // porque la máscara es un círculo inscrito.
+            bool paint_ok = false;
+            if (item_ok) {
+                Framebuffer kfb(100, 60);
+                kfb.clear(0xFFFFFFFFu);
+                kfb.composite_display_list(kdl, 0, 0.0f, nullptr,
+                                           [&](const std::string& src, DecodedImage& out) -> bool {
+                                               if (src.rfind("data:", 0) != 0) return false;
+                                               size_t comma = src.find(',');
+                                               if (comma == std::string::npos) return false;
+                                               // El payload viene percent-encoded.
+                                               std::string raw;
+                                               for (size_t i = comma + 1; i < src.size(); ++i) {
+                                                   if (src[i] == '%' && i + 2 < src.size()) {
+                                                       raw.push_back(static_cast<char>(
+                                                           std::stoi(src.substr(i + 1, 2), nullptr, 16)));
+                                                       i += 2;
+                                                   } else {
+                                                       raw.push_back(src[i]);
+                                                   }
+                                               }
+                                               out = ImageDecoder::decode_bytes(
+                                                   reinterpret_cast<const uint8_t*>(raw.data()), raw.size());
+                                               return out.valid;
+                                           });
+                const uint32_t* px = kfb.pixels();
+                auto at = [&](int x, int y) { return px[y * 100 + x]; };
+                const uint32_t centre = at(10, 10);
+                const uint32_t corner = at(1, 1);
+                auto is_tint = [](uint32_t c) {
+                    return ((c >> 16) & 0xFFu) > 170 && ((c >> 8) & 0xFFu) < 90 && (c & 0xFFu) > 70;
+                };
+                paint_ok = is_tint(centre) && corner == 0xFFFFFFFFu;
+            }
+
+            if (!(url_ok && item_ok && paint_ok)) {
+                std::cerr << "    [diag75] url=" << url_ok << " item=" << item_ok
+                          << " paint=" << paint_ok << " solid=" << solid_fills << "\n";
+            }
+
+            expect(url_ok && item_ok && paint_ok,
+                   "mask-image emits a MaskedFill instead of a solid block, and the compositor tints the "
+                   "element through the mask's alpha so the icon shape is drawn");
+        }
+
         app.stop_workers();
     }
 

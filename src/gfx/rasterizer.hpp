@@ -100,6 +100,13 @@ public:
     // al origen de la caja; un alfa 0 descarta el píxel.
     void fill_affine_box(const float m[6], float rx, float ry, float rw, float rh,
                          const std::function<uint32_t(float lx, float ly)>& shader);
+
+    // Session 13 — relleno recortado por una máscara. Pinta `argb_tint` usando
+    // como cobertura el canal alfa de `mask`, escalado a (w x h) con muestreo
+    // bilineal. Es la técnica con la que las interfaces modernas dibujan sus
+    // iconos: un color sólido a través de la silueta de un SVG.
+    void fill_masked_rect(int x, int y, int w, int h, uint32_t argb_tint,
+                          const uint32_t* mask, int mask_w, int mask_h);
     void draw_text(int x, int y, std::string_view text, uint32_t argb, float font_size,
                    bool bold = false, bool monospace = false);
     void blit_scaled(int dst_x, int dst_y, int dst_w, int dst_h,

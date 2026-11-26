@@ -302,6 +302,9 @@ struct ComputedStyle {
     // un elemento enmascarado produce un bloque de color macizo donde debería
     // verse un icono, así que el compositor lo omite (ver has_unapplied_mask).
     std::string mask_image;
+    // URL de `background-image: url(...)`. Se pinta como imagen sobre la caja;
+    // sin ella, un icono declarado así quedaba como un bloque de color.
+    std::string background_image;
     bool has_unapplied_mask() const { return !mask_image.empty(); }
 
     Color background{0, 0, 0, 0};

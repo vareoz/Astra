@@ -1249,10 +1249,21 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
         dl.items.push_back(std::move(sh));
     }
 
-    // Un elemento con `mask-image` sin aplicar no debe pintar su fondo: el
-    // recorte es justo lo que le da forma de icono y, sin él, saldría un
-    // bloque de color macizo. Es preferible no dibujar nada.
-    const bool suppress_bg = st.has_unapplied_mask();
+    // Un elemento con `mask-image` no pinta su fondo como bloque: emite un
+    // MaskedFill, que el compositor tiñe a través del alfa de la máscara.
+    const bool suppress_bg = st.has_unapplied_mask() || !st.background_image.empty();
+    if (suppress_bg && st.background.a > 0 && f->border_box.w > 0 && f->border_box.h > 0) {
+        DisplayItem item;
+        item.type = DisplayItemType::MaskedFill;
+        item.rect = f->border_box;
+        item.color_argb = apply_opacity(st.background.to_argb(), eff_opacity);
+        item.radius = st.border_radius;
+        item.z_index = eff_z;
+        item.fixed_viewport = eff_fixed;
+        item.text = st.mask_image;
+        attach_clip(item);
+        dl.items.push_back(std::move(item));
+    }
 
     if (!suppress_bg && st.background_gradient.enabled && f->border_box.w > 0 && f->border_box.h > 0) {
         DisplayItem item;
@@ -1274,6 +1285,21 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
         item.radius = st.border_radius;
         item.z_index = eff_z;
         item.fixed_viewport = eff_fixed;
+        attach_clip(item);
+        dl.items.push_back(std::move(item));
+    }
+
+    // Imagen de fondo: se dibuja sobre el color, escalada a la caja. Cubre los
+    // iconos que las interfaces declaran con `background-image` en vez de
+    // `mask-image`, que sin esto quedaban como un rectángulo de color.
+    if (!st.background_image.empty() && f->border_box.w > 0 && f->border_box.h > 0) {
+        DisplayItem item;
+        item.type = DisplayItemType::DrawImage;
+        item.rect = f->border_box;
+        item.z_index = eff_z;
+        item.fixed_viewport = eff_fixed;
+        item.text = st.background_image;
+        item.radius = st.border_radius;
         attach_clip(item);
         dl.items.push_back(std::move(item));
     }

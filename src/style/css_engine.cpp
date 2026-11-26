@@ -841,6 +841,21 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
             st.background_gradient.enabled = false;
         }
     } else if (p == "background" || p == "background-color" || p == "background-image") {
+        // `background-image: url(...)` se guarda para pintarlo; `none` lo borra.
+        if (p != "background-color") {
+            st.background_image.clear();
+            size_t up = v.find("url(");
+            if (up != std::string::npos) {
+                size_t close = v.find(')', up + 4);
+                if (close != std::string::npos) {
+                    std::string u = trim(v.substr(up + 4, close - (up + 4)));
+                    if (u.size() >= 2 && (u.front() == '"' || u.front() == '\'') && u.back() == u.front()) {
+                        u = u.substr(1, u.size() - 2);
+                    }
+                    st.background_image = trim(u);
+                }
+            }
+        }
         size_t lg = vl.find("linear-gradient(");
         if (lg != std::string::npos) {
             size_t start = lg + 16;
@@ -933,11 +948,22 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
                 }
             }
         }
-    } else if (p == "mask-image" || p == "-webkit-mask-image") {
-        st.mask_image = (vl == "none" || vl.empty()) ? std::string() : trim(v);
-    } else if (p == "mask" || p == "-webkit-mask") {
-        // Atajo: aquí sólo interesa saber si declara una imagen de máscara.
-        st.mask_image = (vl.find("url(") == std::string::npos) ? std::string() : trim(v);
+    } else if (p == "mask-image" || p == "-webkit-mask-image" || p == "mask" || p == "-webkit-mask") {
+        // Se guarda la URL ya desnuda: `url("x.svg")` -> `x.svg`. El
+        // compositor la resuelve con el mismo cargador de subrecursos que
+        // usan las <img>, así que admite rutas relativas, absolutas y data:.
+        st.mask_image.clear();
+        size_t up = v.find("url(");
+        if (up != std::string::npos && vl != "none") {
+            size_t close = v.find(')', up + 4);
+            if (close != std::string::npos) {
+                std::string u = trim(v.substr(up + 4, close - (up + 4)));
+                if (u.size() >= 2 && (u.front() == '"' || u.front() == '\'') && u.back() == u.front()) {
+                    u = u.substr(1, u.size() - 2);
+                }
+                st.mask_image = trim(u);
+            }
+        }
     } else if (p == "border-color") {
         st.border_color = StyleEngine::parse_color(v, st.border_color);
     } else if (p == "border-width") {

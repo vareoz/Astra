@@ -314,6 +314,51 @@ void Framebuffer::fill_affine_box(const float m[6], float rx, float ry, float rw
     }
 }
 
+void Framebuffer::fill_masked_rect(int x, int y, int w, int h, uint32_t argb_tint,
+                                   const uint32_t* mask, int mask_w, int mask_h) {
+    if (!mask || mask_w <= 0 || mask_h <= 0 || w <= 0 || h <= 0) return;
+
+    const uint32_t tint_a = (argb_tint >> 24) & 0xFFu;
+    if (tint_a == 0) return;
+    const uint32_t tint_rgb = argb_tint & 0x00FFFFFFu;
+
+    const int x0 = std::max(0, x), y0 = std::max(0, y);
+    const int x1 = std::min(width_, x + w), y1 = std::min(height_, y + h);
+    const float sx = static_cast<float>(mask_w) / static_cast<float>(w);
+    const float sy = static_cast<float>(mask_h) / static_cast<float>(h);
+
+    for (int py = y0; py < y1; ++py) {
+        // Centro del píxel de destino proyectado sobre la máscara.
+        const float my = (static_cast<float>(py - y) + 0.5f) * sy - 0.5f;
+        const int my0 = std::clamp(static_cast<int>(std::floor(my)), 0, mask_h - 1);
+        const int my1 = std::clamp(my0 + 1, 0, mask_h - 1);
+        const float fy = std::clamp(my - static_cast<float>(my0), 0.0f, 1.0f);
+
+        for (int px = x0; px < x1; ++px) {
+            const float mx = (static_cast<float>(px - x) + 0.5f) * sx - 0.5f;
+            const int mx0 = std::clamp(static_cast<int>(std::floor(mx)), 0, mask_w - 1);
+            const int mx1 = std::clamp(mx0 + 1, 0, mask_w - 1);
+            const float fx = std::clamp(mx - static_cast<float>(mx0), 0.0f, 1.0f);
+
+            // Interpolación bilineal del alfa: los iconos suelen venir a mayor
+            // resolución que su caja, y el filtrado evita bordes dentados.
+            const float a00 = static_cast<float>((mask[my0 * mask_w + mx0] >> 24) & 0xFFu);
+            const float a10 = static_cast<float>((mask[my0 * mask_w + mx1] >> 24) & 0xFFu);
+            const float a01 = static_cast<float>((mask[my1 * mask_w + mx0] >> 24) & 0xFFu);
+            const float a11 = static_cast<float>((mask[my1 * mask_w + mx1] >> 24) & 0xFFu);
+            const float top = a00 + (a10 - a00) * fx;
+            const float bot = a01 + (a11 - a01) * fx;
+            const float cov = top + (bot - top) * fy;
+            if (cov <= 1.0f) continue;
+
+            const uint32_t out_a =
+                static_cast<uint32_t>(std::lround(cov * static_cast<float>(tint_a) / 255.0f));
+            if (out_a == 0) continue;
+            blend_pixel(px, py, (std::min<uint32_t>(255u, out_a) << 24) | tint_rgb);
+        }
+    }
+}
+
 void Framebuffer::fill_gradient_rounded_rect(int x, int y, int w, int h, int radius,
                                              uint32_t start_argb, uint32_t end_argb, float angle_deg) {
     if (w <= 0 || h <= 0) return;
@@ -733,6 +778,22 @@ void Framebuffer::composite_display_list(const DisplayList& dl,
                                           light_bg ? 0xFF2563EBu : 0xFF38BDF8u);
                             }
                         }
+                    }
+                }
+                break;
+            }
+            case DisplayItemType::MaskedFill: {
+                // El tinte se pinta a través del alfa de la máscara. Si la
+                // máscara no se puede cargar no se dibuja nada: un bloque de
+                // color macizo se parecería mucho menos al icono ausente.
+                DecodedImage mk;
+                if (!item.text.empty() && image_provider && image_provider(item.text, mk) &&
+                    mk.valid && mk.width > 0 && mk.height > 0) {
+                    int cy = std::max(y_offset, iy);
+                    int ch = std::min(height_, iy + ih) - cy;
+                    if (ch > 0 && iw > 0) {
+                        fill_masked_rect(ix, iy, iw, ih, item.color_argb,
+                                         mk.argb.data(), mk.width, mk.height);
                     }
                 }
                 break;
