@@ -86,6 +86,12 @@ enum class TextAlign : uint8_t {
 struct GridTrack {
     float value = 1.0f;
     bool is_fr = true;
+    // `minmax(min, max)` con un max en longitud: la pista NO es rígida, puede
+    // encogerse si el contenedor no da para tanto.
+    float max_px = -1.0f;
+    // `min-content` / `max-content` / `fit-content` / `auto`: el tamaño sale
+    // del contenido, no del reparto del espacio libre.
+    bool content_sized = false;
 };
 
 enum class PositionType : uint8_t {

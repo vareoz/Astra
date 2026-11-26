@@ -3206,6 +3206,89 @@ int run_full_test_suite() {
                    "so a 25/50/25 twelve-column row keeps its real proportions");
         }
 
+        // ---------------------------------------------------------------------
+        // 78. Rejilla por fases y tablas sin filas (paridad con navegador real)
+        // ---------------------------------------------------------------------
+        {
+            // (a) Una caja `display: table` cuyos hijos NO son filas genera
+            // celdas anónimas: debe maquetarlos como un bloque. Sin esto, los
+            // <figure> de las fichas (que las wikis declaran `display: table`)
+            // colapsaban a la altura del borde y sus imágenes no se veían.
+            SlabArena ta;
+            HtmlDocument tdoc = HtmlDocument::parse(ta,
+                "<html><head><style>"
+                "body { margin: 0; padding: 0; }"
+                "figure { display: table; width: 300px; }"
+                "figure p { height: 60px; }"
+                "</style></head><body><figure><p>pie</p></figure></body></html>");
+            CssStylesheet tsheet;
+            tsheet.parse(tdoc.collect_stylesheets());
+            LayoutFrame* troot = LayoutEngine::build_layout(ta, tdoc, tsheet, 800.0f, 400.0f);
+            const LayoutFrame* fig = (troot && !troot->children.empty()) ? troot->children[0] : nullptr;
+            bool table_ok = fig && fig->style.display == DisplayType::Table &&
+                            fig->border_box.h > 50.0f &&          // no colapsa
+                            !fig->children.empty() &&
+                            fig->children[0]->border_box.h > 50.0f; // y maqueta al hijo
+
+            // (b) Reparto de pistas por fases: `min-content` se dimensiona por
+            // contenido y `minmax(0, X)` puede encogerse, de modo que una barra
+            // lateral quepa en lugar de quedarse sin espacio. Y un área que
+            // abarca varias filas no infla la altura de la primera.
+            SlabArena ga;
+            HtmlDocument gdoc = HtmlDocument::parse(ga,
+                "<html><head><style>"
+                "body { margin: 0; padding: 0; }"
+                ".page { display: grid; column-gap: 20px;"
+                "        grid-template: min-content min-content 1fr / minmax(0, 900px) min-content;"
+                "        grid-template-areas: 'head side' 'bar side' 'body side'; }"
+                ".head { grid-area: head; height: 30px; }"
+                ".bar  { grid-area: bar;  height: 20px; }"
+                ".body { grid-area: body; height: 40px; }"
+                ".side { grid-area: side; }"
+                "</style></head><body><div class=\"page\">"
+                "<div class=\"head\"></div><div class=\"bar\"></div>"
+                "<div class=\"body\"></div><div class=\"side\"></div>"
+                "</div></body></html>");
+            CssStylesheet gsheet;
+            gsheet.parse(gdoc.collect_stylesheets());
+            LayoutFrame* groot = LayoutEngine::build_layout(ga, gdoc, gsheet, 800.0f, 400.0f);
+            const LayoutFrame* page = (groot && !groot->children.empty()) ? groot->children[0] : nullptr;
+
+            const LayoutFrame *head = nullptr, *bar = nullptr, *side = nullptr;
+            if (page) {
+                for (const LayoutFrame* c : page->children) {
+                    if (c->style.grid_area == "head") head = c;
+                    else if (c->style.grid_area == "bar") bar = c;
+                    else if (c->style.grid_area == "side") side = c;
+                }
+            }
+            bool grid_ok = false;
+            if (head && bar && side) {
+                grid_ok =
+                    // la barra lateral recibe ancho real, no el mínimo de 40px
+                    side->border_box.w > 100.0f &&
+                    // y cabe dentro del contenedor junto a la columna principal
+                    (side->border_box.x + side->border_box.w) <= 800.0f + 1.0f &&
+                    // el área que abarca 3 filas no empuja la segunda fila:
+                    // `bar` debe ir justo debajo de `head` (30px), no detrás
+                    // de toda la altura de la barra lateral
+                    std::abs(bar->border_box.y - (head->border_box.y + 30.0f)) < 2.0f;
+            }
+
+            if (!(table_ok && grid_ok)) {
+                std::cerr << "    [diag78] table=" << table_ok << " grid=" << grid_ok << "\n";
+                if (fig) std::cerr << "      figure h=" << fig->border_box.h << "\n";
+                if (head) std::cerr << "      head y=" << head->border_box.y << "\n";
+                if (bar) std::cerr << "      bar  y=" << bar->border_box.y << "\n";
+                if (side) std::cerr << "      side x=" << side->border_box.x
+                                    << " w=" << side->border_box.w << "\n";
+            }
+
+            expect(table_ok && grid_ok,
+                   "A display:table box without rows lays out its children as a block, and grid tracks size in "
+                   "phases so a min-content sidebar fits while a row-spanning area does not inflate its first row");
+        }
+
         app.stop_workers();
     }
 

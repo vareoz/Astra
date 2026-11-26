@@ -602,11 +602,15 @@ std::vector<GridTrack> parse_grid_tracks(std::string_view val) {
                 tr.is_fr = true;
                 tr.value = std::max(0.1f, std::strtof(upper.c_str(), nullptr));
             } else if (upper == "auto" || upper == "max-content" || upper == "min-content") {
-                tr.is_fr = true;
-                tr.value = 1.0f;
+                tr.content_sized = true;
+                tr.is_fr = false;
+                tr.value = 0.0f;
             } else {
+                // El máximo es un tope, no un tamaño rígido: la pista puede
+                // encogerse si el contenedor no alcanza.
                 tr.is_fr = false;
                 tr.value = std::max(24.0f, StyleEngine::parse_px(upper, 120.0f));
+                tr.max_px = tr.value;
             }
             tracks.push_back(tr);
             pos = (q < s.size()) ? q + 1 : s.size();
@@ -615,11 +619,12 @@ std::vector<GridTrack> parse_grid_tracks(std::string_view val) {
             while (pos < s.size() && !std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
             std::string tok = s.substr(st, pos - st);
             GridTrack tr;
-            if (tok == "min-content" || tok == "max-content" || tok == "fit-content") {
-                // Sin cálculo intrínseco de pistas, una pista de contenido se
-                // comporta como flexible: reparte lo que quede.
-                tr.is_fr = true;
-                tr.value = 1.0f;
+            if (tok == "min-content" || tok == "max-content" || tok == "fit-content" || tok == "auto") {
+                // Pista dimensionada por su contenido: se reserva antes de
+                // repartir el espacio libre entre las pistas flexibles.
+                tr.content_sized = true;
+                tr.is_fr = false;
+                tr.value = 0.0f;
                 tracks.push_back(tr);
                 continue;
             }

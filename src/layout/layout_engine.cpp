@@ -508,7 +508,25 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
     Rect next_cb = (st.position != PositionType::Static) ? frame->border_box : containing_block;
     float cur_y = frame->content_box.y;
 
+    // CSS Tables §2: una caja `display: table` cuyos hijos NO son filas genera
+    // celdas y filas anónimas, es decir, se comporta como un bloque. Sin esto
+    // el motor no maquetaba a sus hijos y la caja colapsaba a la altura del
+    // borde: por eso los `<figure>` de las fichas (que las wikis declaran
+    // `display: table`) salían de 2px y sus imágenes no aparecían.
+    bool table_has_rows = false;
     if (st.display == DisplayType::Table && !flow_children.empty()) {
+        std::function<void(const LayoutFrame*)> probe_rows = [&](const LayoutFrame* n) {
+            if (!n || table_has_rows) return;
+            if (n->style.display == DisplayType::TableRow || (n->node && n->node->tag == "tr")) {
+                table_has_rows = true;
+                return;
+            }
+            for (const LayoutFrame* c : n->children) probe_rows(c);
+        };
+        for (const LayoutFrame* ch : flow_children) probe_rows(ch);
+    }
+
+    if (st.display == DisplayType::Table && table_has_rows && !flow_children.empty()) {
         // Collect all <tr> rows (flattening <thead>/<tbody>/<tfoot> wrappers)
         std::vector<LayoutFrame*> rows;
         std::function<void(LayoutFrame*)> collect_rows = [&](LayoutFrame* n) {
@@ -606,20 +624,65 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
         const float cgap = (st.column_gap >= 0.0f) ? st.column_gap : st.gap;
         const float rgap = (st.row_gap >= 0.0f) ? st.row_gap : st.gap;
         float total_gap = cgap * static_cast<float>(ncols > 1 ? ncols - 1 : 0);
+        // CSS Grid §12: el reparto va por fases. Primero las pistas
+        // dimensionadas por contenido (`min-content`, `auto`), luego las de
+        // tamaño fijo —que pueden encogerse si venían de un `minmax()`— y por
+        // último las flexibles se llevan lo que quede.
+        std::vector<float> col_w(ncols, 60.0f);
+        std::vector<float> col_x(ncols, frame->content_box.x);
+
+        // Fase 1: pistas por contenido. Sin dimensionado intrínseco, se usa el
+        // ancho declarado del ítem que ocupa la pista y, si no lo declara, una
+        // fracción acotada del contenedor. Es una aproximación, pero evita que
+        // una barra lateral se quede sin sitio o se lo coma todo.
+        float content_px = 0.0f;
+        for (size_t c = 0; c < ncols; ++c) {
+            if (!cols[c].content_sized) continue;
+            float want = 0.0f;
+            for (const LayoutFrame* ch : flow_children) {
+                if (ch->style.width > 0.0f) { want = std::max(want, ch->style.width); }
+            }
+            if (want <= 0.0f) want = std::clamp(inner_w * 0.25f, 120.0f, 320.0f);
+            col_w[c] = want;
+            content_px += want;
+        }
+
+        // Fase 2: pistas fijas. Si no caben, las que vienen de un `minmax()`
+        // se encogen a prorrata en lugar de desbordar el contenedor.
         float fixed_px = 0.0f;
+        float shrinkable_px = 0.0f;
         float total_fr = 0.0f;
         for (const auto& t : cols) {
             if (t.is_fr) total_fr += t.value;
-            else fixed_px += t.value;
+            else if (!t.content_sized) {
+                fixed_px += t.value;
+                if (t.max_px > 0.0f) shrinkable_px += t.value;
+            }
         }
-        float rem_w = std::max(0.0f, inner_w - total_gap - fixed_px);
-        std::vector<float> col_w(ncols, 60.0f);
-        std::vector<float> col_x(ncols, frame->content_box.x);
+        const float avail_tracks = std::max(0.0f, inner_w - total_gap - content_px);
+        float shrink_scale = 1.0f;
+        if (fixed_px > avail_tracks && shrinkable_px > 0.0f) {
+            const float rigid_px = fixed_px - shrinkable_px;
+            const float room = std::max(0.0f, avail_tracks - rigid_px);
+            shrink_scale = std::clamp(room / shrinkable_px, 0.0f, 1.0f);
+        }
+
+        float used_fixed = 0.0f;
+        for (size_t c = 0; c < ncols; ++c) {
+            if (cols[c].is_fr || cols[c].content_sized) continue;
+            col_w[c] = (cols[c].max_px > 0.0f) ? cols[c].value * shrink_scale : cols[c].value;
+            used_fixed += col_w[c];
+        }
+
+        // Fase 3: las flexibles reparten el sobrante.
+        const float rem_w = std::max(0.0f, avail_tracks - used_fixed);
+        for (size_t c = 0; c < ncols; ++c) {
+            if (!cols[c].is_fr) continue;
+            col_w[c] = std::max(40.0f, (total_fr > 0.0f ? rem_w * (cols[c].value / total_fr) : 60.0f));
+        }
+
         float cx = frame->content_box.x;
         for (size_t c = 0; c < ncols; ++c) {
-            col_w[c] = cols[c].is_fr
-                           ? std::max(40.0f, (total_fr > 0.0f ? rem_w * (cols[c].value / total_fr) : 60.0f))
-                           : cols[c].value;
             col_x[c] = cx;
             cx += col_w[c] + cgap;
         }
@@ -675,7 +738,15 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
                         float span_w = 0.0f;
                         for (size_t c = c0; c <= c1; ++c) span_w += col_w[c];
                         span_w += cgap * static_cast<float>(c1 - c0);
-                        layout_node(ch, col_x[c0], cur_y, span_w, next_cb, viewport);
+                        layout_node(ch, col_x[c0], cur_y, span_w, next_cb, viewport,
+                                    ch->style.width_pct >= 0.0f || !ch->style.width_calc.empty());
+                        // CSS Grid §7.3: un área que abarca VARIAS filas no fija
+                        // la altura de la primera; su alto se reparte entre todas
+                        // las que ocupa. Contarlo en la fila r0 empujaba el resto
+                        // de la página hacia abajo tanto como midiera esa área
+                        // (la columna lateral de 113px dejaba un hueco de 120px
+                        // entre el título y la barra de pestañas).
+                        if (ar.r1 > ar.r0) continue;
                         float ch_h = ch->border_box.h + ch->style.margin.top + ch->style.margin.bottom;
                         row_h = std::max(row_h, ch_h);
                     }
