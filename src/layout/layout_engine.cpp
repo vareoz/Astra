@@ -342,8 +342,14 @@ LayoutFrame* build_frame_tree(SlabArena& arena,
     return f;
 }
 
+// `width_pre_resolved` indica que `avail_w` NO es el ancho disponible del
+// bloque contenedor sino el ancho que ya se calculó para esta caja (floats,
+// ítems flex, cajas en línea). Sin esta distinción, un `width: 25%` se
+// aplicaba DOS veces: una al medir el ítem contra su contenedor y otra aquí
+// sobre el resultado, dejando las columnas a un tercio de su tamaño.
 void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
-                 const Rect& containing_block, const Rect& viewport) {
+                 const Rect& containing_block, const Rect& viewport,
+                 bool width_pre_resolved = false) {
     if (!frame) return;
     const ComputedStyle& st = frame->style;
 
@@ -364,7 +370,15 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
 
     float box_w = max_avail;
     float resolved_width = st.width;
-    if (!st.width_calc.empty()) {
+    if (width_pre_resolved) {
+        // El llamante ya resolvió el porcentaje o el calc() contra el bloque
+        // contenedor: `avail_w` es el ancho final de esta caja.
+        if (st.width_pct >= 0.0f || !st.width_calc.empty()) {
+            resolved_width = (st.box_sizing == BoxSizing::BorderBox)
+                                 ? max_avail
+                                 : std::max(0.0f, max_avail - horiz_extra);
+        }
+    } else if (!st.width_calc.empty()) {
         resolved_width = StyleEngine::eval_calc(st.width_calc, max_avail, viewport.w, -1.0f);
     } else if (st.width_pct >= 0.0f) {
         resolved_width = max_avail * st.width_pct * 0.01f;
@@ -711,6 +725,17 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
                 if (cs.flex_basis >= 0.0f) {
                     float bw = (cs.box_sizing == BoxSizing::BorderBox) ? cs.flex_basis : (cs.flex_basis + extra);
                     item_w[i] = std::min(inner_w, bw + cs.margin.left + cs.margin.right);
+                } else if (cs.width_pct >= 0.0f || !cs.width_calc.empty()) {
+                    // CSS Flexbox §9.2: un ancho en porcentaje (o calc) de un
+                    // ítem se resuelve contra el tamaño interior del
+                    // contenedor. Sin esta rama caía al respaldo fijo y las
+                    // rejillas de 12 columnas quedaban en ~160px.
+                    float pw = !cs.width_calc.empty()
+                                   ? StyleEngine::eval_calc(cs.width_calc, inner_w, viewport.w, -1.0f)
+                                   : inner_w * cs.width_pct * 0.01f;
+                    if (pw < 0.0f) pw = inner_w * 0.5f;
+                    float bw = (cs.box_sizing == BoxSizing::BorderBox) ? pw : (pw + extra);
+                    item_w[i] = std::min(inner_w, bw + cs.margin.left + cs.margin.right);
                 } else if (cs.width > 0.0f) {
                     float bw = (cs.box_sizing == BoxSizing::BorderBox) ? cs.width : (cs.width + extra);
                     item_w[i] = std::min(inner_w, bw + cs.margin.left + cs.margin.right);
@@ -776,7 +801,7 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
                 float row_h = 0.0f;
                 for (size_t j = row_start; j < idx; ++j) {
                     LayoutFrame* ch = flow_children[j];
-                    layout_node(ch, cur_x, cur_y, item_w[j], next_cb, viewport);
+                    layout_node(ch, cur_x, cur_y, item_w[j], next_cb, viewport, true);
                     float ch_h = ch->border_box.h + ch->style.margin.top + ch->style.margin.bottom;
                     row_h = std::max(row_h, ch_h);
                     cur_x += item_w[j] + gap_x;
@@ -800,7 +825,9 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
         bool has_flex_grow = false;
         for (LayoutFrame* ch : flow_children) {
             if (ch->style.flex_grow > 0.0f) has_flex_grow = true;
-            if (ch->style.width > 0.0f || ch->style.flex_basis >= 0.0f || intrinsic_html_w(ch) > 0.0f) {
+            if (ch->style.width > 0.0f || ch->style.flex_basis >= 0.0f ||
+                ch->style.width_pct >= 0.0f || !ch->style.width_calc.empty() ||
+                intrinsic_html_w(ch) > 0.0f) {
                 has_explicit_w = true;
             }
         }
@@ -829,6 +856,14 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
                 float attr_w = intrinsic_html_w(flow_children[i]);
                 if (cs.flex_basis >= 0.0f) {
                     float bw = (cs.box_sizing == BoxSizing::BorderBox) ? cs.flex_basis : (cs.flex_basis + extra);
+                    child_w[i] = bw + cs.margin.left + cs.margin.right;
+                    used_w += child_w[i];
+                } else if (cs.width_pct >= 0.0f || !cs.width_calc.empty()) {
+                    float pw = !cs.width_calc.empty()
+                                   ? StyleEngine::eval_calc(cs.width_calc, inner_w, viewport.w, -1.0f)
+                                   : inner_w * cs.width_pct * 0.01f;
+                    if (pw < 0.0f) pw = inner_w * 0.5f;
+                    float bw = (cs.box_sizing == BoxSizing::BorderBox) ? pw : (pw + extra);
                     child_w[i] = bw + cs.margin.left + cs.margin.right;
                     used_w += child_w[i];
                 } else if (cs.width > 0.0f) {
@@ -902,7 +937,7 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
             float cur_x = start_x;
             for (size_t i = 0; i < count; ++i) {
                 LayoutFrame* ch = flow_children[i];
-                layout_node(ch, cur_x, cur_y, child_w[i], next_cb, viewport);
+                layout_node(ch, cur_x, cur_y, child_w[i], next_cb, viewport, true);
                 float ch_total_h = ch->border_box.h + ch->style.margin.top + ch->style.margin.bottom;
                 max_h = std::max(max_h, ch_total_h);
                 cur_x += child_w[i] + item_gap;
@@ -1003,7 +1038,7 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
                 float fx = (cs.float_mode == FloatMode::Left)
                                ? (frame->content_box.x + left_float_w)
                                : (frame->content_box.x + inner_w - right_float_w - fw);
-                layout_node(ch, fx, cur_y, fw, next_cb, viewport);
+                layout_node(ch, fx, cur_y, fw, next_cb, viewport, true);
                 float end_y = ch->border_box.y + ch->border_box.h + cs.margin.bottom;
                 float used_w = ch->border_box.w + cs.margin.left + cs.margin.right;
                 if (cs.float_mode == FloatMode::Left) {
@@ -1065,7 +1100,7 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
                             line_right = avail_x + avail_line_w;
                             iw = measure_inline_w(ich, avail_line_w);
                         }
-                        layout_node(ich, line_x, cur_y, iw, next_cb, viewport);
+                        layout_node(ich, line_x, cur_y, iw, next_cb, viewport, true);
 
                         // CSS Text §4.1.1: el espacio que queda al PRINCIPIO de
                         // una línea se elimina. Conservarlo (necesario entre

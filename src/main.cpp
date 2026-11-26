@@ -3149,6 +3149,63 @@ int run_full_test_suite() {
                    "and the properties declared after it still apply");
         }
 
+        // ---------------------------------------------------------------------
+        // 77. Anchos en porcentaje dentro de un contenedor flex
+        // ---------------------------------------------------------------------
+        {
+            // Las rejillas de 12 columnas (Primer, Bootstrap...) son ítems flex
+            // con `width: 25%` / `50%`. El bucle que mide los ítems no
+            // contemplaba el porcentaje, así que caían a un respaldo fijo de
+            // 160px y las tres columnas de la página quedaban aplastadas.
+            SlabArena pa;
+            HtmlDocument pdoc = HtmlDocument::parse(pa,
+                "<html><head><style>"
+                "body { margin: 0; padding: 0; }"
+                "* { box-sizing: border-box; }"
+                ".row { display: flex; flex-wrap: wrap; width: 1200px; }"
+                ".a { width: 25%; height: 20px; }"
+                ".b { width: 50%; height: 20px; }"
+                ".c { width: 25%; height: 20px; }"
+                "</style></head><body><div class=\"row\">"
+                "<div class=\"a\"></div><div class=\"b\"></div><div class=\"c\"></div>"
+                "</div></body></html>");
+            CssStylesheet psheet;
+            psheet.parse(pdoc.collect_stylesheets());
+            LayoutFrame* proot = LayoutEngine::build_layout(pa, pdoc, psheet, 1400.0f, 400.0f);
+            const LayoutFrame* row = (proot && !proot->children.empty()) ? proot->children[0] : nullptr;
+
+            bool cols_ok = false;
+            if (row && row->children.size() == 3) {
+                const LayoutFrame* A = row->children[0];
+                const LayoutFrame* B = row->children[1];
+                const LayoutFrame* C = row->children[2];
+                cols_ok = std::abs(A->border_box.w - 300.0f) < 2.0f &&   // 25% de 1200
+                          std::abs(B->border_box.w - 600.0f) < 2.0f &&   // 50%
+                          std::abs(C->border_box.w - 300.0f) < 2.0f &&   // 25%
+                          // y van contiguas en la misma fila, sin apilarse
+                          std::abs(A->border_box.y - B->border_box.y) < 1.0f &&
+                          std::abs(B->border_box.y - C->border_box.y) < 1.0f &&
+                          B->border_box.x > A->border_box.x &&
+                          C->border_box.x > B->border_box.x;
+            }
+
+            // El porcentaje se aplica UNA sola vez: antes se resolvía al medir
+            // el ítem y otra vez al maquetarlo, dejando un tercio del ancho.
+            bool single_pass = row && row->children.size() == 3 &&
+                               row->children[1]->border_box.w > 400.0f;
+
+            if (!(cols_ok && single_pass)) {
+                std::cerr << "    [diag77] cols=" << cols_ok << " single=" << single_pass << "\n";
+                if (row) for (const LayoutFrame* c : row->children)
+                    std::cerr << "      col x=" << c->border_box.x << " y=" << c->border_box.y
+                              << " w=" << c->border_box.w << " pct=" << c->style.width_pct << "\n";
+            }
+
+            expect(cols_ok && single_pass,
+                   "Percentage widths on flex items resolve against the container's inner size exactly once, "
+                   "so a 25/50/25 twelve-column row keeps its real proportions");
+        }
+
         app.stop_workers();
     }
 
