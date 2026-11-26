@@ -334,6 +334,9 @@ struct ComputedStyle {
     bool bold = false;
     bool monospace = false;
     float line_height = 1.48f;
+    // true cuando el autor declaró `line-height`. Si no, la altura de línea
+    // sale de las métricas de la fuente, como hace `normal`.
+    bool line_height_specified = false;
     bool has_content = false;
     std::string content_text;
     Transform2D transform;

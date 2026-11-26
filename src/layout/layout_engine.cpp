@@ -17,6 +17,16 @@ float line_height_for_size(float font_size) {
     return FontEngine::instance().line_height(font_size);
 }
 
+// Altura de línea efectiva: la declarada por el autor (un multiplicador del
+// tamaño de fuente) y, si no la hay, la que dictan las métricas de la fuente,
+// que es el comportamiento de `line-height: normal`.
+float effective_line_height(const ComputedStyle& st) {
+    if (st.line_height_specified && st.line_height > 0.0f) {
+        return st.font_size * st.line_height;
+    }
+    return line_height_for_size(st.font_size);
+}
+
 uint32_t apply_opacity(uint32_t argb, float opacity) {
     if (opacity >= 0.999f) return argb;
     uint32_t a = (argb >> 24) & 0xFFu;
@@ -461,7 +471,7 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
             return;
         }
         if (tag == "br") {
-            float lh = line_height_for_size(st.font_size);
+            float lh = effective_line_height(st);
             frame->content_box.w = 0.0f;
             frame->content_box.h = lh * 0.5f;
             frame->border_box.w = 0.0f;
@@ -491,7 +501,7 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
         }
         frame->wrapped_lines = wrap_text(frame->node->text, inner_w, st.font_size, st.bold, st.monospace,
                                          keep_lead, keep_trail);
-        float lh = line_height_for_size(st.font_size);
+        float lh = effective_line_height(st);
         frame->content_box.h = static_cast<float>(frame->wrapped_lines.size()) * lh;
         frame->border_box.h = frame->content_box.h;
         return;
@@ -1594,7 +1604,7 @@ void emit_display_items(const LayoutFrame* f, DisplayList& dl,
     }
 
     if (f->node && f->node->type == NodeType::Text && !f->wrapped_lines.empty()) {
-        float lh = line_height_for_size(st.font_size);
+        float lh = effective_line_height(st);
         float ty = f->content_box.y;
         auto& fe = FontEngine::instance();
         for (const auto& line : f->wrapped_lines) {

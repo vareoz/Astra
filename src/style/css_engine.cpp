@@ -1097,6 +1097,40 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
         // acotado frente a valores hostiles.
         st.font_size = std::clamp(resolve_font_size(vl, v, st.parent_font_size, st.font_size),
                                   6.0f, 160.0f);
+    } else if (p == "line-height") {
+        // CSS Inline §4.3. `st.line_height` es un MULTIPLICADOR del tamaño de
+        // fuente, así que las longitudes y porcentajes se convierten a esa
+        // forma. Hasta ahora la propiedad se ignoraba por completo y todo el
+        // texto heredaba el valor fijo del motor, con lo que la altura de los
+        // bloques no coincidía con la del navegador de referencia.
+        const std::string lv = trim(vl);
+        st.line_height_specified = true;
+        if (lv == "normal") {
+            st.line_height_specified = false; // vuelve a las métricas de la fuente
+        } else if (lv == "inherit" || lv == "unset") {
+            // se queda con el heredado
+        } else {
+            char* lend = nullptr;
+            const float lnum = std::strtof(lv.c_str(), &lend);
+            if (lend != lv.c_str() && lnum > 0.0f) {
+                const std::string lunit = trim(std::string(lend));
+                const float base = (st.font_size > 0.0f) ? st.font_size : 16.0f;
+                if (lunit.empty()) {
+                    st.line_height = lnum;                       // número sin unidad
+                } else if (lunit == "%") {
+                    st.line_height = lnum / 100.0f;
+                } else if (lunit == "em") {
+                    st.line_height = lnum;                       // em sobre el propio tamaño
+                } else if (lunit == "rem") {
+                    st.line_height = (lnum * 16.0f) / base;
+                } else if (lunit == "pt") {
+                    st.line_height = (lnum * (96.0f / 72.0f)) / base;
+                } else {
+                    st.line_height = StyleEngine::parse_px(lv, base) / base;
+                }
+                st.line_height = std::clamp(st.line_height, 0.6f, 4.0f);
+            }
+        }
     } else if (p == "font-weight") {
         st.bold = (vl == "bold" || vl == "600" || vl == "700" || vl == "800" || vl == "900");
     } else if (p == "font-family") {
@@ -1189,14 +1223,18 @@ void apply_ua_defaults(const DomNode* node, ComputedStyle& st, bool light_web_de
         // Las hojas de agente de usuario reales NO fijan `font-size` en <body>:
         // hereda el valor inicial `medium` (16px). Fijarlo aquí encogía todo el
         // documento respecto al navegador de referencia.
+        // Las hojas de agente de usuario reales separan <body> del borde con
+        // MARGIN (8px), no con padding. La diferencia importa: los sitios
+        // resetean `body { margin: 0 }`, que es lo habitual, y un padding
+        // nuestro sobrevivía a ese reset desplazando toda la página 20px a la
+        // derecha y estrechando la columna de contenido 40px.
+        st.margin = {8, 8, 8, 8};
         if (light_web_default) {
             st.background = Color{255, 255, 255, 255};
             st.color = Color{17, 24, 39, 255};
-            st.padding = {12, 20, 20, 20};
         } else {
             st.background = Color{13, 17, 24, 255};
             st.color = Color{226, 232, 240, 255};
-            st.padding = {24, 28, 28, 28};
         }
     } else if (t == "h1") {
         // Los tamaños de cabecera de la hoja de agente de usuario son
@@ -1898,6 +1936,7 @@ ComputedStyle StyleEngine::compute_style(const DomNode* node,
         st.bold = parent_style->bold;
         st.monospace = parent_style->monospace;
         st.line_height = parent_style->line_height;
+        st.line_height_specified = parent_style->line_height_specified;
         st.text_align = parent_style->text_align;
         st.css_vars = parent_style->css_vars;
     }
