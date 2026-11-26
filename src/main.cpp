@@ -3097,6 +3097,58 @@ int run_full_test_suite() {
                    "element through the mask's alpha so the icon shape is drawn");
         }
 
+        // ---------------------------------------------------------------------
+        // 76. El ';' dentro de url(...) no separa declaraciones
+        // ---------------------------------------------------------------------
+        {
+            // Una URI de datos lleva un ';' en su tipo MIME
+            // (`data:image/png;base64,...`). El parser partía ahí la
+            // declaración, dejándola sin cerrar y perdiendo tanto esa
+            // propiedad como la siguiente. Afecta a cualquier hoja con
+            // fuentes, iconos o fondos incrustados, no sólo a una web.
+            const std::string px1 =
+                "data:image/png;base64,"
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+
+            SlabArena da;
+            HtmlDocument ddoc = HtmlDocument::parse(da,
+                "<html><head><style>"
+                "body { margin: 0; padding: 0; }"
+                ".a { mask-image: url(" + px1 + "); background: #112233; width: 24px; height: 24px; }"
+                "</style></head><body><div class=\"a\"></div></body></html>");
+            CssStylesheet dsheet;
+            dsheet.parse(ddoc.collect_stylesheets());
+            LayoutFrame* droot = LayoutEngine::build_layout(da, ddoc, dsheet, 200.0f, 100.0f);
+            const LayoutFrame* el = (droot && !droot->children.empty()) ? droot->children[0] : nullptr;
+
+            // La máscara se conserva ENTERA, con su ';' interno...
+            bool mask_ok = el && el->style.mask_image == px1;
+            // ...y las propiedades declaradas DESPUÉS del ';' interno siguen
+            // aplicándose: antes se perdían junto con el resto del valor.
+            bool rest_ok = el && el->style.background.to_argb() == 0xFF112233u &&
+                           std::abs(el->border_box.w - 24.0f) < 0.5f &&
+                           std::abs(el->border_box.h - 24.0f) < 0.5f;
+
+            // Y el 1x1 transparente que usan las skins como máscara por
+            // defecto deja el elemento sin pintar, en vez de como un bloque.
+            DisplayList ddl = LayoutEngine::build_display_list(droot, 200, 100);
+            int solid = 0;
+            for (const auto& it : ddl.items) {
+                if (it.type == DisplayItemType::FillRect && it.color_argb == 0xFF112233u) ++solid;
+            }
+            bool no_block = (solid == 0);
+
+            if (!(mask_ok && rest_ok && no_block)) {
+                std::cerr << "    [diag76] mask_ok=" << mask_ok << " rest=" << rest_ok
+                          << " solid=" << solid << "\n      mask='"
+                          << (el ? el->style.mask_image : std::string("(null)")) << "'\n";
+            }
+
+            expect(mask_ok && rest_ok && no_block,
+                   "A ';' inside url(data:...) does not split a CSS declaration, so the value survives whole "
+                   "and the properties declared after it still apply");
+        }
+
         app.stop_workers();
     }
 

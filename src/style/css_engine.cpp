@@ -36,11 +36,32 @@ std::vector<std::string> split_ws(std::string_view s) {
     return out;
 }
 
+// Busca el ';' que separa declaraciones, ignorando los que van dentro de
+// paréntesis o de comillas. Hace falta porque un valor puede llevarlos: una
+// URI de datos como `url(data:image/png;base64,...)` contiene un ';' que, si
+// se toma como separador, parte la declaración y la deja sin cerrar.
+size_t find_decl_separator(std::string_view block, size_t from) {
+    int depth = 0;
+    char quote = 0;
+    for (size_t i = from; i < block.size(); ++i) {
+        const char c = block[i];
+        if (quote) {
+            if (c == quote && (i == 0 || block[i - 1] != '\\')) quote = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'') quote = c;
+        else if (c == '(') ++depth;
+        else if (c == ')') { if (depth > 0) --depth; }
+        else if (c == ';' && depth == 0) return i;
+    }
+    return std::string_view::npos;
+}
+
 std::vector<CssDeclaration> parse_declarations(std::string_view block) {
     std::vector<CssDeclaration> decls;
     size_t start = 0;
     while (start < block.size()) {
-        size_t semi = block.find(';', start);
+        size_t semi = find_decl_separator(block, start);
         std::string_view item = (semi == std::string_view::npos) ? block.substr(start) : block.substr(start, semi - start);
         size_t colon = item.find(':');
         if (colon != std::string_view::npos) {
