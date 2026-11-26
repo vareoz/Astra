@@ -317,7 +317,11 @@ struct ComputedStyle {
     LinearGradient background_gradient;
     Color color{230, 234, 240, 255};
     BoxShadow box_shadow;
-    float font_size = 14.0f;
+    // CSS Fonts §3.1: el valor inicial de `font-size` es `medium`, que los
+    // navegadores resuelven a 16px. Partir de 14 encogía todo el documento y
+    // hacía que cada caja relativa (em, %, rem) saliera a escala distinta de
+    // la del navegador de referencia.
+    float font_size = 16.0f;
     // Tamaño de fuente HEREDADO del padre. CSS Fonts §3.1: un `font-size` en
     // porcentaje o en `em` se resuelve contra este valor, no contra el propio
     // ni contra el del documento raíz.

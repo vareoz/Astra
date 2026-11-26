@@ -1068,6 +1068,31 @@ void layout_node(LayoutFrame* frame, float x, float y, float avail_w,
                     return std::min(avail, iw + extra + cs.margin.left + cs.margin.right);
                 }
             }
+            // CSS §10.3.5: una caja flotada sin ancho declarado se ajusta a su
+            // contenido. Cuando contiene una imagen con dimensiones propias,
+            // ése es su ancho natural; medir en su lugar el texto del pie como
+            // una sola línea daba cajas desproporcionadas (una ficha de 466px
+            // para una imagen de 252px) que estrechaban el texto de al lado.
+            if (ch->node && ch->node->type == NodeType::Element && !ch->children.empty()) {
+                float intrinsic = 0.0f;
+                std::function<void(const LayoutFrame*)> probe = [&](const LayoutFrame* n) {
+                    if (!n || !n->node || n->node->type != NodeType::Element) return;
+                    const std::string& t = n->node->tag;
+                    if (t == "img" || t == "svg" || t == "canvas" || t == "video") {
+                        float aw = static_cast<float>(std::atoi(n->node->get_attr("width").c_str()));
+                        if (aw <= 0.0f && n->style.width > 0.0f) aw = n->style.width;
+                        intrinsic = std::max(intrinsic, aw);
+                    } else if (n->style.width > 0.0f) {
+                        intrinsic = std::max(intrinsic, n->style.width);
+                    }
+                    for (const LayoutFrame* c : n->children) probe(c);
+                };
+                probe(ch);
+                if (intrinsic > 0.0f) {
+                    return std::min(avail, intrinsic + extra + cs.margin.left + cs.margin.right);
+                }
+            }
+
             std::string txt = ch->node ? ch->node->text_content() : "";
             if (txt.empty()) {
                 return std::min(avail, std::max(8.0f, extra + cs.margin.left + cs.margin.right));

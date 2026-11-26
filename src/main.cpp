@@ -3289,6 +3289,78 @@ int run_full_test_suite() {
                    "phases so a min-content sidebar fits while a row-spanning area does not inflate its first row");
         }
 
+        // ---------------------------------------------------------------------
+        // 79. Tamaño de fuente inicial y float ajustado a su contenido
+        // ---------------------------------------------------------------------
+        {
+            // (a) CSS Fonts §3.1: el valor inicial de `font-size` es `medium`,
+            // 16px. El motor partía de 14, con lo que todo el documento salía
+            // a otra escala que la del navegador de referencia y cada unidad
+            // relativa (em, %, rem) heredaba el desajuste.
+            SlabArena fa;
+            HtmlDocument fdoc = HtmlDocument::parse(fa,
+                "<html><body><p id=\"base\">texto</p>"
+                "<p id=\"rel\" style=\"font-size: 150%\">texto</p></body></html>");
+            CssStylesheet fsheet;
+            LayoutFrame* froot = LayoutEngine::build_layout(fa, fdoc, fsheet, 800.0f, 400.0f);
+            float base_fs = -1.0f, rel_fs = -1.0f;
+            std::function<void(const LayoutFrame*)> seek = [&](const LayoutFrame* f) {
+                if (!f) return;
+                if (f->node && f->node->type == NodeType::Element) {
+                    if (f->node->get_attr("id") == "base") base_fs = f->style.font_size;
+                    if (f->node->get_attr("id") == "rel") rel_fs = f->style.font_size;
+                }
+                for (const LayoutFrame* c : f->children) seek(c);
+            };
+            seek(froot);
+            bool fs_ok = std::abs(base_fs - 16.0f) < 0.5f && std::abs(rel_fs - 24.0f) < 0.5f;
+
+            // (b) CSS §10.3.5: un float sin ancho declarado se ajusta a su
+            // contenido. Medir en su lugar el texto del pie como una sola
+            // línea daba fichas desproporcionadas que estrechaban el texto
+            // contiguo: una imagen de 250px producía una caja de 466px.
+            SlabArena la;
+            HtmlDocument ldoc = HtmlDocument::parse(la,
+                "<html><head><style>"
+                "body { margin: 0; padding: 0; }"
+                "figure { float: right; }"
+                "</style></head><body>"
+                "<figure><img src=\"x.png\" width=\"250\" height=\"120\">"
+                "<figcaption>Un pie de foto deliberadamente largo que mediria "
+                "mucho mas que la imagen si se midiera como una sola linea de texto</figcaption>"
+                "</figure>"
+                "<p id=\"flow\">Texto que fluye junto a la ficha flotada.</p>"
+                "</body></html>");
+            CssStylesheet lsheet;
+            lsheet.parse(ldoc.collect_stylesheets());
+            LayoutFrame* lroot = LayoutEngine::build_layout(la, ldoc, lsheet, 800.0f, 400.0f, true);
+            const LayoutFrame *figf = nullptr, *flow = nullptr;
+            std::function<void(const LayoutFrame*)> seek2 = [&](const LayoutFrame* f) {
+                if (!f) return;
+                if (f->node && f->node->type == NodeType::Element) {
+                    if (f->node->tag == "figure" && !figf) figf = f;
+                    if (f->node->get_attr("id") == "flow") flow = f;
+                }
+                for (const LayoutFrame* c : f->children) seek2(c);
+            };
+            seek2(lroot);
+            bool float_ok = figf && flow &&
+                            // la ficha se ciñe a la imagen, no al pie
+                            figf->border_box.w < 320.0f && figf->border_box.w > 230.0f &&
+                            // y deja sitio real al texto de al lado
+                            flow->border_box.w > 400.0f;
+
+            if (!(fs_ok && float_ok)) {
+                std::cerr << "    [diag79] base_fs=" << base_fs << " rel_fs=" << rel_fs
+                          << " fig_w=" << (figf ? figf->border_box.w : -1.0f)
+                          << " flow_w=" << (flow ? flow->border_box.w : -1.0f) << "\n";
+            }
+
+            expect(fs_ok && float_ok,
+                   "The initial font-size is medium (16px) so relative units match a real browser, and a float "
+                   "without a declared width shrinks to its content instead of to its caption text");
+        }
+
         app.stop_workers();
     }
 

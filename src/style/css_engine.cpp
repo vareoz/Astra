@@ -1185,29 +1185,43 @@ void apply_ua_defaults(const DomNode* node, ComputedStyle& st, bool light_web_de
     } else if (t == "img" || t == "svg") {
         st.display = DisplayType::InlineBlock;
     } else if (t == "body") {
+        // Las hojas de agente de usuario reales NO fijan `font-size` en <body>:
+        // hereda el valor inicial `medium` (16px). Fijarlo aquí encogía todo el
+        // documento respecto al navegador de referencia.
         if (light_web_default) {
             st.background = Color{255, 255, 255, 255};
             st.color = Color{17, 24, 39, 255};
             st.padding = {12, 20, 20, 20};
-            st.font_size = 14.0f;
         } else {
             st.background = Color{13, 17, 24, 255};
             st.color = Color{226, 232, 240, 255};
             st.padding = {24, 28, 28, 28};
-            st.font_size = 15.0f;
         }
     } else if (t == "h1") {
-        st.font_size = 28.0f;
+        // Los tamaños de cabecera de la hoja de agente de usuario son
+        // RELATIVOS al tamaño heredado (2em, 1.5em, 1.17em...), no absolutos.
+        st.font_size = st.parent_font_size * 2.0f;
         st.bold = true;
         st.margin = {8, 0, 14, 0};
         st.color = light_web_default ? Color{15, 23, 42, 255} : Color{248, 250, 252, 255};
     } else if (t == "h2") {
-        st.font_size = 22.0f;
+        st.font_size = st.parent_font_size * 1.5f;
         st.bold = true;
         st.margin = {14, 0, 10, 0};
         st.color = light_web_default ? Color{15, 23, 42, 255} : Color{241, 245, 249, 255};
     } else if (t == "h3") {
-        st.font_size = 17.0f;
+        st.font_size = st.parent_font_size * 1.17f;
+        st.bold = true;
+        st.margin = {10, 0, 8, 0};
+    } else if (t == "h4") {
+        st.bold = true;
+        st.margin = {10, 0, 8, 0};
+    } else if (t == "h5") {
+        st.font_size = st.parent_font_size * 0.83f;
+        st.bold = true;
+        st.margin = {10, 0, 8, 0};
+    } else if (t == "h6") {
+        st.font_size = st.parent_font_size * 0.67f;
         st.bold = true;
         st.margin = {10, 0, 8, 0};
     } else if (t == "p") {
