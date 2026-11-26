@@ -314,6 +314,11 @@ struct ComputedStyle {
     bool has_unapplied_mask() const { return !mask_image.empty(); }
 
     Color background{0, 0, 0, 0};
+    // true cuando una regla del autor (o el atributo style) declaró el fondo,
+    // aunque sea `transparent`. Permite distinguir "el autor no dijo nada" de
+    // "el autor pidió expresamente que no se pinte", que es lo que hacen los
+    // botones silenciosos de las interfaces modernas.
+    bool background_specified = false;
     LinearGradient background_gradient;
     Color color{230, 234, 240, 255};
     BoxShadow box_shadow;

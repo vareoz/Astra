@@ -187,8 +187,12 @@ LayoutFrame* build_frame_tree(SlabArena& arena,
 
     if (st.display == DisplayType::None) return nullptr;
 
-    // Default styling for interactive <button> if author didn't override
-    if (node->tag == "button" && st.background.a == 0) {
+    // Default styling for interactive <button> if author didn't override.
+    // Se comprueba si el autor DECLARÓ el fondo, no si el resultado es
+    // transparente: un botón silencioso pide `background-color: transparent`
+    // a propósito, y pintarlo igualmente dejaba recuadros grises donde el
+    // navegador de referencia sólo muestra un icono.
+    if (node->tag == "button" && st.background.a == 0 && !st.background_specified) {
         if (light_web_default) {
             st.background = Color{241, 245, 249, 255};
             st.color = Color{15, 23, 42, 255};

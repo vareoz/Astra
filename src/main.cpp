@@ -3361,6 +3361,69 @@ int run_full_test_suite() {
                    "without a declared width shrinks to its content instead of to its caption text");
         }
 
+        // ---------------------------------------------------------------------
+        // 80. Un fondo transparente declarado gana al estilo por defecto
+        // ---------------------------------------------------------------------
+        {
+            // Los botones "silenciosos" de las interfaces modernas piden
+            // `background-color: transparent` a propósito. El motor aplicaba su
+            // estilo por defecto de <button> cuando el fondo CALCULADO salía
+            // transparente, sin distinguir si el autor lo había declarado así,
+            // y dejaba recuadros grises donde sólo debía verse el contenido.
+            SlabArena ba;
+            HtmlDocument bdoc = HtmlDocument::parse(ba,
+                "<html><head><style>"
+                "body { margin: 0; padding: 0; }"
+                ".quiet:enabled.ghost { background-color: var(--nope, transparent); }"
+                "</style></head><body>"
+                "<button class=\"quiet ghost\" id=\"q\">silencioso</button>"
+                "<button id=\"d\">por defecto</button>"
+                "</body></html>");
+            CssStylesheet bsheet;
+            bsheet.parse(bdoc.collect_stylesheets());
+            LayoutFrame* broot = LayoutEngine::build_layout(ba, bdoc, bsheet, 600.0f, 200.0f, true);
+
+            const LayoutFrame *quiet = nullptr, *deflt = nullptr;
+            std::function<void(const LayoutFrame*)> seek = [&](const LayoutFrame* f) {
+                if (!f) return;
+                if (f->node && f->node->type == NodeType::Element) {
+                    if (f->node->get_attr("id") == "q") quiet = f;
+                    if (f->node->get_attr("id") == "d") deflt = f;
+                }
+                for (const LayoutFrame* c : f->children) seek(c);
+            };
+            seek(broot);
+
+            bool ok_quiet = quiet && quiet->style.background_specified &&
+                            quiet->style.background.a == 0;
+            // El botón sin reglas SÍ conserva el estilo por defecto.
+            bool ok_default = deflt && !deflt->style.background_specified &&
+                              deflt->style.background.a > 200;
+
+            // Y en la lista de pintado no aparece relleno para el silencioso.
+            DisplayList bdl = LayoutEngine::build_display_list(broot, 600, 200);
+            int fills = 0;
+            for (const auto& it : bdl.items) {
+                if (it.type == DisplayItemType::FillRect && it.rect.y < 60 &&
+                    it.rect.x < quiet->border_box.x + quiet->border_box.w &&
+                    it.rect.x + it.rect.w > quiet->border_box.x &&
+                    it.rect.w < 200) {
+                    ++fills;
+                }
+            }
+
+            if (!(ok_quiet && ok_default)) {
+                std::cerr << "    [diag80] quiet_spec=" << (quiet ? quiet->style.background_specified : false)
+                          << " quiet_a=" << (quiet ? (int)quiet->style.background.a : -1)
+                          << " def_a=" << (deflt ? (int)deflt->style.background.a : -1)
+                          << " fills=" << fills << "\n";
+            }
+
+            expect(ok_quiet && ok_default,
+                   "A declared transparent background beats the engine's <button> default, while a button with "
+                   "no author rule still gets it");
+        }
+
         app.stop_workers();
     }
 

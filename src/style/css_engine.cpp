@@ -867,6 +867,7 @@ void apply_declaration(ComputedStyle& st, const CssDeclaration& d) {
             st.background_gradient.enabled = false;
         }
     } else if (p == "background" || p == "background-color" || p == "background-image") {
+        if (p != "background-image") st.background_specified = true;
         // `background-image: url(...)` se guarda para pintarlo; `none` lo borra.
         if (p != "background-color") {
             st.background_image.clear();
