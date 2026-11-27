@@ -4,3 +4,6 @@ build/
 # Salidas de render y caché local de pruebas.
 *.png
 !examples/*.png
+
+# Metadatos del Finder de macOS.
+.DS_Store
