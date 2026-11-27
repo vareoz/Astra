@@ -1,97 +1,136 @@
----
-language:
-  - es
-  - en
-license: mpl-2.0
-tags:
-  - browser-engine
-  - cpp20
-  - native-desktop
-  - privacy
-  - webextensions
-  - astra-browser
----
+# Astra Browser Core
 
-# Astra Browser Core (Native C++20 Multi-Process Engine)
+**Un navegador de escritorio construido desde cero en C++20 puro.** Sin Chromium. Sin WebKit. Sin Gecko. Sin Electron. Sin V8, sin Blink, sin Skia.
 
-Navegador web de escritorio construido desde cero en **C++20 puro**, inspirado en la arquitectura multiproceso de Mozilla Firefox (e10s / WebRender / Necko / RDD / nsPresArena), **sin Electron**, **sin Chromium** y con un techo estricto de memoria **≤ 2 GB RAM**.
+28 240 líneas de C++20 en 52 ficheros que arrancan tres procesos, hablan HTTP/2 sobre TLS 1.3, parsean HTML y CSS, compilan JavaScript a bytecode, lo ejecutan en una VM de pila con recolector de basura, maquetan el resultado con Flexbox y Grid, lo rasterizan en software con anti-aliasing y lo pintan en una ventana — y renderizan Wikipedia, Hacker News y GitHub de forma reconocible.
 
-El árbol de código es portable: todas las divergencias de sistema operativo están concentradas en `src/core/platform.hpp`, de modo que las mismas fuentes compilan en **Linux (glibc)** y en **macOS/Darwin**. Las primitivas que solo existen en un kernel (el sandbox `seccomp-BPF`) degradan de forma segura y explícita fuera de él.
-
-## Módulos principales
-
-- **Core, Memoria y Portabilidad (`src/core/`)**: `SlabArena` por pestaña basado en `mmap`/`munmap` con devolución inmediata de páginas al kernel (`MADV_DONTNEED` en Linux, `MADV_FREE` en Darwin), `MemoryGovernor` con lectura **real** de RSS por proceso (`/proc/<pid>/statm` en Linux, `proc_pid_rusage`/`proc_pidinfo` en macOS) y deshidratación LRU de pestañas, parser JSON RFC 8259 y **capa de portabilidad POSIX `platform.hpp`** (banderas de socket, semántica de `madvise`, nombres de biblioteca para `dlopen`).
-- **IPC Multiproceso y Sandbox de Kernel (`src/ipc/`)**: Aislamiento real mediante `fork()`, sockets binarios `AF_UNIX` (`Main`, `Content`, `RDD Media`), **Site Isolation por eTLD+1** (procesos de contenido dedicados por origen) y **`ProcessSandbox` multiplataforma**, que confina a los workers con la primitiva nativa de cada kernel:
-  - **Linux**: `PR_SET_NO_NEW_PRIVS` + `setrlimit` + filtro **`seccomp-BPF`** (`SECCOMP_MODE_FILTER`) que devuelve `EPERM` en `socket`/`connect`/`bind`/`listen`/`accept`/`ptrace`/`mount`/`chmod`/`chown` y, en `ContentWorker`, también `execve`/`execveat`/`fork`/`vfork`/`kill`.
-  - **macOS**: `setrlimit` + perfil **Seatbelt** compilado con `sandbox_init` (SBPL). `(deny network*)` corta `connect()`/`bind()`, `(deny process-exec)` corta `execve()` y `(deny process-fork)` impide engendrar procesos. El worker `RddMediaWorker` conserva `process-exec` para el decodificador auxiliar, igual que en Linux.
-  - En ambas plataformas el `socketpair(AF_UNIX)` del canal IPC **sigue funcionando** tras el confinamiento: la suite lo comprueba como control positivo, porque un sandbox que rompiera el IPC dejaría al navegador sin proceso de contenido.
-- **Seguridad Web y Privacidad (`src/privacy/`)**:
-  - **Motor de Políticas Web (`security_policy.*`)**: `SecurityOrigin` (Same-Origin Policy y clave `site_key()` eTLD+1), **`ContentSecurityPolicy` (CSP Nivel 2/3)** desde cabecera HTTP y `<meta http-equiv="Content-Security-Policy">` (control de `script-src`, `style-src`, `connect-src`, `default-src`, `'self'`, `'none'`, `'unsafe-inline'`, wildcards `*.dominio`), **`MixedContentBlocker`** (bloqueo de contenido activo `http://`/`ws://` desde documentos `https://`) y **`CorsEnforcer`** (`Access-Control-Allow-Origin`).
-  - **`AstraShield`**: Total Cookie Protection particionado por `(top_level_site, origin)` con **aplicación real de `SameSite=Strict | Lax | None`** (rechazo de `SameSite=None` sin `Secure`), bloqueador Trie de rastreadores, limpieza de parámetros UTM/FBCLID, modo HTTPS-Only y cabeceras endurecidas (`Sec-GPC`).
-- **Red y Caché (`src/net/`)**: `AstraNet v8` con **revalidación condicional RFC 9111 (`If-None-Match` / `If-Modified-Since` → `304 Not Modified` servido desde la caché acotada sin retransferir el cuerpo, con directivas `max-age` / `no-cache` / `must-revalidate` / `no-store`)**, **Brotli (RFC 7932)**, métodos REST completos (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`) y cabeceras personalizadas en `HttpClient::request()` y `fetch()`, cliente nativo WebSocket RFC 6455 (`ws://` y `wss://` vía TLS 1.3 `dlopen`), multiplexación real multi-stream HTTP/2 (RFC 7540 + RFC 7541 HPACK/Huffman) sobre un único socket TLS 1.3 ALPN (`h2`), pool acotado Keep-Alive HTTP/1.1, verificación estricta de certificados (`dlopen libssl.so.3`), `gzip`/`deflate` (`libz.so.1`) y `HttpCache` acotado thread-safe (RAM + Disco).
-- **Motor Web (`src/dom/`, `src/style/`, `src/layout/`)**: **`font-size` relativo correcto (`%` y `em` contra el tamaño heredado, `rem` contra la raíz, palabras clave absolutas y relativas)**, **contexto de formato en línea sin holgura artificial** (las cajas cortas no se inflan al suelo de bloque, el espacio entre palabras sale del propio texto y un nodo de solo-espacio colapsa a uno entre cajas en línea), **`flex-grow` / `flex-basis` y atajo `flex`, con reparto del espacio libre también en el camino multi-fila**, **anchos en porcentaje de los ítems flex resueltos contra el contenedor (una sola vez)**, **reparto de pistas de CSS Grid por fases** (`min-content` dimensionada por contenido, `minmax()` encogible, áreas multi-fila que no inflan su primera fila), **`display: table` sin filas maquetado como bloque** (celdas anónimas), **tamaño de fuente inicial `medium` (16px) y cabeceras relativas como en una hoja de agente de usuario real**, **floats sin ancho declarado ajustados a su contenido**, **un fondo transparente declarado por el autor gana al estilo por defecto de los controles**, **`<body>` separado del borde con `margin: 8px` como las hojas de agente de usuario reales** (para que el `body { margin: 0 }` de los sitios llegue de verdad al contenido), **`line-height` del autor** (número sin unidad, longitud o porcentaje, con regreso a las métricas de la fuente en `normal`), **`currentColor`**, **`mask-image` aplicada de verdad** (el color de fondo se tiñe a través del canal alfa de la máscara con muestreo bilineal: es como se dibujan los iconos de las interfaces modernas) y **`background-image: url(...)`** pintada sobre la caja, **CSS Grid con áreas con nombre (`grid-template-areas` + `grid-area`, identificadores sensibles a mayúsculas), atajo `grid-template`, pistas `minmax()`/`min-content` y separación por eje `column-gap`/`row-gap`** — el mecanismo con el que las skins modernas colocan barra lateral y contenido en columnas. **parser de declaraciones CSS que respeta paréntesis y comillas** (un `;` dentro de `url(data:image/png;base64,...)` ya no parte la declaración), Parser HTML5 con DOM dinámico (`innerHTML`, `classList`, `removeAttribute`, `<canvas>`, `<svg>`, **`<table>`/`<thead>`/`<tbody>`/`<tr>`/`<th>`/`<td>` con `colspan` acotado**, **`<iframe srcdoc>` recursivo acotado** y **envío nativo de formularios `<form action="..." method="GET|POST">`**), cascada CSS3 v9 con **evaluador recursivo `calc(...)` (`px`, `%`, `vw`, `vh`, `rem`, `em`)**, **`:nth-child(an+b | odd | even | N)`**, **pseudo-elementos `::before`/`::after` (`content: "..."`)**, **`display: inline-block` real con salto horizontal**, **`float: left | right` y `clear: left | right | both`**, pseudo-clases (`:first-child`, `:last-child`, `:focus`, `:hover`), `flex-wrap: wrap`, `border-left`, **animaciones `@keyframes` con listas de fotogramas por propiedad y atajo `animation` (duración, retardo, iteraciones, `infinite`, `alternate`, `forwards`)**, **transiciones `transition` interpoladas sobre valores calculados**, **curvas de temporización exactas (`linear`, `ease*`, `cubic-bezier()`, `steps()`) resueltas por Newton-Raphson con respaldo de bisección**, **`transform` 2D completo (`translate`/`scale`/`rotate`) resuelto a matriz afín de pintado que, conforme a CSS Transforms Level 1, NO altera la maquetación**, variables CSS (`--*`, `var()`), combinador `>`, Flexbox, CSS Grid, `@media`, `box-sizing`, `linear-gradient(...)`, `position: relative | absolute | fixed`, `z-index`, `opacity`, `box-shadow`, recorte `overflow: hidden` y formato binario **`ASD6`** (matriz afín por item).
-- **JavaScript y Extensiones (`src/js/`, `src/ext/`)**: `AstraJS v10` (compilador a bytecode + VM de pila + GC Mark-and-Sweep + **cadena `[[Prototype]]` real (`Object.create`/`getPrototypeOf`/`setPrototypeOf`, `fn.prototype`, `class Sub extends Base` + `super()`/`super.method()`, `instanceof`)** + **`RegExp` nativo (`/pat/flags`, `.test()`, `.exec()`, `String.match`/`replace(/g)`/`split(re)`)** + **`Date` nativo (ISO-8601, `Date.now()`, getters UTC, `.toISOString()`)** + **`Map` y `Set` nativos con iteración `for..of`** + **APIs SPA (`history.pushState`/`replaceState`/`back`/`forward`/`state`/`length`, `location.*`, `sessionStorage`)** + **DOM Events Level 2 (ruta de propagación congelada, fases de captura/objetivo/burbujeo, objeto `Event` con `type`/`target`/`currentTarget`/`eventPhase`, `preventDefault()`, `stopPropagation()`, `stopImmediatePropagation()`, opciones `{capture, once}`, `removeEventListener` y `dispatchEvent`)** + **`document.cookie` enganchado al tarro particionado de AstraShield** + destructuring ES6, parámetros por defecto, spread, shorthand, `Object.*`, `Array`/`String` stdlib, `fetch()`, clases ES6, template literals, `element.style.*`, `new WebSocket()`, `try`/`catch`/`finally`/`throw`, `requestAnimationFrame`, `<canvas>` 2D, `async`/`await`, closures, `Promise`, `localStorage`) y runtime multi-extensión Manifest V3 simultáneo con DNR combinado.
-- **Gráficos, SVG, Chrome v4, Descargas, Tipografía, 3D, Documentos y Video/Audio (`src/gfx/`, `src/docs/`, `src/media/`, `src/browser/`)**:
-  - **`AstraImage v3` (`src/gfx/image_decoder.*`)**: decodificador **GIF87a/GIF89a LZW** en C++20 puro (GCT/LCT, transparencia, entrelazado) + soporte **WebP** (`RIFF WEBP` con `dlopen("libwebp.so.7"/"libwebp.so.6")` + sonda de cabecera VP8X/VP8L/VP8) + **JPEG Baseline Sequential DCT** puro + PNG/BMP/PPM nativos.
-  - **`AstraSVG v1` (`src/gfx/svg_engine.*`)**: parser y rasterizador vectorial nativo en C++20 puro para `<svg>` inline y para `<img src="*.svg">` (local, remoto o `data:`), con supersampling 2x2 anti-aliased, límite 512×512 y **exclusión de los subárboles no renderizables (`<defs>`, `<clipPath>`, `<mask>`, `<symbol>`, gradientes…)** conforme a SVG 1.1 §5.6.
-  - **Chrome de escritorio v4 + Gestor de Descargas Nativo (`astra://downloads`)**: Omnibox editable sincronizado con `history.pushState`, historial (`<` / `>` / `R`), pestañas `[+]` / `[x]`, verificación nativa **SHA-256 (FIPS 180-4)** y registro `ledger.json`.
-  - `AstraFont`: tipografía vectorial TrueType UTF-8 anti-aliased vía `dlopen("libfreetype.so.6")` (caché LRU 4 MiB).
-  - **Compositor v10 (`ASD6`)**: **composición afín por píxel con muestreo inverso y supermuestreo 2x2 para `transform`**, composición alpha de `<svg>`, gradientes direccionales CSS, `border-left`, `text-align`, `<canvas>` 2D, recorte estricto `overflow: hidden`, scroll APZ, `DropShadow`, `fixed_viewport`, X11 interactivo, `Astra3D`, PDF/Markdown y `AstraMedia v4` con ALSA (`dlopen("libasound.so.2")`).
-
-## Compilación y uso (Linux y macOS, cero dependencias de compilación)
-
-```bash
-make -j4
-./build/astra --test
-./build/astra --stress-tabs 150 --cap 2048
-./build/astra --url https://example.com
-./build/astra --ext examples/astra-privacy-guard --ext examples/astra-reader-boost --url astra://home --out home.png
-./build/astra --url file://examples/astra_session9.html --out session9.png
-./build/astra --url file://examples/astra_session8.html --out session8.png
-./build/astra --url file://examples/astra_session7.html --out session7.png
-./build/astra --url file://examples/astra_session6.html --raf-step 4 --out session6.png
-./build/astra --download file://examples/astra_data.json --download https://example.com --url astra://downloads --out downloads.png
-./build/astra --url astra://home --gui   # Ventana interactiva nativa X11 (Linux con DISPLAY)
+```
+82 / 82 pruebas aprobadas   ·   0 warnings   ·   150 pestañas en 642 ms con 27 MB de RSS
 ```
 
-## Publicación en Hugging Face Hub
+> ### 📄 Lee [**HANDOFF.md**](HANDOFF.md) primero
+>
+> Contiene el inventario completo de lo que está construido **y, sobre todo, el inventario honesto de lo que falta para llegar al nivel de Chrome**: por capas, con las ausencias concretas y una estimación de esfuerzo que suma entre 16 y 27 años-persona. Si solo vas a leer un documento de este repositorio, que sea ese.
 
-```bash
-export HF_TOKEN="<tu_token_write_de_hugging_face>"
-export HF_REPO_ID="thevareoz/astra-browser-core"
-bash upload_to_huggingface.sh "Release Astra Browser Core v9 (Hito A Layout + Hito B AstraJS v9 SPA + Hito C Seccomp-BPF/CSP/CORS)"
+---
+
+## Arquitectura
+
+```
+┌──────────────┐   AF_UNIX    ┌───────────────┐
+│ Main Process │◄────────────►│ Content Worker│  sandbox: seccomp-BPF (Linux)
+│  Chrome UI   │              │ DOM/CSS/JS/LY │           Seatbelt (macOS)
+│  Net / Cache │   AF_UNIX    ├───────────────┤
+│  MemGovernor │◄────────────►│  RDD Media    │  sandbox: sin red
+└──────────────┘              └───────────────┘
 ```
 
-## Resultados verificados (fusión v10 + v8, macOS 27.2 arm64)
+Multiproceso real con `fork()` y canal IPC binario sobre `socketpair(AF_UNIX)`, inspirado en la arquitectura e10s / WebRender / Necko / RDD de Firefox. Arena de memoria `mmap` por pestaña con devolución inmediata de páginas al kernel, deshidratación LRU y un techo duro de 2 GB que el `MemoryGovernor` vigila leyendo el RSS **real** del sistema operativo.
 
-Esta versión fusiona dos líneas de desarrollo que partían ambas de la v7: la rama de apertura a la web real (SVG, stdlib y prototipos de JS, tablas/floats/`calc()`, GIF/WebP, Brotli, HLS, sandbox y políticas de seguridad) y la rama de portabilidad y animación (capa POSIX, `@keyframes`/`transition`/`transform` con `ASD6`, eventos DOM nivel 2 y revalidación HTTP condicional).
+El árbol es portable: todas las divergencias de sistema operativo viven en un único encabezado, [`src/core/platform.hpp`](src/core/platform.hpp). Las mismas fuentes compilan en **Linux (glibc)** y **macOS/Darwin** sin `#ifdef` dispersos.
 
-- **Compilación**: `g++ -std=c++20 -O2 -Wall -Wextra -pthread` en macOS 27.2 arm64 (Apple clang 21) — **0 errores, 0 warnings**.
-- **Suite de verificación (`--test`)**: **82 / 82 pruebas aprobadas** (43 de la v7 + 19 de la rama de web abierta + 6 de la rama de animación y portabilidad).
-- **Sandbox verificado a nivel de kernel en macOS**: `connect()=EPERM`, `bind()=EPERM`, `execve()=EPERM` y canal IPC `AF_UNIX` vivo, con el perfil Seatbelt activo en el proceso de contenido real.
-- **Prueba de estrés de 150 pestañas (`--stress-tabs 150 --cap 2048`)**:
-  - 150 pestañas creadas en **620.6 ms** (**4.1 ms/pestaña**).
-  - **RAM total real (suma del RSS de los 3 procesos)**: **19.95 MB / 2048 MB** (`main`: 14.81 MB + `content`: 4.05 MB + `rdd-media`: 1.09 MB — ~0.97 % del techo de 2 GB).
-  - Rehidratación de pestañas deshidratadas (Tab #1): **OK**.
-- **Renderizado E2E**: las nueve páginas de `examples/` (sesiones 3 a 10) se renderizan sin errores.
-- **Web abierta**: `github.com/explore` coloca sus tres columnas de rejilla con las proporciones reales (25/50/25) y los avatares junto a los nombres; `news.ycombinator.com` se renderiza de forma legible y reconocible (457 display items); `en.wikipedia.org` reproduce ya la estructura de tres columnas del navegador de referencia (índice, artículo con su ficha ilustrada y panel de apariencia), con cabecera (buscador y enlaces de cuenta repartidos), índice lateral y cuerpo del artículo, con tipografía a escala, texto en línea sin huecos artificiales ni sangrías con el logotipo vectorial de la cabecera dibujado desde su SVG remoto y con los iconos de interfaz (menú, idiomas, marcador, menú contextual) rasterizados desde sus máscaras SVG.
+## Compilación y uso
 
-### Dos salvedades honestas sobre esta verificación
+Cero dependencias de compilación. Las bibliotecas opcionales (OpenSSL, zlib, Brotli, FreeType, libwebp, libX11, ALSA) se cargan con `dlopen()` en tiempo de ejecución; si falta alguna, ese subsistema degrada de forma explícita.
 
-1. **El sandbox de macOS usa API obsoleta y es lista de denegación, no de permiso.** `sandbox_init` está marcada como deprecada desde macOS 10.8, pero sigue siendo la única vía de confinar un binario sin empaquetar ni firmar, y es la que usaron históricamente los navegadores. El perfil parte de `(allow default)` y veta operaciones concretas — igual que el filtro seccomp de Linux deniega una lista de syscalls — así que es un confinamiento real pero más débil que una lista blanca. Además Darwin no tiene equivalente a `PR_SET_NO_NEW_PRIVS`.
-2. **`RegExp` se apoya en `std::regex`.** Los patrones llegan desde JS de páginas no confiables, y `std::regex` es conocido por desbordar la pila y por explosión exponencial ante patrones patológicos. El harness de fuzzing actual no cubre esa superficie.
+```bash
+make -j8
+```
 
-## Resultados verificados (Sesión 9)
+```bash
+./build/astra --test                        # suite de 82 pruebas
+```
 
-- **Compilación**: `g++ -std=c++20 -O2 -Wall -Wextra -pthread -ldl` — **0 errores, 0 warnings**.
-- **Suite de verificación (`--test`)**: **55 / 55 pruebas aprobadas** (48 previas + 7 nuevas pruebas cubriendo los 3 hitos completos):
-  - **Hito A (Layout web real, imágenes y formularios)**: `<table>` con `colspan`, `float: left|right` + `clear: both`, `display: inline-block`, `calc(100% - 200px)`, `:nth-child(even)`, `::before`/`::after`, `<iframe srcdoc>`, decodificador nativo GIF89a LZW con transparencia + WebP RIFF, y envío de `<form method="GET">` con codificación URL.
-  - **Hito B (Profundidad de motor JS y SPAs)**: cadena `[[Prototype]]` (`Object.create`/`getPrototypeOf`), `class Sub extends Base` + `super()`, `instanceof`, `RegExp` (`/pat/flags`, `.test`, `.exec`, `replace(/g)`, `split(re)`), `Date` (ISO-8601, UTC, `.toISOString()`), `Map`/`Set` con `for..of`, y runtime SPA (`history.pushState`, `location.*`, `sessionStorage`).
-  - **Hito C (Seguridad real y fuzzing)**: verificación a nivel de kernel de **`seccomp-BPF`** (`socket(AF_INET)=EPERM`, `execve()=EPERM`, `ptrace()=EPERM`), bloqueo **CSP** (`<meta>` y cabecera), **Mixed Content**, **SOP/CORS**, cookies **`SameSite=Strict|Lax|None`**, **Site Isolation** por eTLD+1, y **harness de fuzzing** sobre 49 payloads hostiles/corruptos en HTML, CSS, PNG/JPEG/GIF/WebP, SVG y HPACK (0 fallos/cuelgues) + renderizado E2E de `examples/astra_session9.html`.
-- **Prueba de estrés de 150 pestañas (`--stress-tabs 150 --cap 2048`)**:
-  - 150 pestañas creadas en **952.3 ms** (**6.3 ms/pestaña**).
-  - **RAM total real (Linux `/proc` RSS sumando Main + Content sandboxed + RDD Media)**: **26.41 MB / 2048 MB** (`main`: 13.86 MB + `content`: 8.02 MB + `rdd-media`: 4.53 MB — ~1.29% del techo de 2 GB).
-  - Rehidratación de pestañas deshidratadas (Tab #1): **OK**.
+```bash
+./build/astra --stress-tabs 150 --cap 2048  # estrés de memoria
+```
 
+```bash
+./build/astra --url https://en.wikipedia.org/wiki/Web_browser --out wiki.png
+```
 
+```bash
+./build/astra --url astra://home --gui      # ventana X11 interactiva (Linux con DISPLAY)
+```
 
+## Módulos
+
+| Módulo | Líneas | Qué hace |
+|---|---:|---|
+| [`src/core/`](src/core) | 1 009 | Arena `mmap`, gobernador de memoria, JSON RFC 8259, portabilidad POSIX |
+| [`src/ipc/`](src/ipc) | 772 | `fork()`, canal `AF_UNIX`, site isolation, `ProcessSandbox` |
+| [`src/privacy/`](src/privacy) | 878 | CSP 2/3, SOP, CORS, mixed content, cookies particionadas |
+| [`src/net/`](src/net) | 3 246 | HTTP/1.1, HTTP/2 + HPACK, WebSocket RFC 6455, TLS 1.3, caché RFC 9111, Brotli |
+| [`src/dom/`](src/dom) | 578 | Parser HTML5, DOM dinámico |
+| [`src/style/`](src/style) | 3 345 | Cascada CSS3, `calc()`, Grid, Flexbox, `@keyframes`, `transition`, `transform` |
+| [`src/layout/`](src/layout) | 1 957 | Bloque, línea, tabla, float, Grid, Flex |
+| [`src/js/`](src/js) | 4 445 | `AstraJS`: compilador a bytecode, VM de pila, GC mark-and-sweep |
+| [`src/ext/`](src/ext) | 290 | Runtime multi-extensión Manifest V3 |
+| [`src/gfx/`](src/gfx) | 3 997 | Rasterizador, SVG, JPEG/PNG/GIF/WebP/BMP, FreeType, Astra3D |
+| [`src/docs/`](src/docs) | 372 | Visor PDF y Markdown |
+| [`src/media/`](src/media) | 874 | Audio/vídeo, HLS, ALSA |
+| [`src/browser/`](src/browser) | 2 604 | Omnibox, pestañas, historial, descargas con SHA-256 |
+| [`src/main.cpp`](src/main.cpp) | 3 873 | CLI y suite de verificación |
+
+## Qué sabe hacer
+
+**Red** — HTTP/2 multi-stream real (RFC 7540 + HPACK/Huffman RFC 7541) sobre un solo socket TLS 1.3 con ALPN y verificación estricta de certificados; HTTP/1.1 con pool Keep-Alive; WebSocket RFC 6455 (`ws://` y `wss://`); revalidación condicional RFC 9111 (`304` servido desde caché sin retransferir el cuerpo); `gzip`, `deflate`, Brotli; REST completo con cabeceras personalizadas.
+
+**Seguridad y privacidad** — CSP Nivel 2/3 desde cabecera y `<meta>`; Same-Origin Policy; CORS; bloqueo de contenido mixto activo; Total Cookie Protection particionada por `(top_level_site, origin)` con `SameSite=Strict|Lax|None` aplicado de verdad; bloqueador Trie de rastreadores; limpieza de UTM/FBCLID; HTTPS-Only; Site Isolation por eTLD+1; y un **sandbox verificado a nivel de kernel** (`seccomp-BPF` en Linux, perfil Seatbelt en macOS) que comprueba `connect()=EPERM`, `bind()=EPERM`, `execve()=EPERM` **y que el canal IPC sigue vivo** como control positivo.
+
+**CSS** — Flexbox Level 1, Grid Level 1 con áreas con nombre y `minmax()`, Animations Level 1 con `@keyframes` por propiedad, Transitions Level 1, Transforms Level 1 como matriz afín de pintado (que, conforme a la especificación, no altera la maquetación), `cubic-bezier()` por Newton-Raphson, variables CSS, `calc()` recursivo, `@media`, pseudo-clases y pseudo-elementos, `float`/`clear`, `inline-block`, tablas con `colspan`, `position`, `z-index`, `opacity`, `box-shadow`, `overflow: hidden`, `mask-image` compositada de verdad y `background-image`.
+
+**JavaScript (`AstraJS v10`)** — Compilador a bytecode, VM de pila, GC mark-and-sweep. Cadena `[[Prototype]]` real con `class … extends` y `super()`; `async`/`await`, `Promise`, closures; `RegExp`, `Date`, `Map`, `Set` con `for..of`; destructuring, spread, template literals; DOM Events Level 2 completo (ruta de propagación congelada, captura/objetivo/burbujeo, `stopImmediatePropagation`, `{capture, once}`); `fetch()`; `localStorage` y `sessionStorage`; `history.pushState`; `<canvas>` 2D con `requestAnimationFrame`.
+
+**Gráficos** — Rasterizador propio con composición alpha, gradientes, sombras y composición afín por píxel con muestreo inverso y supermuestreo 2×2. Parser y rasterizador **SVG** propios. Decodificadores nativos en C++20 puro de **JPEG baseline DCT**, **PNG**, **GIF87a/89a con LZW**, BMP y PPM. Tipografía TrueType UTF-8 anti-aliased con caché LRU.
+
+**Chrome de escritorio** — Omnibox editable, pestañas, historial, gestor de descargas nativo (`astra://downloads`) con verificación SHA-256 (FIPS 180-4), ventana X11 interactiva con scroll APZ, extensiones Manifest V3, visor de PDF y Markdown.
+
+## Resultados medidos
+
+```
+$ ./build/astra --test
+Summary: 82 passed, 0 failed.
+
+$ ./build/astra --stress-tabs 150 --cap 2048
+  Tabs created:       150          Total elapsed:  642.3 ms (4.3 ms/tab)
+  Active/Warm tabs:   8            Total OS RSS:   27.02 MB / 2048 MB
+  Dehydrated tabs:    142            main        15.75 MB
+  Rehydrate Tab #1:   OK             content      6.89 MB
+                                     rdd-media    4.38 MB
+```
+
+| Sitio | Resultado |
+|---|---|
+| `en.wikipedia.org` | Tres columnas (índice, artículo con ficha ilustrada, panel de apariencia), logotipo desde su SVG remoto, iconos desde sus máscaras SVG |
+| `news.ycombinator.com` | Legible y reconocible, 457 display items |
+| `github.com/explore` | Rejilla de tres columnas con las proporciones reales (25/50/25) |
+
+Fuzzing: 49 cargas hostiles o corruptas en HTML, CSS, PNG, JPEG, GIF, WebP, SVG y HPACK → 0 fallos, 0 cuelgues.
+
+## Qué NO sabe hacer
+
+Para que nadie se lleve a engaño, los titulares — la lista completa y razonada está en [HANDOFF.md](HANDOFF.md#parte-ii--lo-que-falta-para-ser-un-navegador-real-al-nivel-de-chrome):
+
+- **Sin JIT.** El JavaScript de una página corre entre 10× y 100× más lento que en V8.
+- **Sin módulos ES, generadores ni `Proxy`.** Vue 3 no arranca; nada empaquetado como ESM carga.
+- **Sin Web Workers, Service Workers, IndexedDB, Shadow DOM ni WebAssembly.**
+- **Sin GPU ni composición en hilo.** Todo el pintado es software, en CPU, en el hilo principal.
+- **Sin bidi ni conformado de texto complejo.** El árabe y el hebreo se renderizan al revés; el devanagari es ilegible.
+- **Sin árbol de accesibilidad.** Ningún lector de pantalla puede usar Astra.
+- **Sin códecs de vídeo ni audio.** No hay H.264, VP9, AV1, AAC ni Opus. En macOS no hay salida de audio en absoluto.
+- **Sin HTTP/3.**
+- **Rendimiento estructural:** `github.com` tarda unos 45 s y consume unos 492 MB; Chrome hace lo mismo en menos de 2 s.
+- **`RegExp` se apoya en `std::regex`**, que es vulnerable a ReDoS con patrones de páginas no confiables. Es el agujero de seguridad más concreto del árbol.
+
+Chromium ronda los 40 millones de líneas. Astra es el 0,07 % de ese tamaño, y ese cociente es la forma más honesta de resumir la distancia.
+
+## Documentación
+
+- [**HANDOFF.md**](HANDOFF.md) — estado completo y hoja de ruta hacia la paridad con Chrome
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — diseño interno
+- [`examples/`](examples) — nueve páginas de demostración y dos extensiones MV3
+
+## Licencia
+
+[MPL-2.0](https://www.mozilla.org/en-US/MPL/2.0/)
